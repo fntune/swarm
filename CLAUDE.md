@@ -4,7 +4,7 @@
 
 **claude-swarm** - Multi-agent orchestration framework for Claude Code.
 
-Executes agents in parallel git worktrees with dependency resolution and branch merging.
+Executes agents in parallel git worktrees with dependency resolution, retry logic, and branch merging.
 
 ## Commands
 
@@ -17,15 +17,22 @@ swarm --help
 pytest tests/
 
 # Core CLI
-swarm run -f plan.yaml           # Execute plan spec
-swarm run -p "auth: Impl auth"   # Inline single agent
+swarm run -f plan.yaml                    # Execute plan spec
+swarm run -p "auth: Impl auth"            # Inline single agent
 swarm run -p "a: step1" -p "b: step2" --sequential  # Sequential chain
-swarm status <run_id>            # View agent status
-swarm logs <run_id> -a <agent>   # View agent logs
-swarm logs <run_id> --all        # View all logs
-swarm merge <run_id>             # Merge completed branches
-swarm cancel <run_id>            # Cancel running agents
-swarm dashboard <run_id>         # Live status view
+swarm run --run-id <id> -p "..."          # Explicit run ID
+swarm run --resume --run-id <id>          # Resume existing run
+
+swarm resume <run_id>                     # Resume alias
+swarm status [run_id] [--json]            # View status (latest if no id)
+swarm logs <run_id> -a <agent>            # View agent logs
+swarm logs <run_id> --all                 # View all logs
+swarm merge <run_id> [--dry-run]          # Merge completed branches
+swarm cancel <run_id>                     # Cancel running agents
+swarm dashboard <run_id>                  # Live status view
+swarm clean [run_id] [--all]              # Clean up artifacts
+swarm db [run_id] [query]                 # Query SQLite database
+swarm roles [name]                        # List/view available roles
 
 # Testing without Claude CLI
 swarm run -p "test: true" --mock
@@ -35,27 +42,42 @@ swarm run -p "test: true" --mock
 
 ```
 swarm/                    # Python package
-├── cli.py               # Click CLI entrypoint
+├── cli.py               # Click CLI entrypoint (10 commands)
 ├── models.py            # Pydantic: AgentSpec, PlanSpec, Defaults
 ├── parser.py            # YAML parsing, inline plan creation
 ├── db.py                # SQLite setup, queries (WAL mode)
 ├── deps.py              # Dependency graph, topological sort
-├── scheduler.py         # Parallel execution coordinator
+├── scheduler.py         # Parallel execution, circuit breaker, stuck detection
 ├── executor.py          # Agent worker (subprocess or mock)
 ├── git.py               # Worktree creation, branch merging
 ├── merge.py             # Branch consolidation CLI helper
 ├── logs.py              # Log file management
-└── tools.py             # Agent toolset (mark_complete, etc.)
+├── roles.py             # Built-in role templates (7 roles)
+└── tools.py             # Worker + Manager coordination tools
 ```
 
-## Key Patterns
+## Key Features
 
-1. **SQLite state**: `.swarm/runs/{run_id}/swarm.db` (WAL mode for concurrency)
-2. **Git worktrees**: `.swarm/runs/{run_id}/worktrees/{agent}/` for isolation
-3. **Branch naming**: `swarm/{run_id}/{agent}`
-4. **Dependency merging**: When agent has depends_on, dependency branches merge into its worktree before execution
-5. **Check command**: Optional validation after agent completion (default: `true`)
-6. **Run scoping**: Each run gets unique ID like `inline-abc123-def456`
+### Execution
+- **Parallel agents** in isolated git worktrees
+- **Dependency resolution** with topological ordering
+- **Sequential mode** (`--sequential`) for linear pipelines
+- **Resume support** (`--resume --run-id` or `swarm resume`)
+
+### Failure Handling
+- **on_failure: continue** - Default, continue with other agents
+- **on_failure: stop** - Cancel all agents on first failure
+- **on_failure: retry** - Retry failed agents up to `retry_count` times
+- **Error context injection** - Previous error shown in retry prompt
+- **Circuit breaker** - Trip after N failures (cancel_all/pause/notify)
+- **Cascade failures** - Skip agents with failed dependencies
+
+### Coordination Tools
+Worker tools: `mark_complete`, `request_clarification`, `report_progress`, `report_blocker`
+Manager tools: `spawn_worker`, `respond_to_clarification`, `cancel_worker`, `get_worker_status`, `get_pending_clarifications`, `mark_plan_complete`
+
+### Roles
+Built-in roles: `architect`, `implementer`, `tester`, `reviewer`, `debugger`, `refactorer`, `documenter`
 
 ## Plan Spec Format
 
@@ -63,11 +85,19 @@ swarm/                    # Python package
 name: my-plan
 defaults:
   check: "pytest tests/"
+  on_failure: retry
+  retry_count: 3
+orchestration:
+  circuit_breaker:
+    threshold: 3
+    action: cancel_all
 agents:
   - name: auth
     prompt: "Implement authentication"
-  - name: api
-    prompt: "Add API endpoints"
+    use_role: implementer
+  - name: tests
+    prompt: "Write tests for auth"
+    use_role: tester
     depends_on: [auth]
 ```
 
@@ -76,7 +106,7 @@ agents:
 ```
 .swarm/
 └── runs/{run_id}/
-    ├── swarm.db                # SQLite state
+    ├── swarm.db                # SQLite state (WAL mode)
     ├── worktrees/{agent}/      # Git worktrees
     └── logs/{agent}.log        # Per-agent logs
 ```
