@@ -35,6 +35,7 @@ from swarm.executor import AgentConfig, spawn_manager, spawn_worker
 from swarm.git import create_worktree, setup_worktree_with_deps
 from swarm.models import AgentSpec, PlanSpec
 from swarm.parser import generate_run_id, load_shared_context
+from swarm.roles import apply_role, get_role_defaults
 
 logger = logging.getLogger("swarm.scheduler")
 
@@ -109,14 +110,21 @@ class Scheduler:
         # Insert agents
         defaults = self.plan.defaults
         for agent in self.plan.agents:
+            # Apply role template if specified
+            prompt = agent.prompt
+            role_defaults = {}
+            if agent.use_role:
+                prompt = apply_role(agent.prompt, agent.use_role)
+                role_defaults = get_role_defaults(agent.use_role)
+
             insert_agent(
                 self.db,
                 self.run_id,
                 agent.name,
-                agent.prompt,
+                prompt,
                 agent_type=agent.type,
-                check_command=agent.check or defaults.check,
-                model=agent.model or defaults.model,
+                check_command=agent.check or role_defaults.get("check") or defaults.check,
+                model=agent.model or role_defaults.get("model") or defaults.model,
                 max_iterations=agent.max_iterations or defaults.max_iterations,
                 max_cost_usd=agent.max_cost_usd or defaults.max_cost_usd,
                 depends_on=agent.depends_on,

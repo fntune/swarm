@@ -105,10 +105,20 @@ def run(
 
 
 @main.command()
-@click.argument("run_id")
-def status(run_id: str) -> None:
-    """Show status of a run."""
-    from swarm.db import get_agents, get_plan, open_db
+@click.argument("run_id", required=False)
+@click.option("--json", "as_json", is_flag=True, help="Output as JSON")
+def status(run_id: str | None, as_json: bool) -> None:
+    """Show status of a run. If no run_id, shows latest."""
+    import json
+    from swarm.db import get_agents, get_plan, get_total_cost, list_runs, open_db
+
+    # Get latest run if not specified
+    if not run_id:
+        runs = list_runs()
+        if not runs:
+            click.echo("No runs found", err=True)
+            raise click.Abort()
+        run_id = runs[0]
 
     try:
         db = open_db(run_id)
@@ -122,17 +132,40 @@ def status(run_id: str) -> None:
         raise click.Abort()
 
     agents = get_agents(db, run_id)
+    total_cost = get_total_cost(db, run_id)
 
-    click.echo(f"Run: {run_id}")
-    click.echo(f"Plan: {plan['name']}")
-    click.echo(f"Status: {plan['status']}")
-    click.echo(f"\nAgents:")
+    if as_json:
+        output = {
+            "run_id": run_id,
+            "plan": plan["name"],
+            "status": plan["status"],
+            "total_cost": total_cost,
+            "agents": [
+                {
+                    "name": a["name"],
+                    "status": a["status"],
+                    "type": a["type"],
+                    "iteration": a["iteration"],
+                    "max_iterations": a["max_iterations"],
+                    "cost": a["cost_usd"],
+                    "error": a["error"],
+                }
+                for a in agents
+            ],
+        }
+        click.echo(json.dumps(output, indent=2))
+    else:
+        click.echo(f"Run: {run_id}")
+        click.echo(f"Plan: {plan['name']}")
+        click.echo(f"Status: {plan['status']}")
+        click.echo(f"Cost: ${total_cost:.4f}")
+        click.echo(f"\nAgents:")
 
-    for agent in agents:
-        status_str = agent["status"]
-        if agent["error"]:
-            status_str += f" ({agent['error'][:50]})"
-        click.echo(f"  {agent['name']}: {status_str}")
+        for agent in agents:
+            status_str = agent["status"]
+            if agent["error"]:
+                status_str += f" ({agent['error'][:50]})"
+            click.echo(f"  {agent['name']}: {status_str}")
 
     db.close()
 
@@ -443,6 +476,32 @@ def db(run_id: str | None, query: str | None) -> None:
         click.echo("\nTables: plans, agents, events, responses")
 
     conn.close()
+
+
+@main.command()
+@click.argument("role_name", required=False)
+def roles(role_name: str | None) -> None:
+    """List available roles or show role details."""
+    from swarm.roles import BUILTIN_ROLES, get_role
+
+    if role_name:
+        role = get_role(role_name)
+        if not role:
+            click.echo(f"Role not found: {role_name}", err=True)
+            click.echo(f"Available: {', '.join(BUILTIN_ROLES.keys())}")
+            raise click.Abort()
+
+        click.echo(f"Role: {role.name}")
+        click.echo(f"Description: {role.description}")
+        if role.model:
+            click.echo(f"Default model: {role.model}")
+        if role.check:
+            click.echo(f"Default check: {role.check}")
+        click.echo(f"\nSystem prompt:\n{role.system_prompt}")
+    else:
+        click.echo("Available roles:")
+        for name, role in BUILTIN_ROLES.items():
+            click.echo(f"  {name}: {role.description}")
 
 
 if __name__ == "__main__":
