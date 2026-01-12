@@ -172,9 +172,11 @@ def cancel(run_id: str) -> None:
 @click.option("--dry-run", is_flag=True, help="Show what would be merged")
 def merge(run_id: str, dry_run: bool) -> None:
     """Merge completed agent branches."""
+    import json
+
     from swarm.db import get_agents, open_db
     from swarm.deps import DependencyGraph
-    from swarm.git import merge_branch
+    from swarm.git import merge_branch_to_current
     from swarm.models import AgentSpec
 
     try:
@@ -197,7 +199,7 @@ def merge(run_id: str, dry_run: bool) -> None:
         AgentSpec(
             name=a["name"],
             prompt=a["prompt"],
-            depends_on=eval(a["depends_on"]) if a["depends_on"] else [],
+            depends_on=json.loads(a["depends_on"]) if a["depends_on"] else [],
         )
         for a in completed
     ]
@@ -224,7 +226,7 @@ def merge(run_id: str, dry_run: bool) -> None:
         if branch:
             click.echo(f"Merging {name} ({branch})...")
             try:
-                merge_branch(branch)
+                merge_branch_to_current(branch)
                 click.echo(f"  Merged successfully")
             except Exception as e:
                 click.echo(f"  Failed: {e}", err=True)

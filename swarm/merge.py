@@ -4,9 +4,11 @@ import logging
 import subprocess
 from pathlib import Path
 
+import json
+
 from swarm.db import get_agents, open_db
 from swarm.deps import DependencyGraph
-from swarm.git import merge_branch, remove_worktree
+from swarm.git import merge_branch_to_current, remove_worktree
 from swarm.models import AgentSpec
 
 logger = logging.getLogger("swarm.merge")
@@ -34,7 +36,7 @@ def get_merge_order(run_id: str) -> list[str]:
         AgentSpec(
             name=a["name"],
             prompt=a["prompt"],
-            depends_on=eval(a["depends_on"]) if a["depends_on"] else [],
+            depends_on=json.loads(a["depends_on"]) if a["depends_on"] else [],
         )
         for a in completed
     ]
@@ -78,7 +80,7 @@ def merge_run(run_id: str, cleanup: bool = True) -> dict:
             continue
 
         try:
-            merge_branch(branch)
+            merge_branch_to_current(branch)
             results["merged"].append(name)
             logger.info(f"Merged {name} ({branch})")
 

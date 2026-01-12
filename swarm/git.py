@@ -146,6 +146,35 @@ def merge_branch(
     return True
 
 
+def merge_branch_to_current(
+    branch: str,
+    message: str | None = None,
+    repo_path: Path | None = None,
+) -> bool:
+    """Merge a branch into the current branch.
+
+    Args:
+        branch: Branch name to merge
+        message: Optional commit message
+        repo_path: Repository path (defaults to cwd)
+
+    Returns:
+        True if merge succeeded, False if there were conflicts
+    """
+    repo = repo_path or Path.cwd()
+    msg = message or f"Merge {branch}"
+    result = run_git(["merge", branch, "--no-edit", "-m", msg], cwd=repo, check=False)
+
+    if result.returncode != 0:
+        if "CONFLICT" in result.stdout or "CONFLICT" in result.stderr:
+            logger.warning(f"Merge conflict merging {branch}")
+            return False
+        raise GitError(f"Merge failed: {result.stderr}")
+
+    logger.info(f"Merged {branch}")
+    return True
+
+
 def get_changed_files(branch: str, base: str, repo_path: Path | None = None) -> list[str]:
     """Get files changed between base and branch."""
     repo = repo_path or Path.cwd()
