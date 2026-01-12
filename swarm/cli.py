@@ -26,6 +26,8 @@ def main() -> None:
 @click.option("-p", "--prompt", multiple=True, help="Inline agent prompts")
 @click.option("--check", "check_cmd", default=None, help="Check command for inline prompts")
 @click.option("--sequential", is_flag=True, help="Run agents sequentially")
+@click.option("--run-id", "run_id", default=None, help="Explicit run ID")
+@click.option("--resume", is_flag=True, help="Resume existing run")
 @click.option("--mock", is_flag=True, help="Use mock workers (for testing)")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose output")
 def run(
@@ -33,11 +35,38 @@ def run(
     prompt: tuple[str, ...],
     check_cmd: str | None,
     sequential: bool,
+    run_id: str | None,
+    resume: bool,
     mock: bool,
     verbose: bool,
 ) -> None:
     """Run a swarm plan."""
-    if plan_file:
+    from swarm.db import run_exists
+
+    # Resume requires run_id
+    if resume and not run_id:
+        raise click.UsageError("--resume requires --run-id")
+
+    # Check if resuming existing run
+    if resume and run_id and run_exists(run_id):
+        # Load plan from existing run (or use provided plan as override)
+        if plan_file:
+            plan = parse_plan_file(Path(plan_file))
+        elif prompt:
+            defaults = Defaults(check=check_cmd) if check_cmd else None
+            plan = create_inline_plan(list(prompt), sequential=sequential, defaults=defaults)
+        else:
+            # Load plan from DB
+            from swarm.db import get_plan, open_db
+            import yaml
+            db = open_db(run_id)
+            plan_row = get_plan(db, run_id)
+            db.close()
+            if not plan_row:
+                raise click.UsageError(f"Plan not found for run: {run_id}")
+            from swarm.models import PlanSpec
+            plan = PlanSpec(**yaml.safe_load(plan_row["spec"]))
+    elif plan_file:
         plan = parse_plan_file(Path(plan_file))
     elif prompt:
         defaults = Defaults(check=check_cmd) if check_cmd else None
@@ -45,23 +74,27 @@ def run(
     else:
         raise click.UsageError("Either --file or --prompt is required")
 
-    # Validate
-    errors = validate_plan(plan)
-    if errors:
-        for error in errors:
-            click.echo(f"Error: {error}", err=True)
-        raise click.Abort()
+    # Validate (skip for resume with loaded plan)
+    if not resume:
+        errors = validate_plan(plan)
+        if errors:
+            for error in errors:
+                click.echo(f"Error: {error}", err=True)
+            raise click.Abort()
 
     # Set up logging
     from swarm.parser import generate_run_id
-    run_id = generate_run_id(plan.name)
-    setup_logging(run_id, verbose)
+    actual_run_id = run_id or generate_run_id(plan.name)
+    setup_logging(actual_run_id, verbose)
 
-    click.echo(f"Starting run: {run_id}")
+    if resume:
+        click.echo(f"Resuming run: {actual_run_id}")
+    else:
+        click.echo(f"Starting run: {actual_run_id}")
     click.echo(f"Agents: {[a.name for a in plan.agents]}")
 
     # Run
-    result = asyncio.run(run_plan(plan, run_id, use_mock=mock))
+    result = asyncio.run(run_plan(plan, actual_run_id, use_mock=mock, resume=resume))
 
     # Output result
     click.echo(f"\nRun completed: {result.run_id}")
@@ -292,6 +325,124 @@ def dashboard(run_id: str) -> None:
         click.echo("\n")
     finally:
         db.close()
+
+
+@main.command()
+@click.argument("run_id")
+@click.option("-v", "--verbose", is_flag=True, help="Verbose output")
+def resume(run_id: str, verbose: bool) -> None:
+    """Resume a previous run (alias for run --resume --run-id)."""
+    from swarm.db import get_plan, open_db, run_exists
+    import yaml
+
+    if not run_exists(run_id):
+        click.echo(f"Run not found: {run_id}", err=True)
+        raise click.Abort()
+
+    # Load plan from DB
+    db = open_db(run_id)
+    plan_row = get_plan(db, run_id)
+    db.close()
+
+    if not plan_row:
+        click.echo(f"Plan not found for run: {run_id}", err=True)
+        raise click.Abort()
+
+    from swarm.models import PlanSpec
+    plan = PlanSpec(**yaml.safe_load(plan_row["spec"]))
+
+    setup_logging(run_id, verbose)
+    click.echo(f"Resuming run: {run_id}")
+    click.echo(f"Agents: {[a.name for a in plan.agents]}")
+
+    result = asyncio.run(run_plan(plan, run_id, resume=True))
+
+    click.echo(f"\nRun completed: {result.run_id}")
+    click.echo(f"Success: {result.success}")
+    click.echo(f"Completed: {result.completed}")
+    click.echo(f"Failed: {result.failed}")
+    click.echo(f"Total cost: ${result.total_cost:.4f}")
+
+
+@main.command()
+@click.argument("run_id", required=False)
+@click.option("--all", "clean_all", is_flag=True, help="Clean all runs")
+def clean(run_id: str | None, clean_all: bool) -> None:
+    """Clean up run artifacts (worktrees, db)."""
+    import shutil
+    from swarm.db import list_runs
+
+    if clean_all:
+        runs = list_runs()
+        if not runs:
+            click.echo("No runs found")
+            return
+        for rid in runs:
+            run_dir = Path(f".swarm/runs/{rid}")
+            if run_dir.exists():
+                shutil.rmtree(run_dir)
+                click.echo(f"Cleaned: {rid}")
+        click.echo(f"Cleaned {len(runs)} runs")
+    elif run_id:
+        run_dir = Path(f".swarm/runs/{run_id}")
+        if run_dir.exists():
+            shutil.rmtree(run_dir)
+            click.echo(f"Cleaned: {run_id}")
+        else:
+            click.echo(f"Run not found: {run_id}", err=True)
+    else:
+        raise click.UsageError("Provide a run_id or use --all")
+
+
+@main.command()
+@click.argument("run_id", required=False)
+@click.argument("query", required=False)
+def db(run_id: str | None, query: str | None) -> None:
+    """Query the SQLite database."""
+    from swarm.db import list_runs, open_db
+
+    if not run_id:
+        # List runs
+        runs = list_runs()
+        if runs:
+            click.echo("Available runs:")
+            for rid in runs[:10]:
+                click.echo(f"  {rid}")
+            if len(runs) > 10:
+                click.echo(f"  ... and {len(runs) - 10} more")
+        else:
+            click.echo("No runs found")
+        return
+
+    try:
+        conn = open_db(run_id)
+    except Exception:
+        click.echo(f"Run not found: {run_id}", err=True)
+        raise click.Abort()
+
+    if query:
+        # Execute query
+        try:
+            cursor = conn.execute(query)
+            rows = cursor.fetchall()
+            if rows:
+                # Print header
+                cols = [desc[0] for desc in cursor.description]
+                click.echo("\t".join(cols))
+                click.echo("-" * 60)
+                for row in rows:
+                    click.echo("\t".join(str(v) for v in row))
+            else:
+                click.echo("No results")
+        except Exception as e:
+            click.echo(f"Query error: {e}", err=True)
+    else:
+        # Interactive mode hint
+        click.echo(f"Database: .swarm/runs/{run_id}/swarm.db")
+        click.echo("Usage: swarm db <run_id> \"SELECT * FROM agents\"")
+        click.echo("\nTables: plans, agents, events, responses")
+
+    conn.close()
 
 
 if __name__ == "__main__":

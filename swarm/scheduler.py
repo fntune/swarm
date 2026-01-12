@@ -20,6 +20,9 @@ from swarm.db import (
     insert_agent,
     insert_event,
     insert_plan,
+    open_db,
+    reset_failed_agents,
+    run_exists,
     update_agent_status,
     update_agent_worktree,
     update_plan_status,
@@ -53,6 +56,7 @@ class Scheduler:
         plan: PlanSpec,
         run_id: str | None = None,
         use_mock: bool = False,
+        resume: bool = False,
     ):
         """Initialize scheduler.
 
@@ -60,15 +64,34 @@ class Scheduler:
             plan: Plan specification
             run_id: Optional run ID (generated if not provided)
             use_mock: Use mock workers (for testing)
+            resume: Resume existing run (skip completed agents, reset failed)
         """
         self.plan = plan
         self.run_id = run_id or generate_run_id(plan.name)
         self.use_mock = use_mock
+        self.resume = resume
         self.tasks: dict[str, asyncio.Task] = {}
         self.db: sqlite3.Connection | None = None
 
     def _init_db(self) -> None:
         """Initialize database and insert plan/agents."""
+        if self.resume and run_exists(self.run_id):
+            # Resume existing run
+            self.db = open_db(self.run_id)
+            update_plan_status(self.db, self.run_id, "running")
+
+            # Reset failed/timeout agents for retry
+            reset_names = reset_failed_agents(self.db, self.run_id)
+            if reset_names:
+                logger.info(f"Reset agents for retry: {reset_names}")
+
+            agents = get_agents(self.db, self.run_id)
+            completed = [a["name"] for a in agents if a["status"] == "completed"]
+            pending = [a["name"] for a in agents if a["status"] == "pending"]
+            logger.info(f"Resuming run {self.run_id}: {len(completed)} completed, {len(pending)} pending")
+            return
+
+        # New run - initialize fresh
         self.db = init_db(self.run_id)
 
         # Insert plan
@@ -298,6 +321,7 @@ async def run_plan(
     plan: PlanSpec,
     run_id: str | None = None,
     use_mock: bool = False,
+    resume: bool = False,
 ) -> SchedulerResult:
     """Run a plan.
 
@@ -305,9 +329,10 @@ async def run_plan(
         plan: Plan specification
         run_id: Optional run ID
         use_mock: Use mock workers
+        resume: Resume existing run
 
     Returns:
         SchedulerResult
     """
-    scheduler = Scheduler(plan, run_id, use_mock)
+    scheduler = Scheduler(plan, run_id, use_mock, resume)
     return await scheduler.run()

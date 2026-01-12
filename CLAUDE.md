@@ -4,9 +4,7 @@
 
 **claude-swarm** - Multi-agent orchestration framework for Claude Code.
 
-Two-system architecture:
-- **Loop** (`/loop`): In-session plan-file iteration via stop hooks
-- **Orchestration** (`/spawn`, `/dag`, `/swarm`): External multi-agent coordination via Claude Agent SDK
+Executes agents in parallel git worktrees with dependency resolution and branch merging.
 
 ## Commands
 
@@ -17,6 +15,20 @@ swarm --help
 
 # Testing
 pytest tests/
+
+# Core CLI
+swarm run -f plan.yaml           # Execute plan spec
+swarm run -p "auth: Impl auth"   # Inline single agent
+swarm run -p "a: step1" -p "b: step2" --sequential  # Sequential chain
+swarm status <run_id>            # View agent status
+swarm logs <run_id> -a <agent>   # View agent logs
+swarm logs <run_id> --all        # View all logs
+swarm merge <run_id>             # Merge completed branches
+swarm cancel <run_id>            # Cancel running agents
+swarm dashboard <run_id>         # Live status view
+
+# Testing without Claude CLI
+swarm run -p "test: true" --mock
 ```
 
 ## Architecture
@@ -24,38 +36,59 @@ pytest tests/
 ```
 swarm/                    # Python package
 ├── cli.py               # Click CLI entrypoint
-├── loop.py              # Loop management (hook-based)
-├── spawn.py             # Worktree + SDK agent creation
-├── dag.py               # DAG orchestration
-├── models.py            # Pydantic state models
-└── state.py             # State file I/O
-
-hooks/
-└── stop_hook.py         # Stop hook for /loop
-
-commands/                # Slash command definitions
-├── loop.md
-├── spawn.md
-└── ...
+├── models.py            # Pydantic: AgentSpec, PlanSpec, Defaults
+├── parser.py            # YAML parsing, inline plan creation
+├── db.py                # SQLite setup, queries (WAL mode)
+├── deps.py              # Dependency graph, topological sort
+├── scheduler.py         # Parallel execution coordinator
+├── executor.py          # Agent worker (subprocess or mock)
+├── git.py               # Worktree creation, branch merging
+├── merge.py             # Branch consolidation CLI helper
+├── logs.py              # Log file management
+└── tools.py             # Agent toolset (mark_complete, etc.)
 ```
 
 ## Key Patterns
 
-1. **State files**: JSON in `.swarm/` directory, each agent owns its file
-2. **Completion token**: `<done/>` signals task completion
-3. **Worktrees**: Project-local `./worktrees/` with auto-cleanup after merge
-4. **Hook contract**: stdin JSON → stdout `{decision: "allow"|"block", reason?: string}`
+1. **SQLite state**: `.swarm/runs/{run_id}/swarm.db` (WAL mode for concurrency)
+2. **Git worktrees**: `.swarm/runs/{run_id}/worktrees/{agent}/` for isolation
+3. **Branch naming**: `swarm/{run_id}/{agent}`
+4. **Dependency merging**: When agent has depends_on, dependency branches merge into its worktree before execution
+5. **Check command**: Optional validation after agent completion (default: `true`)
+6. **Run scoping**: Each run gets unique ID like `inline-abc123-def456`
+
+## Plan Spec Format
+
+```yaml
+name: my-plan
+defaults:
+  check: "pytest tests/"
+agents:
+  - name: auth
+    prompt: "Implement authentication"
+  - name: api
+    prompt: "Add API endpoints"
+    depends_on: [auth]
+```
+
+## File Layout
+
+```
+.swarm/
+└── runs/{run_id}/
+    ├── swarm.db                # SQLite state
+    ├── worktrees/{agent}/      # Git worktrees
+    └── logs/{agent}.log        # Per-agent logs
+```
 
 ## Dependencies
 
 - `pydantic>=2.0` - State models
 - `click>=8.0` - CLI
-- `pyyaml>=6.0` - Config parsing
-- `jinja2>=3.0` - Template rendering (orchestration only)
-- `claude-agent-sdk` - SDK agent spawning (Phase 2+)
+- `pyyaml>=6.0` - Plan spec parsing
 
 ## Style
 
 - Follow global CLAUDE.md conventions
-- No templates for loop mode (plan-file iteration only)
-- Templates only for orchestration (pipelines, spawn)
+- SQLite WAL mode for concurrent agent access
+- Logs stay as files (for tail -f compatibility)

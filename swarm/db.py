@@ -393,3 +393,43 @@ def get_plan(db: sqlite3.Connection, run_id: str) -> sqlite3.Row | None:
         "SELECT *, max_cost_usd as budget_usd FROM plans WHERE run_id = ?",
         (run_id,),
     ).fetchone()
+
+
+def run_exists(run_id: str, base_path: Path | None = None) -> bool:
+    """Check if a run exists."""
+    db_path = get_db_path(run_id, base_path)
+    return db_path.exists()
+
+
+def reset_failed_agents(db: sqlite3.Connection, run_id: str) -> list[str]:
+    """Reset failed/timeout agents to pending for retry.
+
+    Returns list of agent names that were reset.
+    """
+    agents = db.execute(
+        "SELECT name FROM agents WHERE run_id = ? AND status IN ('failed', 'timeout')",
+        (run_id,),
+    ).fetchall()
+
+    names = [a["name"] for a in agents]
+
+    if names:
+        db.execute(
+            """UPDATE agents SET status = 'pending', error = NULL, iteration = 0,
+               updated_at = CURRENT_TIMESTAMP
+               WHERE run_id = ? AND status IN ('failed', 'timeout')""",
+            (run_id,),
+        )
+        db.commit()
+        logger.info(f"Reset {len(names)} agents for retry: {names}")
+
+    return names
+
+
+def list_runs(base_path: Path | None = None) -> list[str]:
+    """List all run IDs."""
+    base = base_path or Path.cwd()
+    runs_dir = base / ".swarm" / "runs"
+    if not runs_dir.exists():
+        return []
+    return sorted([d.name for d in runs_dir.iterdir() if d.is_dir()], reverse=True)
