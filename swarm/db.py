@@ -42,6 +42,10 @@ CREATE TABLE IF NOT EXISTS agents (
     max_cost_usd REAL DEFAULT 5.0,
     error TEXT,
     depends_on TEXT,
+    on_failure TEXT DEFAULT 'continue',
+    retry_count INTEGER DEFAULT 3,
+    retry_attempt INTEGER DEFAULT 0,
+    last_error TEXT,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (run_id, name),
@@ -140,13 +144,15 @@ def insert_agent(
     depends_on: list[str] | None = None,
     parent: str | None = None,
     plan_name: str | None = None,
+    on_failure: str = "continue",
+    retry_count: int = 3,
 ) -> None:
     """Insert an agent record."""
     db.execute(
         """INSERT INTO agents (
             run_id, name, plan_name, type, prompt, check_command, model,
-            max_iterations, max_cost_usd, depends_on, parent
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            max_iterations, max_cost_usd, depends_on, parent, on_failure, retry_count
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             run_id,
             name,
@@ -159,6 +165,8 @@ def insert_agent(
             max_cost_usd,
             json.dumps(depends_on or []),
             parent,
+            on_failure,
+            retry_count,
         ),
     )
     db.commit()
@@ -399,6 +407,54 @@ def run_exists(run_id: str, base_path: Path | None = None) -> bool:
     """Check if a run exists."""
     db_path = get_db_path(run_id, base_path)
     return db_path.exists()
+
+
+def increment_retry_attempt(
+    db: sqlite3.Connection,
+    run_id: str,
+    name: str,
+    error: str,
+) -> int:
+    """Increment retry attempt and save error. Returns new attempt count."""
+    db.execute(
+        """UPDATE agents SET
+           retry_attempt = retry_attempt + 1,
+           last_error = ?,
+           updated_at = CURRENT_TIMESTAMP
+           WHERE run_id = ? AND name = ?""",
+        (error, run_id, name),
+    )
+    db.commit()
+    row = db.execute(
+        "SELECT retry_attempt FROM agents WHERE run_id = ? AND name = ?",
+        (run_id, name),
+    ).fetchone()
+    return row[0] if row else 0
+
+
+def get_retryable_agents(db: sqlite3.Connection, run_id: str) -> list[sqlite3.Row]:
+    """Get failed agents that can be retried."""
+    return db.execute(
+        """SELECT * FROM agents
+           WHERE run_id = ? AND status = 'failed'
+           AND on_failure = 'retry' AND retry_attempt < retry_count""",
+        (run_id,),
+    ).fetchall()
+
+
+def reset_agent_for_retry(db: sqlite3.Connection, run_id: str, name: str) -> None:
+    """Reset a failed agent to pending for retry."""
+    db.execute(
+        """UPDATE agents SET
+           status = 'pending',
+           error = NULL,
+           iteration = 0,
+           updated_at = CURRENT_TIMESTAMP
+           WHERE run_id = ? AND name = ?""",
+        (run_id, name),
+    )
+    db.commit()
+    logger.info(f"Reset agent {name} for retry")
 
 
 def reset_failed_agents(db: sqlite3.Connection, run_id: str) -> list[str]:

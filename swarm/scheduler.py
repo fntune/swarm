@@ -15,12 +15,15 @@ from swarm.db import (
     get_agent,
     get_agents,
     get_pending_agents,
+    get_retryable_agents,
     get_total_cost,
+    increment_retry_attempt,
     init_db,
     insert_agent,
     insert_event,
     insert_plan,
     open_db,
+    reset_agent_for_retry,
     reset_failed_agents,
     run_exists,
     update_agent_status,
@@ -118,6 +121,8 @@ class Scheduler:
                 max_cost_usd=agent.max_cost_usd or defaults.max_cost_usd,
                 depends_on=agent.depends_on,
                 plan_name=self.plan.name,
+                on_failure=agent.on_failure or defaults.on_failure,
+                retry_count=agent.retry_count or defaults.retry_count,
             )
 
         logger.info(f"Initialized run {self.run_id} with {len(self.plan.agents)} agents")
@@ -163,11 +168,17 @@ class Scheduler:
         if self.plan.shared_context:
             shared_context = load_shared_context(self.plan.shared_context)
 
+        # Add error context for retries
+        error_context = self._build_error_context(agent_row)
+        prompt = agent_row["prompt"]
+        if error_context:
+            prompt = f"{prompt}\n\n{error_context}"
+
         # Build config
         config = AgentConfig(
             name=name,
             run_id=self.run_id,
-            prompt=agent_row["prompt"],
+            prompt=prompt,
             worktree=worktree_path,
             check_command=agent_row["check_command"] or "true",
             model=agent_row["model"] or "sonnet",
@@ -227,6 +238,75 @@ class Scheduler:
             {"error": "cost_exceeded", "total_cost": total_cost, "budget": budget},
         )
 
+    async def _handle_agent_failure(self, name: str, error: str) -> bool:
+        """Handle agent failure based on on_failure setting.
+
+        Returns True if run should stop.
+        """
+        agent = get_agent(self.db, self.run_id, name)
+        if not agent:
+            return False
+
+        on_failure = agent["on_failure"] or "continue"
+
+        if on_failure == "stop":
+            logger.warning(f"Agent {name} failed with on_failure=stop, cancelling run")
+            update_plan_status(self.db, self.run_id, "failed")
+
+            # Cancel all running tasks
+            for task_name, task in self.tasks.items():
+                if not task.done() and task_name != name:
+                    task.cancel()
+                    update_agent_status(self.db, self.run_id, task_name, "cancelled")
+
+            # Mark remaining pending agents as cancelled
+            for a in get_agents(self.db, self.run_id):
+                if a["status"] == "pending":
+                    update_agent_status(self.db, self.run_id, a["name"], "cancelled", "Run stopped due to failure")
+
+            return True
+
+        elif on_failure == "retry":
+            retry_count = agent["retry_count"] or 3
+            attempt = increment_retry_attempt(self.db, self.run_id, name, error)
+
+            if attempt < retry_count:
+                logger.info(f"Retrying agent {name} (attempt {attempt + 1}/{retry_count})")
+                reset_agent_for_retry(self.db, self.run_id, name)
+                insert_event(
+                    self.db,
+                    self.run_id,
+                    name,
+                    "progress",
+                    {"status": f"Retry attempt {attempt + 1}/{retry_count}", "last_error": error[:200]},
+                )
+            else:
+                logger.warning(f"Agent {name} exhausted retries ({retry_count})")
+                update_agent_status(self.db, self.run_id, name, "failed", f"Exhausted {retry_count} retries: {error}")
+
+        # on_failure == "continue" - do nothing special
+        return False
+
+    def _build_error_context(self, agent_row: sqlite3.Row) -> str:
+        """Build error context for retried agents."""
+        last_error = agent_row["last_error"]
+        retry_attempt = agent_row["retry_attempt"] or 0
+
+        if not last_error or retry_attempt == 0:
+            return ""
+
+        return f"""
+## Previous Attempt Failed
+
+This is retry attempt {retry_attempt + 1}. The previous attempt failed with:
+
+```
+{last_error[:500]}
+```
+
+Please address this error and continue with the task.
+"""
+
     def _build_result(self) -> SchedulerResult:
         """Build scheduler result from current state."""
         agents = get_agents(self.db, self.run_id)
@@ -284,18 +364,34 @@ class Scheduler:
                         self.tasks[row["name"]] = task
                         logger.info(f"Spawned agent {row['name']}")
 
-                # Clean up completed tasks
+                # Clean up completed tasks and handle failures
+                should_stop = False
                 for name, task in list(self.tasks.items()):
                     if task.done():
                         try:
                             result = task.result()
                             logger.info(f"Agent {name} finished: {result}")
+
+                            # Check if agent failed
+                            agent = get_agent(self.db, self.run_id, name)
+                            if agent and agent["status"] == "failed":
+                                error = agent["error"] or "Unknown error"
+                                should_stop = await self._handle_agent_failure(name, error)
+
                         except asyncio.CancelledError:
                             logger.info(f"Agent {name} was cancelled")
                         except Exception as e:
                             logger.error(f"Agent {name} raised exception: {e}")
                             update_agent_status(self.db, self.run_id, name, "failed", str(e))
+                            should_stop = await self._handle_agent_failure(name, str(e))
+
                         del self.tasks[name]
+
+                        if should_stop:
+                            break
+
+                if should_stop:
+                    break
 
                 # Check cost budget
                 if self.plan.cost_budget:
