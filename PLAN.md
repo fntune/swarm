@@ -1,947 +1,3738 @@
-# Claude Swarm - Design Plan
+# Claude Swarm - Revised DX Model & Agent Strategy
 
-## Vision
+## Design Principles
 
-A comprehensive orchestration system for Claude Code enabling:
-- **Parallel agents** working in git worktrees
-- **Pipeline workflows** (plan → implement → test → review)
-- **Hierarchical delegation** (manager → workers)
-- **Auto-detection completion** with templates
-- **Progress tracking** and checkpointing
+1. **CLI-first**: Rich CLI is the primary interface, designed for humans AND agents
+2. **Plan specs as input**: Agents write YAML specs, CLI executes them
+3. **Single slash command**: `/swarm` passes through to CLI (thin wrapper)
+4. **Dual execution model**: Managers run via manual loop (full context control), workers via SDK Agent class
+5. **Worktree isolation**: Every agent gets a worktree
+6. **Tool-based completion**: Agents signal completion via `mark_complete()` tool, not text markers
+7. **Blocking coordination**: Workers can block on manager responses for clarifications
+8. **Run-scoped state**: Every run gets a unique `run_id` with resumable state and namespaced artifacts
+
+## Terminology
+
+| Term | Meaning |
+|------|---------|
+| **type** | `worker` or `manager` - determines if agent can spawn subagents |
+| **use_role** | Optional specialized role template (architect, implementer, etc.) |
+| **worker** | Executes a single task, cannot spawn subagents |
+| **manager** | Can spawn subagents via `/swarm run`, receives worker events |
+| **role** | Predefined behavior template with system prompt, allowed tools, model |
+| **template** | Problem-type pattern (feature, bugfix) that expands to full plan spec |
+
+**Example combinations:**
+- `type: worker, use_role: implementer` - Worker using implementer template
+- `type: manager, use_role: architect` - Manager using architect template (can spawn workers)
+- `type: worker` (no use_role) - Basic worker with custom prompt
 
 ## Architecture
 
-### Distribution Layers
+### Dual Execution Model
+
+**Managers** run via manual loop for full context control:
+- Direct API calls, construct prompts dynamically
+- Read worker events before each turn
+- Can inject guidance, adjust strategy mid-flight
+
+**Workers** run via SDK Agent class with standard toolset:
+- Autonomous execution
+- Standard toolset for reporting (mark_complete, request_clarification, etc.)
+- Tools write to event bus / state files
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    User Interfaces                               │
-├─────────────────┬─────────────────┬─────────────────────────────┤
-│ Claude Code     │ CLI Tool        │ MCP Server                  │
-│ /loop, /spawn   │ orch loop       │ tools: spawn, status,       │
-│ /status, etc.   │ orch spawn      │ cancel, merge               │
-└────────┬────────┴────────┬────────┴──────────────┬──────────────┘
-         │                 │                        │
-         └─────────────────┴────────────────────────┘
-                           │
-                           ▼
-         ┌─────────────────────────────────┐
-         │  Python Package (shared logic)  │
-         │  ~/.claude/claude-swarm/swarm/  │
-         └─────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│  Manager/Orchestrator (Manual Loop)                     │
+│  ─────────────────────────────────────────────────────  │
+│  • Direct API calls, full context control               │
+│  • Reads worker events before each turn                 │
+│  • Constructs prompt with: task + events + state        │
+│  • Can inject guidance, adjust strategy mid-flight      │
+│  • Toolset: spawn_worker, respond_to_clarification, etc.│
+└─────────────────────────────────────────────────────────┘
+        │ spawns                    ▲ events
+        ▼                           │
+┌─────────────────────────────────────────────────────────┐
+│  Workers (SDK Agent + Standard Toolset)                 │
+│  ─────────────────────────────────────────────────────  │
+│  • Autonomous execution via Agent class                 │
+│  • Standard toolset for reporting                       │
+│  • Tools write to event bus / state files               │
+│  • Toolset: mark_complete, request_clarification, etc.  │
+└─────────────────────────────────────────────────────────┘
 ```
 
-### File Structure
+### System Overview
 
 ```
-~/.claude/
-├── claude-swarm/                    # Core orchestration system
-│   ├── .claude-plugin/plugin.json   # Claude Code plugin manifest
-│   ├── hooks/
-│   │   ├── hooks.json              # Hook registration (automatic)
-│   │   └── stop_hook.py            # Unified stop hook (Python)
-│   ├── swarm/                       # Python package (core logic)
-│   │   ├── __init__.py
-│   │   ├── cli.py                  # Click CLI entrypoint
-│   │   ├── loop.py                 # Loop management
-│   │   ├── spawn.py                # Worktree + agent creation
-│   │   ├── agents.py               # Agent polling/status (subprocess poll)
-│   │   ├── pipeline.py             # Sequential workflows
-│   │   ├── swarm_cmd.py            # Parallel spawning
-│   │   ├── merge.py                # Branch consolidation + auto-cleanup
-│   │   ├── coordination.py         # Per-agent files, merge on read
-│   │   ├── state.py                # State file I/O
-│   │   ├── templates.py            # Jinja2 template loading
-│   │   ├── models.py               # Pydantic models
-│   │   └── mcp_server.py           # MCP daemon server (Phase 5)
-│   ├── commands/                    # /slash commands (bash wrappers)
-│   │   ├── loop.md
-│   │   ├── spawn.md
-│   │   ├── pipeline.md
-│   │   ├── swarm.md
-│   │   ├── status.md
-│   │   ├── cancel.md
-│   │   └── merge.md
-│   ├── templates/
-│   │   ├── fix-tests.yaml
-│   │   ├── lint-fix.yaml
-│   │   ├── implement.yaml
-│   │   └── refactor.yaml
-│   ├── workflows/
-│   │   ├── tdd.yaml
-│   │   ├── feature.yaml
-│   │   └── refactor.yaml
-│   ├── pyproject.toml
-│   └── requirements.txt
-├── swarm/
-│   └── logs/                        # Central log directory
-│       └── {agent_id}.log          # One log file per agent
-└── state/
-    └── swarm.json                   # Global agent registry
-
-PROJECT/
-├── .gitignore                       # Contains: worktrees/
-└── worktrees/                       # Project-local worktrees
-    ├── .swarm/                      # Per-agent coordination files
-    │   ├── {agent_id}.json         # Each agent owns its file
-    │   └── ...                     # Merged on read for status
-    ├── auth/                        # Agent worktree (branch: auth)
-    │   └── .claude/agent.local.md  # Agent-specific state
-    └── cache/                       # Another worktree (branch: cache)
+┌──────────────────────────────────────────────────────┐
+│           Any Agent (Claude Code, custom, etc.)       │
+│                                                       │
+│   1. Analyzes task                                    │
+│   2. Writes plan spec: .swarm/plans/feature.yaml     │
+│   3. Invokes: /swarm run feature.yaml                │
+└──────────────────────┬───────────────────────────────┘
+                       │
+                       ▼
+              ┌─────────────────┐
+              │  /swarm <args>  │  ← Single slash command
+              │  (thin wrapper) │     passes through to CLI
+              └────────┬────────┘
+                       │
+                       ▼
+              ┌─────────────────────────────────────┐
+              │           swarm CLI                  │
+              │         (primary DX)                 │
+              │                                      │
+              │  swarm run plan.yaml                 │
+              │  swarm status                        │
+              │  swarm logs auth -f                  │
+              │  swarm cancel auth                   │
+              │  swarm merge                         │
+              │  swarm dashboard                     │
+              └────────────────┬────────────────────┘
+                               │
+         ┌─────────────────────┴─────────────────────┐
+         │                                           │
+         ▼                                           ▼
+┌─────────────────────┐                 ┌─────────────────────┐
+│  Manual Loop        │                 │  Claude Agent SDK   │
+│  (for managers)     │                 │  (for workers)      │
+└─────────┬───────────┘                 └─────────┬───────────┘
+          │                                       │
+          ▼                                       ▼
+   ┌───────────┐                    ┌─────────────────────────┐
+   │  manager  │                    │     Worker Agents       │
+   │  worktree │──── events ────────┤  auth │ cache │ logging │
+   │           │◄─── responses ─────│       │       │         │
+   └───────────┘                    └─────────────────────────┘
+          │                                       │
+          └───────────────────────────────────────┘
+                       │
+                        .swarm/runs/{run_id}/swarm.db
 ```
 
-## Two-System Architecture
+## Agent Toolsets
 
-The framework is split into two completely separate systems:
+### Worker Toolset (Standard)
 
-| Aspect | Loop (`/loop`) | Orchestration (`/spawn`, `/dag`, `/swarm`) |
-|--------|----------------|-------------------------------------------|
-| **Runs in** | Claude Code session | External Python (SDK) |
-| **Mechanism** | Stop hooks | Claude Agent SDK |
-| **State** | `.claude/agent.local.md` | `.swarm/` JSON files |
-| **Purpose** | Iterative plan execution | Multi-agent coordination |
-| **Interaction** | None - completely isolated | None - completely isolated |
+Every worker agent is deployed with this standard toolset for coordination:
 
-**Why separate?** Hooks intercept Claude Code exit events (in-session). SDK spawns external agents (out-of-session). These are mutually exclusive architectures that serve different use cases.
+| Tool | Behavior | Blocking |
+|------|----------|----------|
+| `mark_complete(summary)` | Runs check command at completion gate → passes: done, fails: returns error | No |
+| `request_clarification(question, escalate_to?)` | Emits event, waits for response. `escalate_to`: "parent" \| "human" \| "auto" (default) | **Yes** |
+| `report_progress(status, milestone?)` | Emits progress event; optional `milestone` marks named checkpoint | No |
+| `report_blocker(question)` | Emits blocker event, waits for guidance | **Yes** |
 
-## Core Components
+**Note:** Coordination tools are always allowed for all agents, regardless of any role `allowed_tools` restrictions.
 
-### 1. Loop (Single Agent) - `/loop`
+**Note:** Checks only run when `mark_complete()` is called; successful completion cascades to dependent agents and manager orchestration.
 
-Simplified plan-file iteration:
-- Iterates on existing plan files (PLAN.md, TODO.md, etc.)
-- Safe defaults (max=30 iterations)
-- Claude-native `<done/>` token for completion
-- CLI access via `swarm loop`
-- Replaces active loop if one exists
+**Milestones:** Use `report_progress(status, milestone="core_impl")` to mark named checkpoints.
+Milestones are recorded as events and help managers track progress across workers.
 
-```bash
-/loop                               # Iterate on default plan file
-/loop PLAN.md                       # Iterate on specific plan file
-/loop --max 20                      # Custom iteration limit
+**Blocking flow for `request_clarification`:**
 
-# CLI equivalent
-swarm loop
-swarm loop PLAN.md --max 20
+```
+Worker                              Manager (manual loop)
+───────                             ────────────────────
+request_clarification("JWT?")  →    [event: clarification(id=abc123, agent=auth)]
+     │                                      │
+     ▼                                      ▼
+ [BLOCKED]                         Sees event in next turn via
+ status='blocked'                  get_pending_clarifications()
+ polling responses table           decides response:
+     │                                      │
+     │                              ┌───────┴───────┐
+     │                              ▼               ▼
+     │                  respond_to_clarification   (if escalate_to="human",
+     │                   ("abc123", "Use JWT")      forward to human dashboard)
+     │                              │
+     │                              ▼
+     │                    [INSERT INTO responses]
+     ◄──────────────────────────────┘
+     │
+  [UNBLOCKED]
+  status='running'
+  receives "Use JWT" as tool result
+  continues execution
 ```
 
-**Completion:** Agent outputs `<done/>` when plan is complete.
-**Auto-commit:** Changes committed on each iteration for checkpointing.
+**Implementation detail**: The `request_clarification` tool:
+1. Inserts event into `events` table
+2. Updates agent status to `blocked`
+3. Polls `responses` table for manager's response (indexed query)
+4. When response found, marks it consumed and returns to agent
 
-### 2. Parallel Agents - `/spawn`
+```python
+def request_clarification(question: str, timeout: int = 300) -> str:
+    """Blocking call - waits for manager response."""
+    # 1. Emit event
+    clarification_id = uuid4().hex
+    run_id = current_run_id()
+    db.execute(
+        "INSERT INTO events (id, run_id, agent, event_type, data) VALUES (?, ?, ?, 'clarification', ?)",
+        (clarification_id, run_id, current_agent_name(), json.dumps({
+            "question": question,
+            "root_agent": root_agent_name(),
+            "parent_agent": parent_agent_name(),
+            "tree_path": tree_path(),
+        }))
+    )
+    db.execute(
+        "UPDATE agents SET status = 'blocked' WHERE run_id = ? AND name = ?",
+        (run_id, current_agent_name())
+    )
+    db.commit()
 
-Spawn agents in git worktrees:
+    # 2. Poll for response
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        row = db.execute("""
+            SELECT id, response FROM responses
+            WHERE run_id = ? AND clarification_id = ? AND consumed = 0 LIMIT 1
+        """, (run_id, clarification_id)).fetchone()
 
-```bash
-# Spawn 3 parallel agents
-/spawn "Implement auth module" --worktree auth
-/spawn "Implement cache module" --worktree cache
-/spawn "Implement logging module" --worktree logging
+        if row:
+            db.execute(
+                "UPDATE responses SET consumed = 1 WHERE run_id = ? AND id = ?",
+                (run_id, row[0])
+            )
+            db.execute(
+                "UPDATE agents SET status = 'running' WHERE run_id = ? AND name = ?",
+                (run_id, current_agent_name())
+            )
+            db.commit()
+            return row[1]
 
-# View status
-/status
+        time.sleep(2)  # Poll every 2s
 
-# Merge when complete
-/merge auth cache logging
+    # Timeout: update status and emit error event
+    db.execute(
+        "UPDATE agents SET status = 'timeout' WHERE run_id = ? AND name = ?",
+        (run_id, current_agent_name())
+    )
+    db.execute(
+        "INSERT INTO events (id, run_id, agent, event_type, data) VALUES (?, ?, ?, 'error', ?)",
+        (uuid4().hex, run_id, current_agent_name(), json.dumps({"error": "Clarification timeout", "question": question}))
+    )
+    db.commit()
+    raise TimeoutError("No response from manager")
+
+def respond_to_clarification(clarification_id: str, response: str) -> None:
+    """Manager responds to a worker's clarification request, unblocking them."""
+    run_id = current_run_id()
+    db.execute(
+        "INSERT INTO responses (run_id, clarification_id, response) VALUES (?, ?, ?)",
+        (run_id, clarification_id, response)
+    )
+    db.commit()
+
+
+def get_pending_clarifications() -> list[dict]:
+    """Get all clarifications and blockers awaiting manager response."""
+    run_id = current_run_id()
+    rows = db.execute("""
+        SELECT e.id, e.agent, e.event_type, json_extract(e.data, '$.question') as question
+        FROM events e
+        WHERE e.run_id = ? AND e.event_type IN ('clarification', 'blocker')
+        AND NOT EXISTS (
+            SELECT 1 FROM responses r WHERE r.clarification_id = e.id
+        )
+    """, (run_id,)).fetchall()
+    return [{"id": r[0], "agent": r[1], "type": r[2], "question": r[3]} for r in rows]
 ```
 
-**Implementation:**
-- Each `/spawn` creates a git worktree
-- Launches background Claude Code session
-- Tracks in `~/.claude/state/orchestrator.json`
-- Uses existing `worktree-diff` for consolidation
+### Manager Toolset
 
-### 3. Pipeline Workflows - `/pipeline`
+Managers use these tools to coordinate workers:
 
-Sequential agent handoffs:
+| Tool | Behavior |
+|------|----------|
+| `spawn_worker(name, prompt, check?)` | Creates SDK agent in worktree with standard toolset |
+| `respond_to_clarification(clarification_id, response)` | Writes response, unblocks waiting worker |
+| `cancel_worker(name)` | Terminates worker agent |
+| `get_worker_status(name?)` | Returns current state of worker(s) |
+| `get_pending_clarifications()` | Returns list of {id, agent, question} awaiting response |
+| `mark_plan_complete(summary)` | Signals orchestration done, runs manager check (if defined) |
 
-```bash
-/pipeline feature "Add user authentication"
-# Runs: plan → implement → test → review
+**Note:** Clarification events include a unique `clarification_id`. Managers see this ID in the event
+and use it to respond precisely. This avoids ambiguity if an agent has multiple pending requests.
+
+**Manager loop pseudocode:**
+
+```python
+while not done:
+    # 1. Gather events from all workers
+    events = read_worker_events()
+
+    # 2. Construct prompt with task + events + current state
+    prompt = build_prompt(task, events, worker_states)
+
+    # 3. Call API
+    response = call_claude_api(prompt, manager_toolset)
+
+    # 4. Execute tool calls (spawn, respond, cancel, etc.)
+    for tool_call in response.tool_calls:
+        execute_tool(tool_call)
+
+    # 5. Check for completion
+    if response.calls_mark_plan_complete:
+        done = True
 ```
 
-**Pre-built pipelines:**
+## Plan Spec Format
+
+Full schema with all options including orchestration:
 
 ```yaml
-# workflows/feature.yaml
-name: feature
-description: Full feature development pipeline
-stages:
-  - name: plan
-    template: plan
-    output: PLAN.md
-  - name: implement
-    template: implement
-    input: PLAN.md
-    check: "ruff check . && pytest"
-  - name: review
-    template: review
-    input: git diff main...HEAD
-```
+# .swarm/plans/feature-auth.yaml
+name: feature-auth                      # Required: plan identifier
+description: "Implement user auth"      # Optional: human description
 
-### 4. Swarm (Parallel + Merge) - `/swarm`
+# Run metadata (auto-generated if omitted)
+run:
+  id: "2024-03-19T12-30-45Z"            # Optional: set to resume a prior run
+  resume: false                         # true = resume this run_id
 
-Parallel agents with automatic merge:
+# Plan-level defaults (can be overridden per-agent)
+defaults:
+  max_iterations: 30
+  check: "pytest"                       # Completion gate: must pass for mark_complete() to succeed
+  on_failure: continue                  # continue | stop | retry
+  retry_count: 3                        # Max retries before marking failed
+  model: sonnet                         # sonnet | opus | haiku
+  max_cost_usd: 5.0                     # Per-agent cost limit
+  # Note: stuck detection configured in events.stuck section
 
-```bash
-/swarm refactor "Refactor all services to use async" --pattern "src/services/*.py"
-# Creates N agents for N files, merges when all complete
-```
+# Plan-level cost budget
+cost_budget:
+  total_usd: 25.0                       # Total budget for entire plan
+  on_exceed: pause                      # pause | cancel | warn
 
-### 5. Status & Control - `/status`, `/cancel`
+# Shared context files (all agents can read these)
+shared_context:
+  - "CLAUDE.md"
+  - "docs/architecture.md"
 
-```bash
-/status
-# ┌──────────┬──────────┬─────────┬────────────┐
-# │ Agent    │ Worktree │ Status  │ Iteration  │
-# ├──────────┼──────────┼─────────┼────────────┤
-# │ auth     │ wt-auth  │ running │ 5/30       │
-# │ cache    │ wt-cache │ done    │ 12/30      │
-# │ logging  │ wt-log   │ failed  │ 8/30       │
-# └──────────┴──────────┴─────────┴────────────┘
+# Orchestration settings
+orchestration:
+  # Manager receives events inline in prompt
+  event_injection: true
 
-/cancel auth         # Cancel specific agent
-/cancel --all        # Cancel all agents
-```
+  # Circuit breaker
+  circuit_breaker:
+    threshold: 3                        # Stop if >N agents fail
+    action: cancel_all                  # cancel_all | pause | notify_only
 
-## State Management
+  # Dependency context settings (for depends_on branch merges)
+  dependency_context:
+    mode: full                          # full | diff_only | paths
+    # For diff_only: only merge files changed by the dependency
+    # For paths: only merge files matching the patterns below
+    include_paths:                      # Only used when mode=paths
+      - "src/**/*.py"
+      - "tests/**/*.py"
+    exclude_paths:                      # Excluded from merge (all modes)
+      - "**/__pycache__/**"
+      - "*.pyc"
 
-### Orchestrator State (`~/.claude/state/orchestrator.json`)
+  # Merge settings
+  merge:
+    target_branch: null                 # null = auto-detect default branch (main/master)
+    strategy: bottom_up                 # bottom_up | root_only
+    on_conflict: spawn_resolver         # spawn_resolver | fail | manual
+    resolver_timeout: 120               # Seconds before resolver times out
+    resolver_max_cost: 2.0              # USD limit for resolver agent
+    fallback: manual                    # What to do if resolver fails: manual | fail
+    auto_cleanup: true                  # Delete worktrees after merge
 
-```json
-{
-  "version": 1,
-  "agents": {
-    "auth-abc123": {
-      "name": "auth",
-      "worktree": "/path/to/wt-auth",
-      "branch": "feature-auth",
-      "status": "running",
-      "iteration": 5,
-      "max_iterations": 30,
-      "started_at": "2026-01-01T12:00:00Z",
-      "pid": 12345,
-      "check_command": "pytest tests/auth/",
-      "template": "implement"
-    }
-  },
-  "pipelines": {
-    "feature-xyz": {
-      "name": "Add user auth",
-      "current_stage": "implement",
-      "stages": ["plan", "implement", "test", "review"],
-      "completed": ["plan"],
-      "artifacts": {
-        "plan": "PLAN.md"
-      }
-    }
-  }
-}
-```
+# Agent definitions
+agents:
+  - name: auth                          # Required: agent identifier
+    type: worker                        # worker | manager (can spawn subagents)
+    use_role: implementer               # Optional: use built-in role template
+    prompt: |                           # Required: task description
+      Implement JWT authentication with refresh tokens.
+      - Create auth service in src/services/auth.py
+      - Add login/logout endpoints
+      - Implement token refresh logic
 
-### Agent State (per worktree: `.claude/agent.local.md`)
+      When complete, call mark_complete() tool.
+      If blocked, call request_clarification() or report_blocker().
 
-```yaml
----
-active: true
-iteration: 5
-max_iterations: 30
-completion_token: "<done/>"
-parent_pipeline: "feature-xyz"
-started_at: "2026-01-01T12:00:00Z"
----
+    # Optional overrides (inherit from defaults if not specified)
+    max_iterations: 50
+    check: "pytest tests/auth/"
+    on_failure: retry
+    retry_count: 5
+    model: opus                         # Override for complex task
 
-Implement auth module per PLAN.md...
+    # Dependencies (automatic context inheritance)
+    depends_on: []                      # Files from dep branches auto-injected
 
-When complete, output <done/> to signal completion.
-```
+    # Environment variables
+    env:
+      DEBUG: "true"
 
-## Communication Patterns
+    # Events this agent should emit
+    milestones:
+      - name: core_impl
+        description: "Core implementation complete"
+      - name: tests_written
+        description: "Tests written and passing"
 
-### Layer 1: Git (Artifact Durability)
-- Each agent commits to own branch in its worktree
-- Artifacts passed via committed files (PLAN.md, etc.)
-- Full audit trail via git history
-- Merge conflicts handled at consolidation time
-
-### Layer 2: Coordination State (Per-Agent Files)
-```
-./worktrees/.swarm/
-├── {agent_id}.json     # Each agent owns its file
-├── tasks/              # Task spec files for DAG orchestration
-│   └── feature-xyz.md  # Manager-written task specs
-└── results/            # Completed task results
-    └── {task_name}.json
-```
-
-**Agent state file schema:**
-```json
-{
-  "agent_id": "auth-abc123",
-  "status": "running",
-  "iteration": 5,
-  "worktree": "auth",
-  "branch": "auth",
-  "started_at": "2026-01-01T12:00:00Z"
-}
-```
-
-**Task result schema:**
-```json
-{
-  "task_name": "auth-module",
-  "status": "completed",
-  "result": {
-    "summary": "Implemented JWT auth with refresh tokens",
-    "files_changed": ["src/auth.py", "src/middleware.py"],
-    "tests_passed": true
-  },
-  "completed_at": "2026-01-01T14:30:00Z"
-}
-```
-
-### Layer 3: Per-Agent State
-- `./worktrees/AGENT/.claude/agent.local.md` - agent's own loop state
-- Read by stop-hook for loop control
-- Updated by agent each iteration
-
-### Coordination Flow (Simple)
-```
-1. Agent starts → writes own state file
-2. Agent works → commits to branch → updates state
-3. Agent completes → writes <done/> → writes result file
-4. Orchestrator → reads all state files → updates status
-5. Orchestrator → merges branches → cleans up
-```
-
-## DAG Orchestration (Multi-Agent)
-
-### Task Spec Format (Markdown + YAML Frontmatter)
-
-Manager agent writes task specs to `.swarm/tasks/`:
-
-```markdown
----
-name: implement-user-auth
-type: dag
-subtasks:
-  - name: auth-module
-    prompt: "Implement JWT authentication with refresh tokens"
-    worktree: auth
-    depends_on: []
-    on_failure: continue   # continue | stop | retry
-
-  - name: cache-module
-    prompt: "Implement Redis session cache"
-    worktree: cache
-    depends_on: []
-    on_failure: stop
+  - name: cache
+    type: worker
+    use_role: implementer
+    prompt: |
+      Implement Redis session cache.
+      - Create cache service in src/services/cache.py
+      - Add TTL support
+      - Implement cache invalidation
+    check: "pytest tests/cache/"
 
   - name: integration
-    prompt: "Integrate auth with cache, add middleware"
-    worktree: integration
-    depends_on: [auth-module, cache-module]
-    on_failure: retry
----
+    type: worker
+    use_role: integrator
+    prompt: |
+      Integrate auth with cache, add middleware.
+      - Wire auth to use cache for sessions
+      - Add auth middleware to API routes
+    depends_on: [auth, cache]           # Auto-inherits files from auth + cache branches
+    check: "pytest"
 
-# Feature: User Authentication
-
-Manager decomposed this feature into 3 subtasks.
-Auth and cache can run in parallel, integration waits for both.
+# Plan completion options
+on_complete: merge                      # merge | none | notify
 ```
 
-### DAG Execution Flow
+### Run Identity & Resumability
 
-```
-                    ┌─────────────┐
-                    │   Manager   │
-                    │   Agent     │
-                    └──────┬──────┘
-                           │ writes task spec
-                           ▼
-              ┌────────────────────────┐
-              │ .swarm/tasks/auth.md   │
-              └────────────┬───────────┘
-                           │ orchestrator detects
-                           ▼
-              ┌────────────────────────┐
-              │   Dependency Resolver  │
-              │   (topological sort)   │
-              └────────────┬───────────┘
-                           │
-           ┌───────────────┼───────────────┐
-           │               │               │
-           ▼               ▼               │
-    ┌─────────────┐ ┌─────────────┐        │
-    │ auth-module │ │cache-module │        │
-    │  (parallel) │ │  (parallel) │        │
-    └──────┬──────┘ └──────┬──────┘        │
-           │               │               │
-           └───────┬───────┘               │
-                   │ both complete         │
-                   ▼                       │
-           ┌─────────────┐                 │
-           │ integration │ ◄───────────────┘
-           │(waits for deps)
-           └──────┬──────┘
-                  │
-                  ▼
-           ┌─────────────┐
-           │  Results to │
-           │ .swarm/results/
-           └─────────────┘
-```
+- `run.id` namespaces all state: `.swarm/runs/{run_id}/` (db, worktrees, logs, telemetry, plan snapshot).
+- Managers can spawn new runs with fresh `run_id` values; context inheritance remains via branches and plan snapshots.
+- Branches are namespaced as `swarm/{run_id}/{agent}` to avoid collisions across runs.
+- Resume loads `.swarm/runs/{run_id}/plan.yaml`, reuses worktrees/branches, and skips already-completed agents.
+- CLI: `swarm run plan.yaml --run-id <id>` or `swarm run plan.yaml --resume --run-id <id>` (alias: `swarm resume <id>`).
 
-### Failure Handling (Per-Task Configurable)
+### Manager Agent Plan Spec
 
-| `on_failure` | Behavior |
-|--------------|----------|
-| `continue` | Mark failed, continue independent branches |
-| `stop` | Cancel all pending/running tasks immediately |
-| `retry` | Retry with error context (up to 3 times) |
-
-### Cyclic Dependencies (Iterative Patterns)
-
-Cycles are allowed for iterative refinement (e.g., test→fix→test):
+When an agent has `type: manager`, it can spawn subagents:
 
 ```yaml
-subtasks:
+name: feature-complex
+description: "Complex feature requiring decomposition"
+
+agents:
+  - name: architect
+    type: manager                       # Can spawn subagents
+    use_role: architect                 # Uses architect role template
+    prompt: |
+      You are a software architect.
+
+      Task: Implement user authentication system
+
+      Process:
+      1. Explore the codebase
+      2. Break down into subtasks
+      3. Write a plan spec: .swarm/plans/architect-tasks.yaml (include run.id if resuming)
+      4. Spawn workers: /swarm run architect-tasks.yaml --run-id <id>
+      5. Monitor via events (injected into your context)
+      6. Respond to stuck workers with guidance
+      7. Review completed work
+      8. Merge: /swarm merge
+      9. Call mark_plan_complete() when done
+
+    # Manager settings
+    manager:
+      max_subagents: 5                  # Limit how many workers
+      event_poll_interval: 10           # Seconds between event checks
+      guidance_enabled: true            # Can respond to stuck workers
+
+    check: "pytest && ruff check"
+
+orchestration:
+  event_injection: true                 # Critical for manager
+```
+
+### Nested Hierarchy Naming
+
+When managers spawn workers, names are hierarchical:
+
+```yaml
+# Root plan spawns 'architect' manager
+# architect manager spawns: auth, cache, integration
+# Resulting agent names:
+#   - architect
+#   - architect.auth
+#   - architect.cache
+#   - architect.integration
+#
+# If auth is also a manager and spawns: tokens, validation
+#   - architect.auth.tokens
+#   - architect.auth.validation
+```
+
+**Note:** Agent names stay hierarchical; run identity is separate and namespaces paths/branches.
+
+### Event Configuration
+
+```yaml
+# Configure which events agents emit
+events:
+  # Standard events
+  standard:
+    - started        # Emitted by orchestrator on agent spawn
+    - progress       # Emitted via report_progress() tool
+    - clarification  # Emitted via request_clarification() tool
+    - blocker        # Emitted via report_blocker() tool
+    - done           # Emitted via mark_complete() on success
+    - error          # Emitted by orchestrator on failure/timeout
+
+  # Custom milestones (emitted via report_progress with milestone param)
+  milestones:
+    - name: exploration_complete
+      description: "Agent has finished exploring the codebase"
+    - name: implementation_done
+      description: "Core implementation is complete"
+
+  # Stuck detection (automatic, no text markers needed)
+  stuck:
+    idle_iterations: 10                 # Auto-detect after N iterations without progress
+    # Progress is tracked via report_progress() calls and iteration updates
+```
+
+**Note:** All events are tool-based. No text markers are used for detection.
+
+## Specialized Roles & Templates
+
+Roles define behavior templates (system prompts, tool restrictions, models).
+Agents specify `use_role: <role_name>` to inherit these settings.
+Coordination tools are always allowed and do not need to be listed in `allowed_tools`.
+
+**Note:** A role's `can_spawn: true` means the role is designed for managers.
+The agent must still have `type: manager` to actually spawn subagents.
+
+### Built-in Role Library
+
+Predefined roles with tailored capabilities:
+
+```yaml
+# Built-in roles (swarm/roles/*.yaml)
+roles:
+  architect:
+    description: "Decomposes problems, designs solutions"
+    system_prompt: |
+      You are a software architect. Your job is to:
+      1. Analyze requirements
+      2. Design solutions
+      3. Break down into implementable tasks
+      4. Create plan specs for workers
+    allowed_tools: [Read, Glob, Grep, Write]  # No Bash - planning only
+    can_spawn: true                            # Can create subagents
+    model: opus                                # Complex reasoning needed
+
+  implementer:
+    description: "Writes production code"
+    system_prompt: |
+      You are a code implementer. Your job is to:
+      1. Read existing code to understand patterns
+      2. Implement the specified feature/fix
+      3. Follow project conventions
+      4. Ensure check command passes
+    allowed_tools: [Read, Write, Edit, Bash, Glob, Grep]
+    can_spawn: false
+    model: sonnet
+
+  tester:
+    description: "Writes and runs tests"
+    system_prompt: |
+      You are a test engineer. Your job is to:
+      1. Understand what needs testing
+      2. Write comprehensive tests
+      3. Run tests and ensure they pass
+      4. Report coverage
+    allowed_tools: [Read, Write, Edit, Bash, Glob, Grep]
+    can_spawn: false
+    check: "pytest --cov"
+
+  reviewer:
+    description: "Reviews code for quality"
+    system_prompt: |
+      You are a code reviewer. Your job is to:
+      1. Review changes for correctness
+      2. Check for edge cases
+      3. Verify tests are adequate
+      4. Suggest improvements
+    allowed_tools: [Read, Glob, Grep]  # Read-only
+    can_spawn: false
+    output: "review_report.md"        # Creates review artifact
+
+  debugger:
+    description: "Diagnoses and fixes issues"
+    system_prompt: |
+      You are a debugging expert. Your job is to:
+      1. Reproduce the issue
+      2. Identify root cause
+      3. Propose fix
+      4. Verify fix works
+    allowed_tools: [Read, Write, Edit, Bash, Glob, Grep]
+    can_spawn: false
+
+  refactorer:
+    description: "Improves code structure"
+    system_prompt: |
+      You are a refactoring specialist. Your job is to:
+      1. Understand current code structure
+      2. Identify improvement opportunities
+      3. Refactor while preserving behavior
+      4. Ensure tests still pass
+    allowed_tools: [Read, Write, Edit, Bash, Glob, Grep]
+    can_spawn: false
+    check: "pytest"  # Must not break existing tests
+
+  integrator:
+    description: "Combines work from multiple sources"
+    system_prompt: |
+      You are an integration specialist. Your job is to:
+      1. Review work from multiple agents
+      2. Resolve conflicts
+      3. Ensure components work together
+      4. Run integration tests
+    allowed_tools: [Read, Write, Edit, Bash, Glob, Grep]
+    can_spawn: false
+    check: "pytest tests/integration/"
+```
+
+### Custom Role Definition
+
+Users can define custom roles:
+
+```yaml
+# In plan spec
+custom_roles:
+  security_auditor:
+    description: "Reviews code for security issues"
+    system_prompt: |
+      You are a security expert. Review for:
+      - Injection vulnerabilities
+      - Authentication issues
+      - Data exposure
+    allowed_tools: [Read, Glob, Grep]
+    output: "security_report.md"
+
+  performance_optimizer:
+    description: "Identifies and fixes performance issues"
+    system_prompt: |
+      You are a performance engineer. Your job is to:
+      1. Profile the code
+      2. Identify bottlenecks
+      3. Optimize critical paths
+    allowed_tools: [Read, Write, Edit, Bash, Glob, Grep]
+    check: "python benchmark.py"
+```
+
+### Problem-Type Templates
+
+Built-in templates expand to full plan specs. Templates define:
+- Which roles to use
+- Execution order (parallel groups, sequential phases)
+- Dependencies between agents
+
+```yaml
+# templates/feature.yaml - New Feature Development
+name: feature
+description: "Full feature development pipeline"
+
+# Templates define phases that expand to agents
+phases:
+  - name: design
+    agents:
+      - name: architect
+        type: manager
+        use_role: architect
+
   - name: implement
-    depends_on: []
+    parallel: true                    # All agents in this phase run in parallel
+    depends_on: [design]
+    agents:
+      - name: "impl-{component}"      # Placeholder for each component
+        type: worker
+        use_role: implementer
+
   - name: test
     depends_on: [implement]
-  - name: fix
+    agents:
+      - name: tester
+        type: worker
+        use_role: tester
+
+  - name: finalize
     depends_on: [test]
-    on_failure: continue
-  - name: test  # Cycle back to test
+    agents:
+      - name: integrator
+        type: worker
+        use_role: integrator
+      - name: reviewer
+        type: worker
+        use_role: reviewer
+
+# templates/bugfix.yaml - Bug Fix Pipeline
+name: bugfix
+description: "Diagnose and fix a bug"
+phases:
+  - name: diagnose
+    agents:
+      - name: debugger
+        type: worker
+        use_role: debugger
+  - name: fix
+    depends_on: [diagnose]
+    agents:
+      - name: fixer
+        type: worker
+        use_role: implementer
+  - name: verify
     depends_on: [fix]
-    max_iterations: 5  # Default: 5, then break cycle
+    agents:
+      - name: verifier
+        type: worker
+        use_role: tester
 ```
 
-### Tree Decomposition Pattern
+### Using Templates
 
-For dynamic work breakdown:
+```bash
+# Use built-in template
+swarm run --template feature "Implement user authentication"
 
-```
-1. Manager agent receives complex task
-2. Manager analyzes, writes task spec with subtasks
-3. Orchestrator spawns workers per subtask
-4. Workers complete, write results to .swarm/results/
-5. Worker requests new subtask → manager reviews → modifies spec
-6. Manager reads results via coordination state
-7. Manager synthesizes final output
+# Template expands to full plan spec
+# Architect analyzes task, spawns appropriate implementers
 ```
 
-### Orchestrator Scheduler
+### Template-Based Plan Spec
 
-**Two modes:**
-- **Daemon mode**: `swarm scheduler start` - polls for task specs
-- **Hook mode**: Triggered on agent completion for simple flows
+```yaml
+# .swarm/plans/auth-feature.yaml
+name: auth-feature
+template: feature                    # Use built-in template
 
-```python
-# Daemon scheduler (start with: swarm scheduler start)
-def scheduler_loop():
-    while running:
-        specs = read_task_specs(".swarm/tasks/")
+# Template parameters
+params:
+  components:
+    - name: jwt_tokens
+      description: "JWT token generation and validation"
+    - name: password_hashing
+      description: "Secure password hashing"
+    - name: auth_service
+      description: "Main authentication service"
+      depends_on: [jwt_tokens, password_hashing]
 
-        for spec in specs:
-            graph = build_dependency_graph(spec.subtasks)
-
-            # Handle cycles with max-depth tracking
-            for task in graph.ready_tasks():
-                if task.cycle_count < task.max_iterations:
-                    if not is_running(task):
-                        spawn_agent(task)
-
-            for task in graph.running_tasks():
-                # Check status field in coordination state
-                if get_task_status(task) == "completed":
-                    handle_completion(task, graph)
-
-        sleep(poll_interval)
-
-# Stop with: swarm scheduler stop
+# Template expands to:
+# architect → jwt_tokens (impl) + password_hashing (impl) + auth_service (impl)
+#          → tester → integrator → reviewer
 ```
 
-## Implementation Phases
+### Dynamic Tree Generation
 
-### Phase 1: Loop + Foundation
-**Goal:** Single-agent plan-file iteration with CLI
+Architect agents can dynamically generate implementation trees:
 
-**Dependencies:** `pydantic`, `click`, `pyyaml`
+```yaml
+agents:
+  - name: planner
+    type: manager
+    use_role: architect
+    prompt: |
+      Analyze this task and create an implementation tree.
 
-1. Create plugin directory structure with `pyproject.toml`
-2. Implement `swarm/models.py` - Pydantic models for state (LoopState)
-3. Implement `swarm/state.py` - State file I/O (read/write `.claude/agent.local.md`)
-4. Implement `hooks/stop_hook.py`:
-   - Detect `<done/>` token in output
-   - Handle retry with error + conversation summary
-   - Auto-commit on each iteration
-5. Implement `swarm/loop.py` - Loop setup, cancel-and-replace if active
-6. Implement `swarm/cli.py` - Click CLI (`swarm loop`, `swarm cancel`)
-7. Implement slash commands (bash wrappers calling Python):
-   - `/loop` → `python ~/.claude/claude-swarm/swarm/cli.py loop "$@"`
-   - `/cancel` → `python ~/.claude/claude-swarm/swarm/cli.py cancel`
-8. Add shell alias to `.zshrc`: `alias swarm="python ~/.claude/claude-swarm/swarm/cli.py"`
-9. Write integration tests for loop lifecycle
+      Task: {{task_description}}
 
-**Deliverable:** `/loop PLAN.md` and `swarm loop` work end-to-end
+      Based on your analysis:
+      1. Identify components needed
+      2. Choose appropriate roles for each
+      3. Define dependencies
+      4. Write plan spec to .swarm/plans/generated.yaml
+      5. Execute: /swarm run generated.yaml
 
-### Phase 2: Parallel Agents
-**Goal:** Spawn agents in worktrees with coordination
-
-1. Implement `swarm/spawn.py`:
-   - Create git worktree with simple branch name
-   - Launch `claude -p "prompt" --dangerously-skip-permissions` in background
-   - Write agent state to `./worktrees/.swarm/{agent_id}.json`
-2. Implement `swarm/coordination.py`:
-   - Per-agent JSON files (no locking needed)
-   - Merge all files on read for status
-3. Implement `swarm/agents.py`:
-   - Subprocess poll loop to monitor children
-   - Log output to `~/.claude/swarm/logs/{agent_id}.log`
-4. Extend `swarm/cli.py` - `swarm spawn`, `swarm status` commands
-5. Implement `/spawn`, `/status` slash commands
-6. Update `/cancel` to support named agents
-
-**Deliverable:** `/spawn "task" --worktree foo` creates isolated agent
-
-### Phase 3: Pipelines
-**Goal:** Sequential multi-stage workflows
-
-1. Design workflow YAML schema (stages, inputs, outputs, checks)
-2. Implement `swarm/pipeline.py` - stage transitions, artifact passing, check execution
-3. Create 3 workflows: tdd.yaml, feature.yaml, refactor.yaml
-4. Extend `swarm/cli.py` - `swarm pipeline` command
-5. Implement `/pipeline` slash command
-
-**Deliverable:** `/pipeline feature "Add auth"` runs plan→implement→test→review
-
-### Phase 4: Swarm + Merge
-**Goal:** Parallel agents with automatic consolidation
-
-1. Implement `swarm/swarm_cmd.py` - pattern-based spawning (glob → spawn per file)
-2. Implement `swarm/merge.py`:
-   - Branch consolidation using worktree-diff skill
-   - Auto-cleanup worktree + branch after successful merge
-3. Extend `swarm/cli.py` - `swarm swarm`, `swarm merge` commands
-4. Implement `/swarm`, `/merge` slash commands
-
-**Deliverable:** `/swarm refactor "Add types" --pattern "src/*.py"` parallelizes
-
-### Phase 5: DAG Orchestration
-**Goal:** Multi-agent coordination with dependency resolution
-
-1. Implement `swarm/dag.py`:
-   - Parse task spec files (markdown + YAML frontmatter)
-   - Build dependency graph (topological sort)
-   - Track task states: pending → running → completed/failed
-2. Implement `swarm/scheduler.py`:
-   - Polling loop to detect new task specs
-   - Spawn agents when dependencies satisfied
-   - Handle per-task failure modes (continue/stop/retry)
-3. Implement `swarm/results.py`:
-   - Write task results to `.swarm/results/`
-   - Aggregate results for manager agent
-4. Extend `swarm/cli.py` - `swarm dag`, `swarm graph` commands
-5. Implement `/dag` slash command for manager agents
-6. Add task spec template for managers to use
-
-**Deliverable:** Manager writes `.swarm/tasks/feature.md`, workers auto-spawn with dep resolution
-
-### Phase 6: MCP Server
-**Goal:** External orchestration via MCP protocol
-
-1. Implement `swarm/mcp_server.py`:
-   - MCP daemon (background process)
-   - Full control: spawn, status, cancel, merge, dag tools
-2. Document MCP server registration in Claude Code settings
-
-**Deliverable:** Other Claude sessions can orchestrate via MCP
-
-### Phase 7: Observability
-**Goal:** Rich monitoring and debugging
-
-1. Compact table-formatted status display (box drawing)
-2. DAG visualization (show dependency graph)
-3. Per-agent iteration progress
-4. Log aggregation from `~/.claude/swarm/logs/`
-5. Optional: token/cost estimation
-
-## Files to Create
-
-**Phase 1 (Loop + Foundation):**
-```
-~/.claude/claude-swarm/
-├── .claude-plugin/plugin.json       # Plugin manifest
-├── hooks/
-│   ├── hooks.json                  # Hook registration (automatic)
-│   └── stop_hook.py                # Completion detection (<done/>), retry, auto-commit
-├── swarm/                           # Python package (core logic)
-│   ├── __init__.py
-│   ├── cli.py                      # Click CLI entrypoint
-│   ├── loop.py                     # Loop management (cancel-and-replace)
-│   ├── state.py                    # State file I/O (.claude/agent.local.md)
-│   └── models.py                   # Pydantic models for state
-├── commands/                        # /slash commands (bash wrappers)
-│   ├── loop.md                     # /loop → calls swarm/cli.py loop
-│   └── cancel.md                   # /cancel → calls swarm/cli.py cancel
-├── tests/
-│   └── test_integration.py         # Integration tests
-├── pyproject.toml
-└── requirements.txt                 # pydantic, click, pyyaml
+    # Architect has freedom to design the tree
+    tree_generation:
+      allowed_roles: [implementer, tester, reviewer, refactorer]
+      max_depth: 3
+      max_agents: 10
 ```
 
-**Phase 2 (Parallel Agents):**
-```
-├── swarm/
-│   ├── spawn.py                    # Worktree creation + claude launch
-│   ├── agents.py                   # Subprocess poll loop
-│   └── coordination.py             # Per-agent files, merge on read
-├── commands/
-│   ├── spawn.md
-│   └── status.md
-```
+### Context Inheritance Flow
 
-**Phase 3 (Pipelines):**
 ```
-├── swarm/
-│   └── pipeline.py                 # Stage transitions, artifact passing
-├── commands/
-│   └── pipeline.md
-├── workflows/
-│   ├── tdd.yaml
-│   ├── feature.yaml
-│   └── refactor.yaml
+1. Agent 'auth' starts
+   - Prompt includes: shared_context files (CLAUDE.md, docs/architecture.md)
+   - Works in: .swarm/runs/{run_id}/worktrees/auth/
+   - Commits to: swarm/{run_id}/auth branch
+
+2. Agent 'cache' starts (parallel with auth)
+   - Prompt includes: shared_context files
+   - Works in: .swarm/runs/{run_id}/worktrees/cache/
+
+3. Agent 'integration' waits for deps to complete, then:
+   - Worktree created from main
+   - swarm/{run_id}/auth branch MERGED into worktree (files on disk!)
+   - swarm/{run_id}/cache branch MERGED into worktree (files on disk!)
+   - Prompt includes: shared_context files
+   - Agent can import auth/cache code, run tests
+   - Works in: .swarm/runs/{run_id}/worktrees/integration/
 ```
 
-**Phase 4 (Swarm + Merge):**
-```
-├── swarm/
-│   ├── swarm_cmd.py                # Pattern-based spawning
-│   └── merge.py                    # Branch consolidation + auto-cleanup
-├── commands/
-│   ├── swarm.md
-│   └── merge.md
-```
+**Key change:** Dependency code is merged into the worktree, not just injected as text.
+This enables real imports, tests, and integration work.
 
-**Phase 5 (DAG Orchestration):**
-```
-├── swarm/
-│   ├── dag.py                      # Task spec parsing, dependency graph
-│   ├── scheduler.py                # Polling loop, spawn on deps satisfied
-│   └── results.py                  # Task result aggregation
-├── commands/
-│   └── dag.md                      # /dag command for managers
-├── templates/
-│   └── task-spec.yaml              # Template for manager task specs
-```
+## CLI Commands
 
-**Phase 6 (MCP Server):**
-```
-├── swarm/
-│   └── mcp_server.py               # MCP daemon server
-```
+### Execution
 
-## Key Design Decisions
+```bash
+# Execute plan spec
+swarm run plan.yaml
+swarm run .swarm/plans/feature-auth.yaml
 
-### Naming & Distribution
-1. **Package name**: `claude-swarm` (CLI: `swarm`)
-2. **Plugin location**: `~/.claude/claude-swarm/`
-3. **CLI installation**: Shell alias in `.zshrc`: `alias swarm="python ~/.claude/claude-swarm/swarm/cli.py"`
-4. **Slash commands**: Direct names (`/loop`, `/spawn`) - bash wrappers call Python
+# Explicit run id (namespaces all artifacts)
+swarm run plan.yaml --run-id 2024-03-19T12-30-45Z
 
-### Agent Execution
-5. **Agent execution**: Claude Agent SDK (Python) - not CLI subprocess
-6. **Process management**: SDK handles agent lifecycle, PID + process check for stale detection
-7. **Loop conflict**: Replace - cancel old loop, start new one
-8. **Auto-commit**: Commit state update only (skip if no code changes)
-9. **Conversation persistence**: Hybrid - SDK primary, git backup for crash recovery
+# Resume existing run
+swarm run plan.yaml --resume --run-id 2024-03-19T12-30-45Z
 
-### Completion & Retry
-10. **Completion token**: `<done/>` (XML-style, Claude-native)
-11. **Default max iterations**: 30 (safe default)
-12. **Error detection**: Parse last assistant message for error patterns
-13. **Retry context**: Key events extraction (tool calls + errors only)
+# Inline execution with -p flag
+swarm run -p "auth: Implement JWT auth" -p "cache: Implement cache"
 
-### State Architecture (Files Only)
-14. **Source of truth**: JSON files in `.swarm/` directory (no git tags)
-15. **Agent state**: `.swarm/{agent_id}.json` - each agent owns its file
-16. **Coordination**: Central coordinator assigns tasks (no self-claiming)
-17. **Logs**: `~/.claude/swarm/logs/{agent_id}.log`
+# Sequential pipeline (--seq)
+swarm run --seq -p "plan: Create implementation plan" \
+                -p "impl: Execute the plan" \
+                -p "review: Review the code"
 
-### Git & Worktrees
-18. **Worktree location**: Project-local `./worktrees/`
-19. **Worktree naming**: `{name}-{uuid_suffix}` (e.g., `auth-abc123`) - collision-proof
-20. **Branch naming**: Same as worktree name
-21. **Cleanup**: Auto-cleanup after successful merge
-22. **Merge conflicts**: Spawn conflict-resolution agent automatically
+# Pattern-based (one agent per file)
+swarm run --each "src/services/*.py" -p "Add type hints to {file}"
 
-### Templates (Orchestration Only)
-23. **Template syntax**: Jinja2 `{{ variable }}` (for pipelines/spawn, not loop)
-24. **Template schema**: Minimal - `prompt`, `max_iterations`, `check_command`
-25. **Hook registration**: Plugin hooks.json (automatic)
-
-### DAG Orchestration
-26. **Orchestration model**: Both DAG and tree patterns supported
-27. **Task identity**: UUID for each task instance (e.g., `test:abc123`, `test:def456`)
-28. **Task dependencies**: Explicit `depends_on` in YAML frontmatter
-29. **Delegation**: Manager writes task spec → central coordinator spawns workers
-30. **Task spec format**: Markdown with YAML frontmatter
-31. **Result handoff**: Workers write to `.swarm/results/`, manager reads via file query
-32. **Failure modes**: Configurable per-task (`continue`, `stop`, `retry`)
-33. **Dep check**: Status field in `.swarm/{task_id}.json`
-34. **Scheduler mode**: Daemon only (`swarm scheduler start/stop`)
-35. **Cyclic deps**: Allowed with max-depth (default: 5 iterations)
-36. **Dynamic subtasks**: Only manager can modify task spec (workers request)
-37. **Daemon control**: Manual `swarm scheduler start` / `swarm scheduler stop`
-
-### Resource Management
-38. **Rate limits**: Agent queue with throttling (central queue limits API calls)
-39. **Token budget**: 150K tokens per agent (hard limit, kill if exceeded)
-40. **Context overflow**: Automatic summarization when approaching limit
-41. **Max concurrent agents**: Default 5 (configurable)
-42. **Network failures**: SDK handles retry with idempotency
-43. **Log management**: TTL-based cleanup (delete logs older than 7 days)
-44. **File conflicts**: Each agent writes own file only (no conflicts possible)
-
-### Security
-45. **Template sandboxing**: Jinja2 SandboxedEnvironment (disable dangerous ops)
-
-### MCP & Observability
-46. **MCP mode**: Daemon (background process)
-47. **MCP scope**: Full control (spawn, status, cancel, merge, dag)
-48. **Status output**: Compact table format + DAG visualization
-49. **Testing**: Integration tests only
-
-## Failure Resilience
-
-### Stale State Detection
-```python
-def is_agent_alive(agent_id: str) -> bool:
-    state_file = Path(f".swarm/{agent_id}.json")
-    if not state_file.exists():
-        return False
-
-    state = json.loads(state_file.read_text())
-    pid = state.get("pid")
-
-    if pid:
-        try:
-            os.kill(pid, 0)  # Check if process exists
-            return True
-        except OSError:
-            return False  # Process dead, state is stale
-
-    return False
+# Override defaults
+swarm run plan.yaml --max-iterations 50 --check "make test"
 ```
 
-### Agent State File Schema
+### Monitoring
+
+```bash
+swarm status                 # Table if TTY, JSON if piped
+swarm status auth            # Single agent details
+swarm status --json          # Force JSON output
+swarm status --run-id <id>   # Inspect a specific run
+swarm logs auth              # View agent logs
+swarm logs auth -f           # Follow mode (tail -f)
+swarm logs auth --run-id <id>
+swarm logs --all             # Interleaved logs from all agents
+swarm dashboard              # TUI with live updates
+swarm dashboard --run-id <id>
 ```
-File: .swarm/auth-abc123.json
+
+### Control
+
+```bash
+swarm cancel                 # Cancel all agents (latest run)
+swarm cancel --run-id <id>   # Cancel specific run
+swarm cancel auth cache      # Cancel specific agents
+swarm merge                  # Merge all completed branches (latest run)
+swarm merge --run-id <id>    # Merge specific run
+swarm merge auth cache       # Merge specific branches
+swarm resume <id>            # Resume run (alias for swarm run --resume --run-id)
+swarm resume <id> --agent auth  # Resume a specific agent within a run
+swarm clean                  # Remove stale worktrees, reset DB (latest run)
+swarm clean --run-id <id>    # Clean specific run
+swarm clean --all            # Full cleanup including logs/telemetry
+swarm db                     # Open interactive SQLite shell (latest run)
+swarm db --run-id <id>       # Open DB for specific run
+swarm db "SELECT * FROM agents WHERE run_id = '<id>'"  # Run SQL query
+```
+
+### Status Output Format
+
+```
+# TTY output (human-readable table)
+┌──────────────┬──────────┬──────┬────────────────┬─────────┐
+│ Agent        │ Status   │ Iter │ Branch         │ Check   │
+├──────────────┼──────────┼──────┼────────────────┼─────────┤
+│ auth         │ ✓ done   │ 8/30 │ swarm/{run_id}/auth     │ ✓ pass  │
+│ cache        │ ● run    │ 3/30 │ swarm/{run_id}/cache    │ …       │
+│ integration  │ ○ wait   │ 0/30 │ —              │ —       │
+└──────────────┴──────────┴──────┴────────────────┴─────────┘
+
+# JSON output (machine-readable)
 {
-    "agent_id": "auth-abc123",
-    "status": "running",      # pending | running | completed | failed
-    "iteration": 5,
-    "max_iterations": 30,
-    "pid": 12345,
-    "worktree": "./worktrees/auth-abc123",
-    "branch": "auth-abc123",
-    "started_at": "2026-01-04T12:00:00Z",
-    "last_heartbeat": "2026-01-04T12:05:00Z",
-    "parent_task": "feature-xyz",     # For DAG tracking
-    "error": null                      # Last error if any
-}
-```
-
-### Error Detection (Parse Assistant Message)
-```python
-ERROR_PATTERNS = [
-    r"Error:",
-    r"Failed to",
-    r"Exception:",
-    r"Could not",
-    r"Permission denied",
-    r"No such file",
-]
-
-def detect_error(last_message: str) -> Optional[str]:
-    for pattern in ERROR_PATTERNS:
-        if match := re.search(pattern, last_message):
-            # Extract context around error
-            return extract_error_context(last_message, match)
-    return None
-```
-
-### Key Events Extraction (Retry Context)
-```python
-def extract_key_events(conversation: list) -> str:
-    events = []
-    for msg in conversation[-10:]:  # Last 10 messages
-        if msg.type == "tool_use":
-            events.append(f"Tool: {msg.name}({msg.input})")
-        elif msg.type == "tool_result" and msg.is_error:
-            events.append(f"Error: {msg.content[:200]}")
-    return "\n".join(events)
-```
-
-### Conflict Resolution Agent
-```python
-async def handle_merge_conflict(worktrees: list[str], target: str):
-    # Create conflict branch
-    conflict_branch = f"conflict-{uuid4().hex[:8]}"
-
-    # Spawn resolution agent
-    agent = await sdk.create_agent(
-        prompt=f"""Resolve merge conflicts between branches:
-        {worktrees}
-
-        Target branch: {target}
-
-        Review conflicts, make decisions, commit resolution.
-        Output <done/> when resolved.""",
-        worktree=f"conflict-resolver-{conflict_branch}"
-    )
-
-    await agent.run()
-```
-
-### Recovery on Crash
-```python
-def recover_from_crash():
-    """Called on swarm scheduler start to recover orphaned agents."""
-    for state_file in Path(".swarm").glob("*.json"):
-        state = json.loads(state_file.read_text())
-        agent_id = state_file.stem
-
-        if state["status"] == "running":
-            if not is_agent_alive(agent_id):
-                # Mark as failed, allow retry
-                state["status"] = "failed"
-                state["error"] = "Agent crashed unexpectedly"
-                state_file.write_text(json.dumps(state, indent=2))
-
-                # Notify scheduler to potentially retry
-                scheduler.notify_failure(agent_id)
-```
-
-## Python Hook Integration
-
-Claude Code hooks are shell scripts, but we can invoke Python:
-
-```json
-// hooks/hooks.json
-{
-  "hooks": [
-    {
-      "matcher": {"event": "Stop"},
-      "hooks": [{"command": "python ~/.claude/claude-swarm/hooks/stop_hook.py"}]
-    }
+  "agents": [
+    {"name": "auth", "status": "completed", "iteration": 8, ...},
+    {"name": "cache", "status": "running", "iteration": 3, ...},
+    {"name": "integration", "status": "pending", "iteration": 0, ...}
   ]
 }
 ```
 
-**Hook contract:**
-- Input: JSON via stdin (`{"session_id": "...", "transcript": [...]}`)
-- Output: JSON to stdout
-  - Allow exit: `{"decision": "allow"}`
-  - Block + re-inject: `{"decision": "block", "reason": "Continue: <prompt>"}`
+## Slash Command (Single)
 
-**stop_hook.py flow:**
+One slash command, passes through to CLI:
+
+```bash
+/swarm run plan.yaml         # → swarm run plan.yaml
+/swarm status                # → swarm status
+/swarm logs auth -f          # → swarm logs auth -f
+/swarm cancel auth           # → swarm cancel auth
+/swarm merge                 # → swarm merge
+/swarm dashboard             # → swarm dashboard
+```
+
+This enables any agent (Claude Code, custom agents) to orchestrate full pipelines:
+
+```
+Agent thinking: "This feature needs auth, cache, and integration work.
+I'll write a plan spec and spawn parallel agents."
+
+Agent action:
+1. Write .swarm/plans/feature-auth.yaml
+2. Run: /swarm run feature-auth.yaml
+3. Monitor: /swarm status
+4. Consolidate: /swarm merge
+```
+
+## Agent Execution Model
+
+### Lifecycle
+
+```
+1. Run setup
+   - Assign run_id (if not provided)
+   - Snapshot plan: .swarm/runs/{run_id}/plan.yaml
+   - Initialize DB: .swarm/runs/{run_id}/swarm.db
+
+2. Spawn
+   - Create worktree: .swarm/runs/{run_id}/worktrees/{name}/
+   - Create branch: swarm/{run_id}/{name}
+   - Inject shared_context files
+   - Inject dep branch files (if depends_on specified)
+   - Insert agent record into DB (status: pending)
+   - Launch SDK agent with prompt
+
+3. Run
+   - Agent iterates on task
+   - Updates state each iteration (status: running)
+   - Commits changes to branch
+
+4. Check Gate (via mark_complete tool)
+   - Agent calls mark_complete(summary)
+   - Tool runs check command (e.g., pytest)
+   - If fails: returns error, agent continues iterating
+   - If passes: agent marked complete
+
+5. Complete
+   - mark_complete() succeeds
+   - State updated (status: completed)
+   - Dependent agents unblocked
+
+6. Merge
+   - User runs /swarm merge
+   - Changes merged to main
+   - Worktree + branch cleaned up
+   - State archived
+```
+
+### Completion Flow
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    Agent Iteration                       │
+└────────────────────────┬────────────────────────────────┘
+                         │
+                         ▼
+              ┌──────────────────────┐
+              │ Agent working on task │
+              └──────────┬───────────┘
+                         │
+              ┌──────────▼────────────────┐
+              │ Agent calls mark_complete?│
+              └──────────┬────────────────┘
+                    No   │   Yes
+         ┌───────────────┴────────────────┐
+         │                                │
+         ▼                                ▼
+┌─────────────────┐             ┌─────────────────┐
+│ Max iterations? │             │ Run check cmd   │
+└────────┬────────┘             └────────┬────────┘
+    No   │   Yes                   Pass  │  Fail
+         │    │                          │    │
+         ▼    ▼                          ▼    │
+      Continue  Mark                  Mark    │
+      iteration timeout            completed  │
+                                              │
+                         ┌────────────────────┘
+                         ▼
+              ┌──────────────────────────────┐
+              │ Return error to agent,       │
+              │ agent continues iterating    │
+              └──────────────────────────────┘
+```
+
+### Failure Handling
+
+| Condition | on_failure=continue | on_failure=stop | on_failure=retry |
+|-----------|---------------------|-----------------|------------------|
+| Check fails | Continue iterating | Continue iterating | Continue iterating |
+| Max iterations | Mark timeout, continue others | Cancel all agents | Restart agent (up to retry_count) |
+| Agent error | Mark failed, continue others | Cancel all agents | Restart agent |
+| Dep failed | Skip this agent | Cancel all agents | Wait/retry dep |
+
+### Error Context for Retries
+
+When an agent is retried, it receives:
+```
+Previous attempt failed with:
+- Error: [last error message]
+- Iteration reached: 15/30
+- Check output: [last check command output]
+
+Please continue from where you left off, addressing the error above.
+```
+
+### Database Architecture
+
+All state is stored in SQLite per run (`.swarm/runs/{run_id}/swarm.db`) instead of JSON files:
+
+| Problem | File-Based | SQLite |
+|---------|-----------|--------|
+| Atomicity | Partial writes corrupt JSON | ACID transactions |
+| Concurrency | Race conditions | Proper locking |
+| Querying | Read all files | `WHERE status = 'blocked'` |
+| Blocking tools | Poll files | Poll indexed table |
+| Cost tracking | Sum across files | `SUM(cost_usd)` |
+
+**Why SQLite:**
+- Zero config - single file, no server
+- Built into Python stdlib
+- ACID transactions
+- WAL mode = concurrent reads + serialized writes
+- Sufficient for <100 agents
+
+**Concurrency Configuration:**
+
 ```python
-def main():
-    data = json.load(sys.stdin)
-    git_root = find_git_root()
-    state = load_agent_state(git_root / ".claude/agent.local.md")
+def open_db(run_id: str) -> sqlite3.Connection:
+    """Open DB with proper concurrency settings."""
+    db_path = Path(f".swarm/runs/{run_id}/swarm.db")
+    db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if not state.active:
-        return allow()
+    db = sqlite3.connect(db_path, timeout=30.0)  # Wait up to 30s for locks
+    db.row_factory = sqlite3.Row
 
-    last_output = extract_last_output(data["transcript"])
+    # Enable WAL mode for concurrent reads
+    db.execute("PRAGMA journal_mode = WAL")
+    # Wait up to 5s for busy locks (inside transactions)
+    db.execute("PRAGMA busy_timeout = 5000")
+    # Sync less often for performance (data safe due to WAL)
+    db.execute("PRAGMA synchronous = NORMAL")
 
-    # Check for completion token
-    if "<done/>" in last_output:
-        state.active = False
-        save_agent_state(state)
-        return allow()
-
-    # Check for max iterations
-    if state.iteration >= state.max_iterations:
-        state.active = False
-        save_agent_state(state)
-        return allow()
-
-    # Auto-commit changes on each iteration
-    auto_commit(f"swarm: iteration {state.iteration}")
-
-    # Check for errors - append context for retry
-    error_context = extract_error_context(data["transcript"])
-    if error_context:
-        state.retry_count += 1
-        summary = summarize_conversation(data["transcript"])
-        prompt = f"{state.prompt}\n\nPrevious error:\n{error_context}\n\nContext:\n{summary}"
-    else:
-        state.retry_count = 0
-        prompt = state.prompt
-
-    state.iteration += 1
-    save_agent_state(state)
-    return block(f"Continue iteration {state.iteration}/{state.max_iterations}:\n{prompt}")
+    return db
 ```
 
-## Dependencies
+**Best practices:**
+- Each agent monitor task should have its own connection
+- Use `with db:` for automatic commit/rollback
+- Keep transactions short to minimize lock contention
+- Retry on `sqlite3.OperationalError` with "database is locked"
+
+### Database Schema
+
+```sql
+-- .swarm/runs/{run_id}/swarm.db (WAL mode enabled)
+
+CREATE TABLE plans (
+    run_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,              -- plan name
+    spec TEXT NOT NULL,              -- YAML content
+    status TEXT DEFAULT 'running',   -- running | completed | failed | paused
+    total_cost_usd REAL DEFAULT 0.0,
+    max_cost_usd REAL DEFAULT 25.0,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE agents (
+    run_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    plan_name TEXT,                  -- denormalized for convenience
+    status TEXT NOT NULL,            -- pending | running | blocked | checking | paused | completed | failed | timeout | cancelled | cost_exceeded
+    iteration INTEGER DEFAULT 0,
+    max_iterations INTEGER DEFAULT 30,
+    worktree TEXT,
+    branch TEXT,
+    prompt TEXT,
+    check_command TEXT,
+    model TEXT DEFAULT 'sonnet',
+    parent TEXT,                     -- Hierarchical: manager.auth.tokens
+    session_id TEXT,                 -- SDK resumption
+    pid INTEGER,
+    cost_usd REAL DEFAULT 0.0,
+    max_cost_usd REAL DEFAULT 5.0,
+    error TEXT,
+    depends_on TEXT,                 -- JSON array of agent names this agent depends on
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (run_id, name),
+    FOREIGN KEY (run_id) REFERENCES plans(run_id)
+);
+
+CREATE TABLE events (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    ts TEXT DEFAULT CURRENT_TIMESTAMP,
+    agent TEXT NOT NULL,
+    event_type TEXT NOT NULL,        -- started | progress | clarification | blocker | done | error | cascade_skip | circuit_breaker_tripped
+    data TEXT,                       -- JSON
+    FOREIGN KEY (run_id, agent) REFERENCES agents(run_id, name)
+);
+
+CREATE TABLE responses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    clarification_id TEXT NOT NULL,
+    response TEXT NOT NULL,
+    consumed INTEGER DEFAULT 0,      -- 1 when worker has read it
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (clarification_id) REFERENCES events(id)
+);
+
+-- Indexes for common queries
+CREATE INDEX idx_agents_run_status ON agents(run_id, status);
+CREATE INDEX idx_agents_run_parent ON agents(run_id, parent);
+CREATE INDEX idx_events_run_agent ON events(run_id, agent);
+CREATE INDEX idx_events_run_type ON events(run_id, event_type);
+CREATE INDEX idx_responses_pending ON responses(run_id, clarification_id, consumed) WHERE consumed = 0;
+```
+
+### Common Queries
+
+```sql
+-- All blocked agents in a run (waiting for clarification/response)
+SELECT name, status FROM agents
+WHERE run_id = ? AND status = 'blocked';
+
+-- Total cost for a run
+SELECT SUM(cost_usd) FROM agents WHERE run_id = ?;
+
+-- Check if run exceeds budget
+SELECT name FROM plans
+WHERE run_id = ? AND total_cost_usd > max_cost_usd;
+
+-- Pending clarifications/blockers (manager needs to answer)
+SELECT e.id, e.agent, e.event_type, json_extract(e.data, '$.question') as question
+FROM events e
+WHERE e.run_id = ? AND e.event_type IN ('clarification', 'blocker')
+AND NOT EXISTS (
+    SELECT 1 FROM responses r WHERE r.clarification_id = e.id
+);
+
+-- Agent hierarchy
+SELECT name, parent FROM agents WHERE run_id = ? AND parent IS NOT NULL;
+
+-- Recent events for dashboard
+SELECT * FROM events WHERE run_id = ? ORDER BY ts DESC LIMIT 100;
+```
+
+## Claude Agent SDK Integration
+
+**Note:** The SDK API shown here is based on expected patterns from the Claude Agent SDK.
+Actual implementation may differ; adapt as needed based on the real SDK documentation.
+
+### Helper Functions
+
+```python
+from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions
+from dataclasses import dataclass
+
+
+def get_coordination_tools() -> list[dict]:
+    """Return virtual coordination tool definitions."""
+    return [
+        {"name": "mark_complete", "description": "Signal task completion", "input_schema": {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]}},
+        {"name": "request_clarification", "description": "Ask for guidance", "input_schema": {"type": "object", "properties": {"question": {"type": "string"}, "escalate_to": {"type": "string", "enum": ["parent", "human", "auto"]}}, "required": ["question"]}},
+        {"name": "report_progress", "description": "Report progress", "input_schema": {"type": "object", "properties": {"status": {"type": "string"}, "milestone": {"type": "string"}}, "required": ["status"]}},
+        {"name": "report_blocker", "description": "Report blocker", "input_schema": {"type": "object", "properties": {"question": {"type": "string"}}, "required": ["question"]}},
+    ]
+
+
+def build_system_prompt(agent_row: sqlite3.Row) -> str:
+    """Build system prompt for agent."""
+    return f"""You are an autonomous coding agent.
+
+Task: {agent_row['prompt']}
+Check command: {agent_row['check_command'] or 'pytest'}
+
+Coordination tools:
+- mark_complete(summary): Call when done
+- request_clarification(question, escalate_to?): Ask for guidance
+- report_progress(status, milestone?): Report progress
+- report_blocker(question): Report blocking issues
+"""
+
+
+def build_options(agent_row: sqlite3.Row, worktree_path: Path) -> ClaudeAgentOptions:
+    """Build SDK options from agent DB row."""
+    return ClaudeAgentOptions(
+        cwd=str(worktree_path),
+        allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
+        custom_tools=get_coordination_tools(),
+        permission_mode="bypassPermissions",
+        model=agent_row["model"] or "sonnet",
+        system_prompt=build_system_prompt(agent_row),
+    )
+
+
+def build_options_from_state(state: dict) -> ClaudeAgentOptions:
+    """Build SDK options from saved state dict."""
+    return ClaudeAgentOptions(
+        cwd=state["worktree"],
+        allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
+        custom_tools=get_coordination_tools(),
+        permission_mode="bypassPermissions",
+        model=state.get("model", "sonnet"),
+    )
+
+
+def parse_plan_spec(yaml_content: str) -> PlanSpec:
+    """Parse YAML content into PlanSpec."""
+    data = yaml.safe_load(yaml_content)
+    return PlanSpec(**data)
+
+
+@dataclass
+class AgentConfig:
+    """Agent configuration from plan or DB."""
+    name: str
+    prompt: str
+    check_command: str = "pytest"
+    depends_on: list[str] = None
+    model: str = "sonnet"
+    max_iterations: int = 30
+    max_cost_usd: float = 5.0
+    worktree_path: Path = None
+    shared_context: str = ""
+    env: dict = None
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "AgentConfig":
+        """Create AgentConfig from database row."""
+        return cls(
+            name=row["name"],
+            prompt=row["prompt"],
+            check_command=row["check_command"] or "pytest",
+            depends_on=json.loads(row["depends_on"] or "[]"),
+            model=row["model"] or "sonnet",
+            max_iterations=row["max_iterations"] or 30,
+            max_cost_usd=row["max_cost_usd"] or 5.0,
+            worktree_path=Path(row["worktree"]) if row["worktree"] else None,
+        )
+```
+
+### Agent Spawning
+
+Each agent is spawned via `ClaudeSDKClient`:
+
+```python
+async def spawn_agent(agent_config: AgentConfig) -> str:
+    """Spawn a background agent, return session_id."""
+
+    # Define coordination tools (virtual - intercepted by monitor_agent, never executed)
+    coordination_tools = [
+        {
+            "name": "mark_complete",
+            "description": "Signal task completion. Triggers check command automatically.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string", "description": "Summary of work completed"}
+                },
+                "required": ["summary"]
+            }
+        },
+        {
+            "name": "request_clarification",
+            "description": "Ask for guidance. Blocks until response received.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "Question to ask"},
+                    "escalate_to": {
+                        "type": "string",
+                        "enum": ["parent", "human", "auto"],
+                        "description": "Who to escalate to: parent agent, human, or auto-route (default: auto)"
+                    }
+                },
+                "required": ["question"]
+            }
+        },
+        {
+            "name": "report_progress",
+            "description": "Report progress update. Optional milestone for named checkpoints.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string", "description": "Current status"},
+                    "milestone": {"type": "string", "description": "Optional milestone name"}
+                },
+                "required": ["status"]
+            }
+        },
+        {
+            "name": "report_blocker",
+            "description": "Report blocking issue. Blocks until manager responds.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "Description of blocking issue"}
+                },
+                "required": ["question"]
+            }
+        },
+    ]
+
+    options = ClaudeAgentOptions(
+        # Working directory is the worktree
+        cwd=agent_config.worktree_path,
+
+        # File tools for autonomous work + coordination tools (virtual)
+        allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
+        custom_tools=coordination_tools,  # Virtual tools intercepted by monitor
+        permission_mode="bypassPermissions",  # Autonomous mode
+
+        # Inject context via system prompt
+        system_prompt=f"""You are an autonomous coding agent.
+
+Task: {agent_config.prompt}
+
+Check command: {agent_config.check_command}
+
+Coordination tools available:
+- mark_complete(summary): Call when task is done. Runs check command automatically.
+- request_clarification(question, escalate_to?): Ask for guidance (blocks until response).
+  escalate_to: "parent" (manager), "human" (dashboard), "auto" (default, routes automatically)
+- report_progress(status, milestone?): Report progress updates.
+- report_blocker(question): Report blocking issues (blocks until response).
+
+Shared context files:
+{agent_config.shared_context}
+""",
+
+        # Model selection
+        model="sonnet",  # or "opus" for complex tasks
+
+        # Environment
+        env=agent_config.env or {},
+    )
+
+    client = ClaudeSDKClient(options=options)
+    await client.connect(agent_config.prompt)
+
+    # Store session_id for resumption
+    return client.session_id
+```
+
+### Agent Monitoring
+
+```python
+async def monitor_agent(
+    db: sqlite3.Connection,
+    client: ClaudeSDKClient,
+    run_id: str,
+    agent_name: str,
+):
+    """Stream agent output, detect completion via mark_complete tool."""
+
+    async for message in client.receive_response():
+        # Update heartbeat
+        db.execute(
+            "UPDATE agents SET updated_at = CURRENT_TIMESTAMP WHERE run_id = ? AND name = ?",
+            (run_id, agent_name)
+        )
+
+        # Log output to file
+        if isinstance(message, TextBlock):
+            log_to_file(run_id, agent_name, message.text)
+
+        # Track tool usage and handle coordination tools
+        if isinstance(message, ToolUseBlock):
+            db.execute(
+                "UPDATE agents SET iteration = iteration + 1 WHERE run_id = ? AND name = ?",
+                (run_id, agent_name)
+            )
+
+            # Handle mark_complete tool - runs check automatically
+            if message.name == "mark_complete":
+                db.execute(
+                    "UPDATE agents SET status = 'checking' WHERE run_id = ? AND name = ?",
+                    (run_id, agent_name)
+                )
+                check_result = await run_check(run_id, agent_name)
+                if check_result.success:
+                    db.execute(
+                        "UPDATE agents SET status = 'completed' WHERE run_id = ? AND name = ?",
+                        (run_id, agent_name)
+                    )
+                    # Emit done event
+                    db.execute(
+                        "INSERT INTO events (id, run_id, agent, event_type, data) VALUES (?, ?, ?, 'done', ?)",
+                        (str(uuid4()), run_id, agent_name, json.dumps({"summary": message.input.get("summary", "")}))
+                    )
+                    await client.send_tool_result(message.id, "Task completed successfully")
+                else:
+                    db.execute(
+                        "UPDATE agents SET status = 'running' WHERE run_id = ? AND name = ?",
+                        (run_id, agent_name)
+                    )
+                    await client.send_tool_result(message.id, f"Check failed: {check_result.output}")
+
+            # Handle blocking tools - emit event with clarification_id
+            elif message.name in ("request_clarification", "report_blocker"):
+                clarification_id = str(uuid4())
+                event_type = "clarification" if message.name == "request_clarification" else "blocker"
+
+                # Add agent context to event data
+                event_data = {
+                    **message.input,
+                    "root_agent": get_root_agent(db, run_id, agent_name),
+                    "parent_agent": get_parent_agent(db, run_id, agent_name),
+                    "tree_path": get_tree_path(db, run_id, agent_name),
+                }
+                db.execute(
+                    "INSERT INTO events (id, run_id, agent, event_type, data) VALUES (?, ?, ?, ?, ?)",
+                    (clarification_id, run_id, agent_name, event_type, json.dumps(event_data))
+                )
+                db.execute(
+                    "UPDATE agents SET status = 'blocked' WHERE run_id = ? AND name = ?",
+                    (run_id, agent_name)
+                )
+                db.commit()
+
+                # Poll for manager response using clarification_id
+                response = await wait_for_response(db, run_id, clarification_id, agent_name)
+                await client.send_tool_result(message.id, response)
+
+            # Handle progress reporting
+            elif message.name == "report_progress":
+                db.execute(
+                    "INSERT INTO events (id, run_id, agent, event_type, data) VALUES (?, ?, ?, 'progress', ?)",
+                    (str(uuid4()), run_id, agent_name, json.dumps(message.input))
+                )
+                await client.send_tool_result(message.id, "Progress recorded")
+
+            db.commit()
+
+        # Final result
+        if isinstance(message, ResultMessage):
+            db.execute("""
+                UPDATE agents SET
+                    cost_usd = ?,
+                    status = CASE WHEN ? THEN 'failed' ELSE status END,
+                    error = CASE WHEN ? THEN ? ELSE error END
+                WHERE run_id = ? AND name = ?
+            """, (
+                message.total_cost_usd,
+                message.is_error,
+                message.is_error,
+                message.result if message.is_error else None,
+                run_id,
+                agent_name,
+            ))
+            # Update plan total cost
+            db.execute("""
+                UPDATE plans SET total_cost_usd = (
+                    SELECT SUM(cost_usd) FROM agents WHERE run_id = ?
+                ) WHERE run_id = ?
+            """, (run_id, run_id))
+            # Emit error event on failure
+            if message.is_error:
+                db.execute(
+                    "INSERT INTO events (id, run_id, agent, event_type, data) VALUES (?, ?, ?, 'error', ?)",
+                    (str(uuid4()), run_id, agent_name, json.dumps({"error": message.result}))
+                )
+            db.commit()
+            break
+
+
+async def wait_for_response(
+    db: sqlite3.Connection,
+    run_id: str,
+    clarification_id: str,
+    agent_name: str,
+    timeout: int = 300,
+) -> str:
+    """Poll DB for manager response to a specific clarification."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        row = db.execute("""
+            SELECT id, response FROM responses
+            WHERE run_id = ? AND clarification_id = ? AND consumed = 0
+            LIMIT 1
+        """, (run_id, clarification_id)).fetchone()
+
+        if row:
+            db.execute("UPDATE responses SET consumed = 1 WHERE id = ?", (row[0],))
+            db.execute(
+                "UPDATE agents SET status = 'running' WHERE run_id = ? AND name = ?",
+                (run_id, agent_name)
+            )
+            db.commit()
+            return row[1]
+
+        await asyncio.sleep(2)
+
+    # Timeout: set agent to timeout status and emit error event
+    db.execute(
+        "UPDATE agents SET status = 'timeout' WHERE run_id = ? AND name = ?",
+        (run_id, agent_name)
+    )
+    db.execute(
+        "INSERT INTO events (id, run_id, agent, event_type, data) VALUES (?, ?, ?, 'error', ?)",
+        (str(uuid4()), run_id, agent_name, json.dumps({"error": "Clarification timeout"}))
+    )
+    db.commit()
+    raise TimeoutError("No response from manager")
+```
+
+### Agent Context Helpers
+
+```python
+def get_root_agent(db: sqlite3.Connection, run_id: str, agent_name: str) -> str:
+    """Get the root manager agent for an agent hierarchy."""
+    current = agent_name
+    while True:
+        row = db.execute(
+            "SELECT parent FROM agents WHERE run_id = ? AND name = ?",
+            (run_id, current)
+        ).fetchone()
+        if not row or not row["parent"]:
+            return current
+        current = row["parent"]
+
+
+def get_parent_agent(db: sqlite3.Connection, run_id: str, agent_name: str) -> str | None:
+    """Get the immediate parent agent, or None if root."""
+    row = db.execute(
+        "SELECT parent FROM agents WHERE run_id = ? AND name = ?",
+        (run_id, agent_name)
+    ).fetchone()
+    return row["parent"] if row else None
+
+
+def get_tree_path(db: sqlite3.Connection, run_id: str, agent_name: str) -> str:
+    """Get the full hierarchy path (e.g., 'manager.auth.tokens')."""
+    path = [agent_name]
+    current = agent_name
+    while True:
+        parent = get_parent_agent(db, run_id, current)
+        if not parent:
+            break
+        path.insert(0, parent)
+        current = parent
+    return ".".join(path)
+
+
+def log_to_file(run_id: str, agent_name: str, text: str) -> None:
+    """Append agent output to log file."""
+    log_path = Path(f".swarm/runs/{run_id}/logs/{agent_name}.log")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_path, "a") as f:
+        f.write(f"[{datetime.now().isoformat()}] {text}\n")
+```
+
+### Agent Lifecycle Management
+
+```python
+class AgentManager:
+    """Manages multiple concurrent agents."""
+
+    def __init__(self):
+        self.clients: dict[str, ClaudeSDKClient] = {}
+
+    async def spawn(self, config: AgentConfig) -> None:
+        """Spawn agent in background."""
+        client = ClaudeSDKClient(options=build_options(config))
+        self.clients[config.name] = client
+
+        # Start in background task
+        asyncio.create_task(self._run_agent(config.name, client))
+
+    async def cancel(self, name: str) -> None:
+        """Gracefully stop an agent."""
+        if name in self.clients:
+            await self.clients[name].interrupt()
+            await self.clients[name].disconnect()
+            del self.clients[name]
+
+    async def resume(self, name: str, session_id: str) -> None:
+        """Resume a crashed/stopped agent."""
+        state = load_state(name)
+        options = build_options_from_state(state)
+        options.resume = session_id  # Resume from session
+
+        client = ClaudeSDKClient(options=options)
+        await client.connect()
+        self.clients[name] = client
+```
+
+### Completion Detection
+
+Completion is detected via the `mark_complete` tool call, not text parsing:
+
+```python
+# Completion is handled in the tool use handler (see Agent Monitoring above)
+# When agent calls mark_complete(summary):
+#   1. Check command runs
+#   2. If passes: agent marked complete, tool returns success
+#   3. If fails: tool returns error with check output, agent continues
+
+# The ResultMessage indicates agent termination (may or may not be completion)
+async for message in client.receive_response():
+    if isinstance(message, ResultMessage):
+        result = {
+            "success": not message.is_error,
+            "output": message.result,
+            "session_id": message.session_id,
+            "cost_usd": message.total_cost_usd,
+            "duration_ms": message.duration_ms,
+        }
+
+        if message.is_error:
+            # Agent errored out
+            state.status = "failed"
+        elif state.status != "completed":
+            # Agent stopped without completing (max turns, etc.)
+            state.status = "timeout"
+```
+
+### Session Persistence
+
+For crash recovery and resumption:
+
+```python
+# Save session_id to DB
+db.execute(
+    "UPDATE agents SET session_id = ? WHERE run_id = ? AND name = ?",
+    (client.session_id, run_id, agent_name)
+)
+db.commit()
+
+# Later: resume from session
+row = db.execute(
+    "SELECT session_id, worktree FROM agents WHERE run_id = ? AND name = ?",
+    (run_id, agent_name)
+).fetchone()
+
+options = ClaudeAgentOptions(
+    resume=row["session_id"],  # Resume from checkpoint
+    cwd=row["worktree"],
+)
+client = ClaudeSDKClient(options=options)
+await client.connect("Continue the task")
+```
+
+### Worktree Management
+
+```python
+def create_worktree(run_id: str, agent_name: str, repo_path: Path = None) -> Path:
+    """Create a git worktree for an agent.
+
+    Args:
+        run_id: The run identifier
+        agent_name: Name of the agent
+        repo_path: Path to git repo (defaults to cwd if None)
+
+    Returns:
+        Path to the created worktree
+    """
+    repo = repo_path or Path.cwd()
+    worktree_path = repo / "worktrees" / run_id / agent_name
+    branch_name = f"swarm/{run_id}/{agent_name}"
+
+    worktree_path.parent.mkdir(parents=True, exist_ok=True)
+
+    subprocess.run(
+        ["git", "worktree", "add", "-b", branch_name, str(worktree_path)],
+        cwd=repo,
+        check=True,
+    )
+
+    return worktree_path
+```
+
+### Dependency Branch Merging
+
+When an agent has `depends_on`, dependency branches are **merged into the worktree** at spawn time.
+This ensures dependent agents can actually import and test code from their dependencies.
+
+```python
+def setup_worktree_with_deps(
+    run_id: str,
+    agent_name: str,
+    depends_on: list[str],
+    worktree_path: Path,
+    context_config: DependencyContextConfig,
+) -> None:
+    """Merge dependency branches into agent's worktree."""
+
+    for dep_name in depends_on:
+        dep_branch = f"swarm/{run_id}/{dep_name}"
+
+        if context_config.mode == "full":
+            # Full merge - all files from dep branch
+            merge_branch(worktree_path, dep_branch, dep_name)
+
+        elif context_config.mode == "diff_only":
+            # Only cherry-pick files that were changed by the dep agent
+            base_branch = get_default_branch()
+            changed_files = get_changed_files(dep_branch, base_branch)
+            cherry_pick_files(worktree_path, dep_branch, changed_files)
+
+        elif context_config.mode == "paths":
+            # Only merge files matching include_paths
+            merge_branch_filtered(
+                worktree_path, dep_branch, dep_name,
+                include=context_config.include_paths,
+                exclude=context_config.exclude_paths,
+            )
+
+
+def merge_branch(worktree_path: Path, branch: str, dep_name: str) -> None:
+    """Full merge of a dependency branch."""
+    result = subprocess.run(
+        ["git", "merge", branch, "--no-edit", "-m", f"Merge {dep_name} dependency"],
+        cwd=worktree_path,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        raise DependencyMergeError(
+            f"Conflict merging {dep_name}. Output: {result.stderr.decode()}"
+        )
+
+
+def get_changed_files(branch: str, base: str) -> list[str]:
+    """Get files changed between base and branch."""
+    result = subprocess.run(
+        ["git", "diff", "--name-only", f"{base}...{branch}"],
+        capture_output=True, text=True
+    )
+    return result.stdout.strip().split("\n")
+
+
+def get_default_branch() -> str:
+    """Detect the default branch (main or master)."""
+    result = subprocess.run(
+        ["git", "symbolic-ref", "refs/remotes/origin/HEAD"],
+        capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        # refs/remotes/origin/main -> main
+        return result.stdout.strip().split("/")[-1]
+    # Fallback: check if main or master exists
+    for branch in ["main", "master"]:
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", branch],
+            capture_output=True
+        )
+        if result.returncode == 0:
+            return branch
+    return "main"  # Default assumption
+```
+
+**Note:** `depends_on` now means:
+1. **Ordering**: Wait for dep agents to complete before spawning
+2. **Code inheritance**: Merge dep branches into worktree (files exist on disk)
+3. **Prompt context**: Only `shared_context` files are injected into prompt
+
+**Context modes:**
+- `full`: Merge entire dep branch (default, simplest)
+- `diff_only`: Only files changed by dep agent (smaller, avoids unrelated changes)
+- `paths`: Only files matching include_paths patterns (most selective)
+
+This allows dependent agents to:
+- Import modules created by dependencies
+- Run tests that use dependency code
+- Build on actual code, not just text descriptions
+
+## Scheduler Architecture
+
+### Overview
+
+The scheduler is **CLI-driven** with **in-process async monitoring**:
+- `swarm run` starts the scheduler
+- Scheduler holds all SDK clients in memory
+- Monitors via asyncio tasks
+- Exits when all agents complete (or fail)
 
 ```
-# requirements.txt
-pydantic>=2.0
-click>=8.0
-pyyaml>=6.0
-jinja2>=3.0
-anthropic>=0.30.0        # Claude API
-claude-agent-sdk>=0.1.0  # Agent SDK for programmatic agents
-mcp>=0.1.0               # Phase 6 - MCP server
+┌─────────────────────────────────────────────────────────┐
+│                    swarm run plan.yaml                   │
+└────────────────────────┬────────────────────────────────┘
+                         │
+                         ▼
+              ┌──────────────────────┐
+              │      Scheduler       │
+              │   (async event loop) │
+              └──────────┬───────────┘
+                         │
+         ┌───────────────┼───────────────┐
+         │               │               │
+         ▼               ▼               ▼
+   ┌───────────┐   ┌───────────┐   ┌───────────┐
+   │  Agent 1  │   │  Agent 2  │   │  Agent 3  │
+   │  (task)   │   │  (task)   │   │  (task)   │
+   │           │   │           │   │           │
+   │  SDK      │   │  SDK      │   │  SDK      │
+   │  Client   │   │  Client   │   │  Client   │
+   └───────────┘   └───────────┘   └───────────┘
 ```
 
-## Usage Examples
+### Scheduler Implementation
 
-### Simple loop (plan-file iteration)
+```python
+class Scheduler:
+    """Orchestrates agent execution using SQLite for state."""
+
+    def __init__(self, db: sqlite3.Connection, plan: PlanSpec):
+        self.db = db
+        self.plan = plan
+        # Auto-generate run_id if not provided
+        self.run_id = plan.run.id if plan.run and plan.run.id else f"{plan.name}-{uuid4().hex[:8]}"
+        self.clients: dict[str, ClaudeSDKClient] = {}
+
+        # Initialize plan in DB
+        db.execute(
+            "INSERT INTO plans (run_id, name, spec, max_cost_usd) VALUES (?, ?, ?, ?)",
+            (self.run_id, plan.name, yaml.dump(plan.dict()), plan.cost_budget.total_usd)
+        )
+        db.commit()
+
+    async def run(self) -> SchedulerResult:
+        """Execute plan until all agents complete."""
+
+        while not self._all_done():
+            # Find agents ready to start (deps in terminal state, status=pending)
+            ready = self.db.execute("""
+                SELECT a.* FROM agents a
+                WHERE a.run_id = ? AND a.status = 'pending'
+                AND NOT EXISTS (
+                    SELECT 1 FROM agents dep
+                    WHERE dep.name IN (SELECT value FROM json_each(a.depends_on))
+                    AND dep.status NOT IN ('completed', 'failed', 'timeout', 'cancelled', 'cost_exceeded')
+                )
+            """, (self.run_id,)).fetchall()
+
+            # Check if any ready agents have failed dependencies - mark them failed too
+            for row in ready:
+                deps = json.loads(row["depends_on"] or "[]")
+                if deps:
+                    failed_deps = self.db.execute("""
+                        SELECT name FROM agents
+                        WHERE run_id = ? AND name IN ({}) AND status IN ('failed', 'timeout', 'cancelled', 'cost_exceeded')
+                    """.format(",".join("?" * len(deps))), (self.run_id, *deps)).fetchall()
+                    if failed_deps:
+                        self.db.execute(
+                            "UPDATE agents SET status = 'failed', error = ? WHERE run_id = ? AND name = ?",
+                            (f"Dependency failed: {[d['name'] for d in failed_deps]}", self.run_id, row["name"])
+                        )
+                        self.db.commit()
+                        continue
+
+            # Spawn ready agents
+            for row in ready:
+                await self._spawn_agent(row)
+
+            # Check for newly completed agents
+            completed = self.db.execute("""
+                SELECT name FROM agents
+                WHERE run_id = ? AND status IN ('completed', 'failed', 'timeout')
+            """, (self.run_id,)).fetchall()
+
+            # Check cost budget
+            total_cost = self.db.execute(
+                "SELECT SUM(cost_usd) FROM agents WHERE run_id = ?",
+                (self.run_id,)
+            ).fetchone()[0] or 0
+
+            if total_cost > self.plan.cost_budget.total_usd:
+                await self._handle_cost_exceeded()
+
+            await asyncio.sleep(1)  # Poll every second
+
+        return self._build_result()
+
+    async def _spawn_agent(self, agent_row: sqlite3.Row) -> None:
+        """Create worktree, merge deps, and spawn agent."""
+        name = agent_row["name"]
+        agent_config = AgentConfig.from_row(agent_row)
+
+        # 1. Create git worktree
+        worktree_path = create_worktree(self.run_id, name)
+
+        # 2. Merge dependency branches into worktree (if any)
+        if agent_config.depends_on:
+            setup_worktree_with_deps(
+                self.run_id, name, agent_config.depends_on, worktree_path,
+                self.plan.orchestration.dependency_context or DependencyContextConfig()
+            )
+
+        # 3. Update DB with worktree info and emit started event
+        self.db.execute("""
+            UPDATE agents SET
+                status = 'running',
+                worktree = ?,
+                branch = ?
+            WHERE run_id = ? AND name = ?
+        """, (str(worktree_path), f"swarm/{self.run_id}/{name}", self.run_id, name))
+        self.db.execute(
+            "INSERT INTO events (id, run_id, agent, event_type, data) VALUES (?, ?, ?, 'started', ?)",
+            (str(uuid4()), self.run_id, name, json.dumps({"prompt": agent_config.prompt}))
+        )
+        self.db.commit()
+
+        # 4. Create SDK client and connect
+        client = ClaudeSDKClient(options=build_options(agent_row, worktree_path))
+        await client.connect(agent_config.prompt)
+        self.clients[name] = client
+
+        # 5. Start monitoring in background
+        asyncio.create_task(monitor_agent(self.db, client, self.run_id, name))
+
+    def _all_done(self) -> bool:
+        """Check if all agents are in terminal state."""
+        pending = self.db.execute("""
+            SELECT COUNT(*) FROM agents
+            WHERE run_id = ? AND status NOT IN ('completed', 'failed', 'timeout', 'cost_exceeded', 'cancelled', 'paused')
+        """, (self.run_id,)).fetchone()[0]
+        return pending == 0
+
+    async def _handle_cost_exceeded(self) -> None:
+        """Handle cost budget exceeded - pause all agents and plan."""
+        # 1. Update plan status to paused
+        self.db.execute(
+            "UPDATE plans SET status = 'paused' WHERE run_id = ?",
+            (self.run_id,)
+        )
+
+        # 2. Pause all running agents (let them finish current iteration)
+        running_agents = self.db.execute("""
+            SELECT name FROM agents
+            WHERE run_id = ? AND status = 'running'
+        """, (self.run_id,)).fetchall()
+
+        for agent in running_agents:
+            name = agent["name"]
+            # Signal agent to pause after current iteration
+            if name in self.clients:
+                await self.clients[name].interrupt()
+            self.db.execute(
+                "UPDATE agents SET status = 'paused' WHERE run_id = ? AND name = ?",
+                (self.run_id, name)
+            )
+
+        # 3. Emit cost_exceeded event
+        self.db.execute(
+            "INSERT INTO events (id, run_id, agent, event_type, data) VALUES (?, ?, ?, 'error', ?)",
+            (str(uuid4()), self.run_id, "_system", json.dumps({
+                "error": "cost_exceeded",
+                "total_cost": self.db.execute(
+                    "SELECT SUM(cost_usd) FROM agents WHERE run_id = ?", (self.run_id,)
+                ).fetchone()[0],
+                "budget": self.plan.cost_budget.total_usd,
+            }))
+        )
+        self.db.commit()
+
+        logging.warning(f"Run {self.run_id} paused: cost budget exceeded. Use 'swarm resume {self.run_id} --add-budget <amount>' to continue.")
+```
+
+**Resume after cost pause:**
+
 ```bash
-# Via slash command
-/loop                              # Iterate on default plan file
-/loop PLAN.md                      # Iterate on specific plan file
-/loop --max 20                     # Custom iteration limit
+# Resume with additional budget
+swarm resume <run_id> --add-budget 10.0
 
-# Via CLI
-swarm loop
-swarm loop PLAN.md --max 20
+# Or just resume (continues with current budget, will pause again if exceeded)
+swarm resume <run_id>
 ```
 
-### Parallel feature development
-```bash
-# Spawn agents in worktrees (branches: auth, cache)
-/spawn "Auth module" --worktree auth
-/spawn "Cache module" --worktree cache
-/status                            # Monitor progress (compact table)
-/merge auth cache                  # Consolidate + auto-cleanup
+```python
+async def resume_paused_run(run_id: str, add_budget: float = 0.0) -> None:
+    """Resume a paused run, optionally adding budget."""
+    db = open_db(run_id)
+
+    # 1. Add budget if specified
+    if add_budget > 0:
+        db.execute(
+            "UPDATE plans SET max_cost_usd = max_cost_usd + ? WHERE run_id = ?",
+            (add_budget, run_id)
+        )
+
+    # 2. Update plan status
+    db.execute("UPDATE plans SET status = 'running' WHERE run_id = ?", (run_id,))
+
+    # 3. Resume paused agents
+    paused_agents = db.execute("""
+        SELECT * FROM agents WHERE run_id = ? AND status = 'paused'
+    """, (run_id,)).fetchall()
+
+    for agent_row in paused_agents:
+        db.execute(
+            "UPDATE agents SET status = 'running' WHERE run_id = ? AND name = ?",
+            (run_id, agent_row["name"])
+        )
+
+    db.commit()
+
+    # 4. Restart scheduler
+    scheduler = Scheduler(db, parse_plan_spec(db.execute(
+        "SELECT spec FROM plans WHERE run_id = ?", (run_id,)
+    ).fetchone()[0]))
+    await scheduler.run()
 ```
 
-### Full pipeline
+### Crash Recovery
+
+The scheduler is in-process - if `swarm run` crashes, agents die. Recovery uses **resume-from-DB**:
+
+**State preserved on crash:**
+- All agent states in SQLite (status, iteration, session_id, cost)
+- Worktrees persist on disk
+- Branches persist in git
+- Plan snapshot in `.swarm/runs/{run_id}/plan.yaml`
+
+**State lost on crash:**
+- In-flight work since last git commit
+- SDK session state (may be recoverable via session_id)
+
+**Resume flow:**
+
 ```bash
-/pipeline feature "User authentication"
-# Runs: plan → implement → test → review
+# Resume a crashed run
+swarm resume <run_id>
+# Equivalent to: swarm run --resume --run-id <run_id>
 ```
 
-### Codebase-wide refactor
-```bash
-/swarm refactor "Add type hints" --pattern "src/**/*.py" --max 50
-# Spawns N agents (one per file), auto-merges when all complete
+```python
+async def resume_run(run_id: str) -> None:
+    """Resume a run from its last known state."""
+    db = open_db(run_id)
+
+    # Load plan from snapshot
+    plan_path = Path(f".swarm/runs/{run_id}/plan.yaml")
+    plan = parse_plan_spec(plan_path.read_text())
+
+    # Find agents that need restart
+    incomplete = db.execute("""
+        SELECT * FROM agents
+        WHERE run_id = ? AND status IN ('running', 'blocked', 'pending')
+    """, (run_id,)).fetchall()
+
+    for agent_row in incomplete:
+        name = agent_row["name"]
+        session_id = agent_row["session_id"]
+
+        if session_id:
+            # Try to resume SDK session
+            try:
+                client = ClaudeSDKClient(options=ClaudeAgentOptions(
+                    resume=session_id,
+                    cwd=agent_row["worktree"],
+                ))
+                await client.connect("Continue from where you left off")
+            except SessionExpiredError:
+                # Session lost, restart agent from scratch
+                await restart_agent(db, run_id, agent_row)
+        else:
+            # No session, restart from scratch
+            await restart_agent(db, run_id, agent_row)
+
+
+async def restart_agent(db: sqlite3.Connection, run_id: str, agent_row: sqlite3.Row) -> None:
+    """Restart an agent from its last committed state."""
+    name = agent_row["name"]
+    worktree = Path(agent_row["worktree"])
+
+    # Reset iteration count (or continue from where it was)
+    db.execute("""
+        UPDATE agents SET status = 'running', error = NULL
+        WHERE run_id = ? AND name = ?
+    """, (run_id, name))
+
+    # Worktree already has committed work - agent continues from there
+    prompt = f"""Continue the task. Your previous progress is in the worktree.
+
+Previous iteration: {agent_row['iteration']}
+Previous error (if any): {agent_row['error']}
+
+Review your previous commits and continue from where you left off.
+"""
+
+    client = ClaudeSDKClient(options=build_options(agent_row, worktree))
+    await client.connect(prompt)
+    asyncio.create_task(monitor_agent(db, client, run_id, name))
 ```
 
-### CLI equivalents
+**Best practices for robustness:**
+1. Agents should commit frequently (at milestones)
+2. Use `report_progress()` to update DB state
+3. Check commands validate actual completion
+
+### Dependency Resolution
+
+```python
+class DependencyGraph:
+    """Manages agent dependencies."""
+
+    def __init__(self, agents: list[AgentConfig]):
+        self.agents = {a.name: a for a in agents}
+        self.deps = {a.name: set(a.depends_on) for a in agents}
+
+    def get_ready_agents(self, completed: set[str]) -> list[AgentConfig]:
+        """Get agents whose dependencies are satisfied."""
+        ready = []
+        for name, deps in self.deps.items():
+            if deps.issubset(completed):
+                ready.append(self.agents[name])
+        return ready
+
+    def topological_order(self) -> list[str]:
+        """Get merge order (deps before dependents)."""
+        # Kahn's algorithm
+        in_degree = {n: len(d) for n, d in self.deps.items()}
+        queue = [n for n, d in in_degree.items() if d == 0]
+        order = []
+
+        while queue:
+            node = queue.pop(0)
+            order.append(node)
+            for name, deps in self.deps.items():
+                if node in deps:
+                    in_degree[name] -= 1
+                    if in_degree[name] == 0:
+                        queue.append(name)
+
+        return order
+```
+
+## Merge Strategy
+
+### Merge Order
+
+Branches merged in **dependency order** (topological sort):
+- Deps merged before dependents
+- Ensures consistent state
+
+```
+Example: auth, cache → integration
+
+1. Merge swarm/{run_id}/auth → main
+2. Merge swarm/{run_id}/cache → main
+3. Merge swarm/{run_id}/integration → main (has both deps' changes)
+```
+
+### Conflict Resolution
+
+When merge conflicts occur, **spawn resolver agent**:
+
+```python
+async def merge_with_conflict_resolution(run_id: str, branches: list[str]) -> MergeResult:
+    """Merge branches, spawning resolver on conflicts."""
+
+    order = topological_order(branches)
+
+    for branch in order:
+        result = git_merge(branch)
+
+        if result.has_conflicts:
+            # Extract agent name from branch (swarm/{run_id}/{agent_name})
+            agent_name = branch.split("/")[-1]
+            resolver_name = f"resolver-{agent_name}"
+
+            # Spawn conflict resolver agent
+            resolver = await spawn_conflict_resolver(
+                run_id=run_id,
+                agent_name=resolver_name,
+                branch=branch,
+                conflicts=result.conflict_files,
+            )
+
+            # Wait for resolution
+            await resolver.wait()
+
+            # Verify resolution
+            if not git_status_clean():
+                raise MergeError(f"Resolver failed for {branch}")
+
+        # Cleanup
+        delete_worktree(branch)
+        delete_branch(branch)
+
+    return MergeResult(merged=order)
+
+
+async def spawn_conflict_resolver(
+    run_id: str,
+    agent_name: str,
+    branch: str,
+    conflicts: list[str],
+) -> AgentRunner:
+    """Spawn agent to resolve merge conflicts."""
+
+    prompt = f"""Resolve merge conflicts in the following files:
+{conflicts}
+
+The branch being merged is: {branch}
+The agent whose work is being merged: {agent_name}
+
+1. Review each conflicted file
+2. Choose the correct resolution (keep ours, theirs, or combine)
+3. Stage resolved files with git add
+4. Do NOT commit - just resolve and stage
+5. Verify no conflict markers remain: git diff --check
+
+Call mark_complete() when all conflicts are resolved."""
+
+    # Use agent name (not branch) to avoid slashes in resolver name
+    config = AgentConfig(
+        name=f"resolver-{agent_name}",
+        prompt=prompt,
+        check="git diff --check && git diff --name-only --diff-filter=U | wc -l | grep -q '^0$'",
+    )
+
+    return await spawn_agent(run_id, config)
+```
+
+### Merge Flow
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    swarm merge                           │
+└────────────────────────┬────────────────────────────────┘
+                         │
+                         ▼
+              ┌──────────────────────┐
+              │ Get topological order │
+              └──────────┬───────────┘
+                         │
+                         ▼
+              ┌──────────────────────┐
+              │ For each branch:     │
+              │   git merge branch   │
+              └──────────┬───────────┘
+                         │
+           ┌─────────────┴─────────────┐
+           │                           │
+      No conflicts              Has conflicts
+           │                           │
+           ▼                           ▼
+    ┌─────────────┐         ┌─────────────────────┐
+    │  Continue   │         │ Spawn resolver agent │
+    └─────────────┘         └──────────┬──────────┘
+                                       │
+                                       ▼
+                            ┌──────────────────────┐
+                            │ Wait for resolution  │
+                            └──────────┬───────────┘
+                                       │
+                                       ▼
+                            ┌──────────────────────┐
+                            │ Verify & continue    │
+                            └──────────────────────┘
+                                       │
+                                       ▼
+              ┌──────────────────────┐
+              │ Cleanup:             │
+              │ - Delete worktree    │
+              │ - Delete branch      │
+              │ - Archive state      │
+              └──────────────────────┘
+```
+
+## Dashboard Design
+
+### Layout
+
+**Split view** with agent table (top) and log viewer (bottom):
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  SWARM DASHBOARD                                    feature-auth │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  Agent         Status      Iter    Branch          Check  Cost  │
+│  ──────────────────────────────────────────────────────────────  │
+│  ▶ auth        ● running   12/30   swarm/{run_id}/auth      …     $0.15  │
+│    cache       ✓ done       8/30   swarm/{run_id}/cache     ✓     $0.12  │
+│    integration ○ pending    0/30   —               —     —      │
+│                                                                  │
+├─────────────────────────────────────────────────────────────────┤
+│  LOGS: auth                                           [Follow ✓] │
+│  ──────────────────────────────────────────────────────────────  │
+│  [12:05:23] Reading src/services/auth.py...                      │
+│  [12:05:24] Analyzing existing authentication patterns...        │
+│  [12:05:26] Creating JWT token generation function...            │
+│  [12:05:28] Writing tests for token validation...                │
+│  [12:05:30] Running pytest tests/auth/...                        │
+│  > 3 passed, 1 failed                                            │
+│  [12:05:32] Fixing test_token_expiry...                          │
+│                                                                  │
+├─────────────────────────────────────────────────────────────────┤
+│  [c]ancel  [m]erge  [l]ogs  [f]ilter  [q]uit       ↑↓ select    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Keyboard Controls
+
+| Key | Action |
+|-----|--------|
+| `↑`/`↓` | Select agent in table |
+| `Enter` | View selected agent logs |
+| `c` | Cancel selected agent |
+| `m` | Merge completed agents |
+| `l` | Toggle log panel |
+| `f` | Filter agents (running/done/failed) |
+| `r` | Refresh |
+| `q` | Quit dashboard |
+
+### Implementation (Textual TUI)
+
+```python
+import sqlite3
+from textual.app import App, ComposeResult
+from textual.widgets import DataTable, Log, Footer
+from textual.containers import Vertical
+
+class SwarmDashboard(App):
+    """TUI dashboard for swarm monitoring using SQLite."""
+
+    BINDINGS = [
+        ("c", "cancel", "Cancel"),
+        ("m", "merge", "Merge"),
+        ("l", "toggle_logs", "Logs"),
+        ("f", "filter", "Filter"),
+        ("q", "quit", "Quit"),
+    ]
+
+    def __init__(self, run_id: str, db_path: str | None = None):
+        super().__init__()
+        self.run_id = run_id
+        if db_path is None:
+            db_path = f".swarm/runs/{run_id}/swarm.db"
+        self.db = sqlite3.connect(db_path)
+        self.db.row_factory = sqlite3.Row
+
+    def compose(self) -> ComposeResult:
+        yield Vertical(
+            DataTable(id="agents"),
+            Log(id="logs"),
+        )
+        yield Footer()
+
+    async def on_mount(self) -> None:
+        table = self.query_one("#agents", DataTable)
+        table.add_columns("Agent", "Status", "Iter", "Branch", "Check", "Cost")
+        self.set_interval(1.0, self.refresh_agents)
+
+    async def refresh_agents(self) -> None:
+        """Query DB and update table."""
+        table = self.query_one("#agents", DataTable)
+        table.clear()
+
+        rows = self.db.execute("""
+            SELECT name, status, iteration, max_iterations, branch, cost_usd
+            FROM agents
+            WHERE run_id = ?
+            ORDER BY created_at
+        """, (self.run_id,)).fetchall()
+
+        for row in rows:
+            table.add_row(
+                row["name"],
+                format_status(row["status"]),
+                f"{row['iteration']}/{row['max_iterations']}",
+                row["branch"] or "—",
+                "✓" if row["status"] == "completed" else "…",
+                f"${row['cost_usd']:.2f}" if row["cost_usd"] else "—",
+            )
+
+    async def action_cancel(self) -> None:
+        """Cancel selected agent."""
+        table = self.query_one("#agents", DataTable)
+        if table.cursor_row is not None:
+            agent_name = table.get_cell_at((table.cursor_row, 0))
+            self.db.execute(
+                "UPDATE agents SET status = 'cancelled' WHERE run_id = ? AND name = ?",
+                (self.run_id, agent_name)
+            )
+            self.db.commit()
+            # Also kill the process
+            await cancel_agent_process(agent_name)
+
+    async def action_merge(self) -> None:
+        """Merge all completed agents."""
+        completed = self.db.execute(
+            "SELECT name FROM agents WHERE run_id = ? AND status = 'completed'",
+            (self.run_id,)
+        ).fetchall()
+        if completed:
+            await merge_agents(self.run_id, [r["name"] for r in completed])
+```
+
+## Agent Prompt Engineering
+
+### Hierarchical Agent Model
+
+Agents are **orchestrators** - they can spawn subagents recursively:
+
+```
+User Request
+    │
+    ▼
+┌────────────────────────────────────────────────┐
+│              Manager Agent                      │
+│                                                 │
+│  1. Explore codebase                           │
+│  2. Refine plan                                │
+│  3. Break down into tasks                      │
+│  4. Formulate dependency order                 │
+│  5. Spawn subagents: /swarm run plan.yaml      │
+│  6. Monitor: /swarm status                     │
+│  7. Collate results                            │
+│  8. Review work                                │
+│  9. Merge: /swarm merge                        │
+│                                                 │
+└─────────────────┬──────────────────────────────┘
+                  │
+    ┌─────────────┼─────────────┐
+    │             │             │
+    ▼             ▼             ▼
+┌─────────┐  ┌─────────┐  ┌─────────┐
+│ Worker  │  │ Worker  │  │ Sub-Mgr │ ← Can spawn its own workers
+│ Agent   │  │ Agent   │  │ Agent   │
+└─────────┘  └─────────┘  └────┬────┘
+                               │
+                    ┌──────────┼──────────┐
+                    │          │          │
+                    ▼          ▼          ▼
+               ┌─────────┐ ┌─────────┐ ┌─────────┐
+               │ Worker  │ │ Worker  │ │ Worker  │
+               └─────────┘ └─────────┘ └─────────┘
+```
+
+**Nesting**: Unlimited - any agent can spawn subagents recursively.
+
+### Manager Prompt Template (Built-in Default)
+
+```markdown
+# Manager Agent
+
+You are an autonomous software engineering manager agent.
+
+## Your Task
+{{task_description}}
+
+## Process
+
+### Phase 1: Understand
+1. Explore the codebase to understand existing patterns
+2. Read relevant documentation (CLAUDE.md, README, etc.)
+3. Identify files and modules related to the task
+
+### Phase 2: Plan
+1. Break down the task into discrete subtasks
+2. Identify dependencies between subtasks
+3. Determine which subtasks can run in parallel
+4. Write a plan spec file
+
+### Phase 3: Execute
+1. Create plan spec: `.swarm/plans/{{plan_name}}.yaml`
+2. Spawn subagents: `/swarm run .swarm/plans/{{plan_name}}.yaml`
+3. Monitor progress: `/swarm status`
+
+### Phase 4: Review
+1. When all agents complete, review their work
+2. Check for consistency across branches
+3. Run integration tests
+
+### Phase 5: Consolidate
+1. Merge branches: `/swarm merge`
+2. Resolve any conflicts
+3. Run final tests
+4. Call mark_plan_complete() when done
+
+## Checkpointing
+Commit at milestones:
+- After completing exploration
+- After writing plan spec
+- After all subagents complete
+- After successful merge
+
+## Tools Available
+- `/swarm run plan.yaml` - Execute plan with subagents
+- `/swarm status` - Check agent status
+- `/swarm merge` - Consolidate completed branches
+- `/swarm cancel` - Stop agents if needed
+
+## Output
+When task is complete, call mark_plan_complete(summary)
+```
+
+### Worker Prompt Template
+
+```markdown
+# Worker Agent
+
+You are an autonomous coding agent focused on a specific task.
+
+## Your Task
+{{task_description}}
+
+## Check Command
+{{check_command}}
+
+## Coordination Tools
+- mark_complete(summary): Call when done. Runs check command automatically.
+- request_clarification(question): Ask manager for guidance (blocks until response).
+- report_progress(status): Report progress updates.
+- report_blocker(issue): Report blocking issues (blocks until response).
+
+## Process
+
+1. Read relevant files to understand context
+2. Implement the required changes
+3. Write tests if applicable
+4. Call mark_complete() when done (runs check automatically)
+
+## Checkpointing
+Commit at milestones:
+- After understanding existing code
+- After completing core implementation
+- After adding tests
+- After check passes
+
+## Important
+- mark_complete() runs the check command - only call when you believe task is done
+- If stuck, call request_clarification() or report_blocker()
+- Focus only on your assigned task
+```
+
+### Plan Spec Generation by Manager
+
+Managers write plan specs to orchestrate workers:
+
+```yaml
+# Generated by manager agent
+name: feature-user-auth
+description: "Manager decomposed user auth into these subtasks"
+
+defaults:
+  max_iterations: 30
+  on_failure: continue
+
+agents:
+  # Manager identified these as parallelizable
+  - name: jwt-tokens
+    prompt: |
+      Implement JWT token generation and validation.
+      - Create src/auth/tokens.py
+      - Add sign_token() and verify_token() functions
+      - Include refresh token logic
+    check: "pytest tests/auth/test_tokens.py"
+
+  - name: password-hashing
+    prompt: |
+      Implement secure password hashing.
+      - Create src/auth/passwords.py
+      - Use bcrypt for hashing
+      - Add verify_password() function
+    check: "pytest tests/auth/test_passwords.py"
+
+  # Manager identified this depends on both above
+  - name: auth-service
+    prompt: |
+      Integrate tokens and passwords into auth service.
+      - Create src/services/auth_service.py
+      - Implement login(), logout(), register()
+      - Wire up JWT tokens and password hashing
+    depends_on: [jwt-tokens, password-hashing]
+    check: "pytest tests/services/test_auth.py"
+
+on_complete: merge
+```
+
+### Prompt Best Practices
+
+| Practice | Why |
+|----------|-----|
+| Explicit check command | Agent knows when task is complete |
+| Clear deliverables | Agent knows what to produce |
+| Scope boundaries | Agent stays focused |
+| Dependency context | Agent understands prerequisites |
+| Checkpoint guidance | Work is recoverable |
+
+## Agent Orchestration
+
+### Event System
+
+Agents communicate via an event bus for real-time coordination:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                       Manager Agent                          │
+│                                                              │
+│  Events queried from DB before each turn                    │
+│  Can respond with guidance to workers                       │
+└─────────────────────────────────┬────────────────────────────┘
+                                  │
+                    ┌─────────────┴─────────────┐
+                    │       Event Bus           │
+                    │   events table (SQLite)   │
+                    └─────────────┬─────────────┘
+                                  │
+         ┌────────────────────────┼────────────────────────┐
+         ▼                        ▼                        ▼
+   ┌───────────┐           ┌───────────┐           ┌───────────┐
+   │  Worker A │           │  Worker B │           │  Worker C │
+   └───────────┘           └───────────┘           └───────────┘
+```
+
+### Event Types
+
+```python
+EVENTS = {
+    "started": "Agent has begun work",
+    "progress": "Agent iteration update (data.milestone for checkpoints)",
+    "clarification": "Blocking question, resolved by parent agent or human",
+    "blocker": "Agent is blocked, needs help (like clarification but for general issues)",
+    "done": "Agent completed successfully",
+    "error": "Agent encountered an error or timeout",
+    "cascade_skip": "Agent skipped due to failed dependency",
+    "circuit_breaker_tripped": "Circuit breaker activated, stopping agents",
+}
+# Note: Milestones are represented as progress events with data.milestone set.
+# Example: {"event_type": "progress", "data": {"milestone": "core_impl", "status": "Impl complete"}}
+```
+
+### Event Storage
+
+Events stored in `events` table (see Database Schema above):
+
+```sql
+-- Example event queries
+-- Recent events for an agent
+SELECT * FROM events WHERE agent = 'auth' ORDER BY ts DESC LIMIT 10;
+
+-- Pending clarifications/blockers needing manager response
+SELECT e.id, e.agent, e.event_type, json_extract(e.data, '$.question') as question
+FROM events e
+WHERE e.event_type IN ('clarification', 'blocker')
+AND NOT EXISTS (
+    SELECT 1 FROM responses r WHERE r.clarification_id = e.id
+);
+
+-- Event timeline
+SELECT ts, agent, event_type, data FROM events ORDER BY ts;
+```
+
+```
+Example event flow:
+12:00:00 | auth   | started     | {"prompt": "Impl auth"}
+12:01:00 | auth   | progress    | {"iteration": 1}
+12:02:00 | auth   | progress    | {"milestone": "core_impl", "status": "Core implementation done"}
+12:03:00 | auth   | clarification | {"question": "JWT or sessions?", "parent_agent": "architect", "tree_path": "architect.auth"}
+         | (auth blocks, waiting for response)
+12:03:30 | (parent agent or human inserts into responses table)
+         | (auth unblocks, receives "Use JWT")
+12:05:00 | auth   | done        | {"summary": "Auth complete"}
+```
+
+### Event Handling
+
+**Manager queries events from DB** - Before each turn, manager loop queries recent events and includes them in prompt construction.
+
+**Stuck detection** - Both explicit and automatic:
+- Worker calls `report_blocker()` tool (blocks until response)
+- System detects no progress for N iterations via `updated_at` column
+
+### Manager-Worker Dynamics
+
+```
+Manager spawns workers
+       │
+       ▼
+Workers emit events to DB (started, progress, clarification, done)
+       │
+       ▼
+Manager queries events table before each turn
+       │
+       ▼
+Manager can respond via respond_to_clarification() tool
+       │
+       ▼
+Workers poll responses table, unblock when response arrives
+       │
+       ▼
+Workers complete → Manager reviews → Merge
+```
+
+### Worker Escalation Protocol
+
+When a worker is blocked, it uses blocking tools that handle DB operations:
+
+```python
+# Worker calls blocking tool - this is handled by the tool implementation
+response = report_blocker(
+    "Cannot find database configuration. "
+    "Tried: config.yaml, settings.py, env vars. "
+    "Need: Database connection string location"
+)
+# Tool inserts event, updates status to 'blocked', polls responses table
+# When manager responds, tool returns the response string
+# Worker continues with manager's advice in 'response'
+```
+
+The blocking is handled inside the tool implementation (see request_clarification in Agent Toolsets).
+
+### Hierarchical Communication
+
+**No peer-to-peer communication** - all communication flows through the manager hierarchy:
+
+```
+         Manager
+        /   |   \
+       /    |    \
+   Worker Worker Worker
+      │
+      │ (no direct communication)
+      │
+   Worker Worker Worker
+```
+
+This keeps the architecture clean and prevents coordination complexity.
+
+### Recursive Spawning
+
+Agents can spawn subagents recursively (unlimited nesting).
+
+**Flat worktrees with namespaced names:**
+
+```
+.swarm/
+└── runs/
+    └── {run_id}/
+        ├── swarm.db                        # All agent state in SQLite
+        ├── worktrees/
+        │   ├── manager/                    # Root manager
+        │   ├── manager.auth/               # Manager's worker
+        │   ├── manager.cache/              # Manager's worker
+        │   ├── manager.auth.tokens/        # Nested worker (auth's subagent)
+        │   └── manager.auth.validation/    # Nested worker
+        └── logs/
+            ├── manager.log
+            ├── manager.auth.log
+            └── manager.auth.tokens.log
+```
+
+**Hierarchy encoded in names:**
+- `manager` → root
+- `manager.auth` → child of manager
+- `manager.auth.tokens` → grandchild
+
+### Nested Merge Strategy
+
+**Bottom-up merging** - deepest workers merge first, then up to root:
+
+```
+1. manager.auth.tokens completes → stays on branch swarm/{run_id}/manager.auth.tokens
+2. manager.auth.validation completes → stays on branch
+3. manager.auth (sub-manager) merges its workers:
+   - Merge swarm/{run_id}/manager.auth.tokens → swarm/{run_id}/manager.auth
+   - Merge swarm/{run_id}/manager.auth.validation → swarm/{run_id}/manager.auth
+4. manager.cache completes
+5. manager (root) merges:
+   - Merge swarm/{run_id}/manager.auth → swarm/{run_id}/manager
+   - Merge swarm/{run_id}/manager.cache → swarm/{run_id}/manager
+6. Final: merge swarm/{run_id}/manager → main
+```
+
+### Failure Cascades
+
+**Manager decides on dependent failures:**
+
+When a worker fails, its manager is notified and decides:
+- Retry the worker
+- Skip dependents
+- Reassign work
+- Abort entire subtree
+
+```python
+# Manager receives failure event
+{"type": "error", "agent": "auth", "data": {"error": "Tests failed"}}
+
+# Manager decides response
+if can_retry(agent):
+    emit_guidance(agent, "retry", context=extract_error_context())
+elif has_workaround(agent):
+    emit_guidance(agent, "try_alternative", alternative=...)
+else:
+    emit_event("cascade_skip", {"agents": get_dependents(agent)})
+```
+
+**Circuit breaker:**
+
+If more than N agents fail, stop all remaining:
+
+```yaml
+# Plan spec
+circuit_breaker:
+  threshold: 3          # Stop if >3 agents fail
+  action: cancel_all    # cancel_all | pause | notify_only
+```
+
+```python
+class CircuitBreaker:
+    def __init__(self, threshold: int):
+        self.threshold = threshold
+        self.failures = 0
+
+    def record_failure(self) -> bool:
+        self.failures += 1
+        if self.failures > self.threshold:
+            return True  # Trip circuit
+        return False
+
+    def on_trip(self, scheduler):
+        scheduler.cancel_all_agents()
+        scheduler.emit_event("circuit_breaker_tripped", {
+            "failures": self.failures,
+            "threshold": self.threshold,
+        })
+```
+
+## Coordination Modes
+
+### Parallel (default)
 ```bash
-swarm spawn "Auth module" --worktree auth
-swarm status
-swarm merge auth cache
-swarm pipeline feature "User auth"
-swarm swarm refactor "Add types" --pattern "src/*.py"
+swarm run -p "auth: Impl auth" -p "cache: Impl cache" -p "log: Impl logging"
+```
+- All agents spawn immediately
+- Run independently in separate worktrees
+- Merge when all complete
+
+### Sequential (`--seq`)
+```bash
+swarm run --seq -p "plan: Create plan" -p "impl: Execute" -p "review: Review"
+```
+- Each agent waits for previous to call `mark_complete()`
+- Next agent starts from previous agent's branch (not main)
+- Artifacts passed via committed files (PLAN.md, etc.)
+- Branch chain: `main → swarm/{run_id}/plan → swarm/{run_id}/impl → swarm/{run_id}/review`
+- Final merge: `swarm/{run_id}/review → main` (contains all changes)
+
+### DAG (via plan spec)
+```yaml
+# .swarm/plans/feature.yaml
+name: feature-auth
+agents:
+  - name: auth
+    prompt: "Implement JWT auth"
+  - name: cache
+    prompt: "Implement session cache"
+  - name: integration
+    prompt: "Integrate auth with cache"
+    depends_on: [auth, cache]
+```
+```bash
+swarm run .swarm/plans/feature.yaml
+```
+- Dependency resolution via topological sort
+- Parallel where possible, sequential where required
+
+### Pattern (`--each`)
+```bash
+swarm run --each "src/services/*.py" -p "Add type hints to {file}"
+```
+- Glob expansion → N agents
+- Each agent works on single file in isolated worktree
+- Auto-merge when all complete
+
+
+## Observability
+
+### Log Format
+
+Human-readable format for easy debugging:
+
+```
+# Log entry format
+[TIMESTAMP] [LEVEL] [AGENT] MESSAGE
+
+# Examples
+[12:05:23] INFO  [auth] Agent spawned in .swarm/runs/{run_id}/worktrees/auth
+[12:05:24] INFO  [auth] Running prompt: Implement JWT auth...
+[12:05:26] DEBUG [auth] Tool: Read src/auth/__init__.py
+[12:05:28] DEBUG [auth] Tool: Write src/auth/tokens.py
+[12:05:30] INFO  [auth] Running check: pytest tests/auth/
+[12:05:32] WARN  [auth] Check failed: 1 test failed
+[12:05:35] INFO  [auth] Iteration 5/30
+[12:06:10] INFO  [auth] mark_complete() called, running check...
+[12:06:11] INFO  [auth] Check passed, agent completed
+```
+
+### Log Locations
+
+```
+.swarm/runs/{run_id}/
+└── logs/
+    ├── swarm.log           # Main scheduler log
+    ├── auth.log            # Per-agent logs
+    ├── cache.log
+    └── integration.log
+```
+
+### Log Levels
+
+| Level | Purpose |
+|-------|---------|
+| DEBUG | Tool calls, detailed execution |
+| INFO | Agent lifecycle, key events |
+| WARN | Check failures, retries |
+| ERROR | Agent failures, exceptions |
+
+### Logging Implementation
+
+```python
+import logging
+from pathlib import Path
+
+def setup_logging(run_dir: Path) -> logging.Logger:
+    """Configure logging for swarm."""
+    log_dir = run_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    # Main swarm logger
+    logger = logging.getLogger("swarm")
+    logger.setLevel(logging.DEBUG)
+
+    # File handler for main log
+    main_handler = logging.FileHandler(log_dir / "swarm.log")
+    main_handler.setFormatter(logging.Formatter(
+        "[%(asctime)s] %(levelname)-5s [%(agent)s] %(message)s",
+        datefmt="%H:%M:%S"
+    ))
+    logger.addHandler(main_handler)
+
+    # Console handler (INFO and above)
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(logging.Formatter(
+        "[%(asctime)s] %(levelname)-5s [%(agent)s] %(message)s",
+        datefmt="%H:%M:%S"
+    ))
+    logger.addHandler(console_handler)
+
+    return logger
+
+
+def get_agent_logger(name: str, run_dir: Path) -> logging.Logger:
+    """Get logger for specific agent."""
+    log_dir = run_dir / "logs"
+    logger = logging.getLogger(f"swarm.{name}")
+
+    # Per-agent file handler
+    handler = logging.FileHandler(log_dir / f"{name}.log")
+    handler.setFormatter(logging.Formatter(
+        "[%(asctime)s] %(levelname)-5s %(message)s",
+        datefmt="%H:%M:%S"
+    ))
+    logger.addHandler(handler)
+
+    return logger
+```
+
+### Telemetry (Prompt + Tool Trace)
+
+Stored per run under `.swarm/runs/{run_id}/telemetry/`:
+
+- `prompts.jsonl` (prompt snapshots)
+- `tool_calls.jsonl` (tool call inputs/outputs)
+- `costs.jsonl` (per-call cost metadata)
+
+Telemetry is configurable and should redact secrets by default.
+
+### CLI Log Commands
+
+```bash
+# View main scheduler log
+swarm logs
+
+# View specific agent log
+swarm logs auth
+
+# Follow mode (tail -f)
+swarm logs auth -f
+
+# Target a specific run
+swarm logs auth --run-id <id>
+
+# Filter by level
+swarm logs auth --level error
+
+# Show last N lines
+swarm logs auth -n 50
+
+# All agents interleaved
+swarm logs --all
+```
+
+### Debugging
+
+```bash
+# Verbose mode (DEBUG level to console)
+swarm run plan.yaml --verbose
+
+# Dry run (show what would happen without executing)
+swarm run plan.yaml --dry-run
+
+# Show dependency graph
+swarm run plan.yaml --show-deps
+
+# Agent 'auth' depends on nothing
+# Agent 'cache' depends on nothing
+# Agent 'integration' depends on: auth, cache
+```
+
+## Distribution & Installation
+
+### Installation Methods
+
+**1. pip (CLI tool)**
+```bash
+pip install claude-swarm
+swarm --help
+```
+
+**2. Claude Code Plugin (slash commands)**
+```bash
+# Install plugin
+claude plugins install claude-swarm
+
+# Or manual install
+git clone https://github.com/user/claude-swarm ~/.claude/claude-swarm
+```
+
+### Package Structure
+
+```
+claude-swarm/
+├── pyproject.toml          # Package config
+├── swarm/                   # Python package
+│   ├── __init__.py
+│   ├── cli.py             # Click CLI
+│   ├── ...
+├── .claude-plugin/         # Claude Code plugin
+│   ├── plugin.json        # Plugin manifest
+│   └── commands/          # Slash commands
+│       └── swarm.md       # /swarm command
+└── README.md
+```
+
+### pyproject.toml
+
+```toml
+[project]
+name = "claude-swarm"
+version = "0.1.0"
+description = "Multi-agent orchestration for Claude Code"
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.0",
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+    "textual>=0.40",           # Dashboard TUI
+    "claude-agent-sdk>=0.1.0", # Claude SDK
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "pytest-timeout>=2.0",
+]
+
+[project.scripts]
+swarm = "swarm.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+```
+
+### Plugin Manifest
+
+```json
+// .claude-plugin/plugin.json
+{
+  "name": "claude-swarm",
+  "version": "0.1.0",
+  "description": "Multi-agent orchestration",
+  "commands": ["commands/swarm.md"]
+}
+```
+
+### Slash Command Definition
+
+```markdown
+<!-- commands/swarm.md -->
+---
+name: swarm
+description: Multi-agent orchestration
+arguments:
+  - name: args
+    description: CLI arguments
+    required: false
+---
+
+# /swarm
+
+Pass-through to swarm CLI.
+
+## Usage
+```
+/swarm run plan.yaml
+/swarm status
+/swarm merge
+```
+
+## Implementation
+
+```bash
+#!/bin/bash
+swarm "$@"
+```
+```
+
+### User Configuration
+
+```yaml
+# ~/.claude/swarm/config.yaml
+defaults:
+  max_iterations: 30
+  max_agents: 5
+  model: sonnet
+
+logging:
+  level: info
+  dir: .swarm/runs/{run_id}/logs
+
+telemetry:
+  enabled: true
+  dir: .swarm/runs/{run_id}/telemetry
+  redact: true
+
+git:
+  worktree_dir: .swarm/runs/{run_id}/worktrees
+  branch_prefix: swarm/{run_id}/
+  auto_cleanup: true
+```
+
+### Environment Variables
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `SWARM_LOG_LEVEL` | `info` | Log verbosity |
+| `SWARM_MAX_AGENTS` | `5` | Max concurrent agents |
+| `SWARM_MODEL` | `sonnet` | Default model |
+| `SWARM_RUN_ID` | - | Override run id for `swarm run` |
+| `SWARM_RESUME` | `false` | Resume existing run when set |
+| `SWARM_TELEMETRY` | `true` | Enable or disable telemetry capture |
+| `ANTHROPIC_API_KEY` | - | Required for SDK |
+
+### First Run Setup
+
+```bash
+# After installation
+swarm init
+
+# Creates:
+# - ~/.claude/swarm/config.yaml (default config)
+# - Run-specific log/telemetry dirs created on first run
+# - Validates Claude SDK is available
+```
+
+## Testing Strategy
+
+### Test Pyramid
+
+```
+              ┌─────────────┐
+              │  E2E Tests  │  ← Real agents, real git
+              │   (few)     │
+              ├─────────────┤
+              │ Integration │  ← Mock SDK, real git
+              │  (medium)   │
+              ├─────────────┤
+              │ Unit Tests  │  ← Pure functions, mocked deps
+              │  (many)     │
+              └─────────────┘
+```
+
+### Unit Tests
+
+Test pure logic without external dependencies:
+
+```python
+# tests/unit/test_deps.py
+def test_topological_sort():
+    agents = [
+        AgentConfig(name="a", depends_on=[]),
+        AgentConfig(name="b", depends_on=["a"]),
+        AgentConfig(name="c", depends_on=["a", "b"]),
+    ]
+    graph = DependencyGraph(agents)
+    assert graph.topological_order() == ["a", "b", "c"]
+
+def test_get_ready_agents():
+    agents = [
+        AgentConfig(name="a", depends_on=[]),
+        AgentConfig(name="b", depends_on=["a"]),
+    ]
+    graph = DependencyGraph(agents)
+    ready = graph.get_ready_agents(completed=set())
+    assert [a.name for a in ready] == ["a"]
+
+# tests/unit/test_parser.py
+def test_parse_plan_spec():
+    yaml_content = """
+    name: test-plan
+    agents:
+      - name: foo
+        prompt: "Do foo"
+    """
+    spec = parse_plan_spec(yaml_content)
+    assert spec.name == "test-plan"
+    assert len(spec.agents) == 1
+
+# tests/unit/test_name_inference.py
+def test_infer_name_from_prompt():
+    assert infer_agent_name("Implement auth") == "auth"
+    assert infer_agent_name("Fix the login bug") == "login"
+    assert infer_agent_name("Refactor user service") == "user"
+```
+
+### Integration Tests (Mock SDK)
+
+Test orchestration logic with mocked agents:
+
+```python
+# tests/integration/conftest.py
+@pytest.fixture
+def mock_sdk():
+    """Mock Claude SDK client that completes via mark_complete tool."""
+    class MockClient:
+        def __init__(self):
+            self.session_id = str(uuid4())
+
+        async def connect(self, prompt):
+            pass
+
+        async def receive_response(self):
+            yield TextBlock(text="Working on task...")
+            yield ToolUseBlock(name="mark_complete", input={"summary": "Task done"})
+            yield ResultMessage(
+                result="Task complete",
+                is_error=False,
+                total_cost_usd=0.10,
+            )
+
+        async def interrupt(self):
+            pass
+
+        async def disconnect(self):
+            pass
+
+    return MockClient
+
+# tests/integration/test_scheduler.py
+@pytest.mark.asyncio
+async def test_scheduler_parallel_execution(mock_sdk, tmp_path):
+    """Test parallel agents complete in any order."""
+    plan = PlanSpec(
+        name="test",
+        agents=[
+            AgentConfig(name="a", prompt="Task A"),
+            AgentConfig(name="b", prompt="Task B"),
+        ],
+    )
+
+    # Create test database
+    db = open_db(plan.run.id if plan.run else f"{plan.name}-test")
+
+    with patch("swarm.executor.ClaudeSDKClient", mock_sdk):
+        scheduler = Scheduler(db, plan)
+        result = await scheduler.run()
+
+    assert result.completed == {"a", "b"}
+    assert result.failed == set()
+
+@pytest.mark.asyncio
+async def test_scheduler_dependency_order(mock_sdk, tmp_path):
+    """Test deps are respected."""
+    plan = PlanSpec(
+        name="test",
+        agents=[
+            AgentConfig(name="a", prompt="Task A"),
+            AgentConfig(name="b", prompt="Task B", depends_on=["a"]),
+        ],
+    )
+
+    order = []
+
+    class TrackingMockClient(mock_sdk):
+        def __init__(self, name):
+            super().__init__()
+            self.name = name
+
+        async def connect(self, prompt):
+            order.append(self.name)
+
+    db = open_db(f"{plan.name}-test")
+
+    with patch("swarm.executor.ClaudeSDKClient", TrackingMockClient):
+        scheduler = Scheduler(db, plan)
+        await scheduler.run()
+
+    assert order.index("a") < order.index("b")
+```
+
+### Git Integration Tests
+
+Test worktree and merge operations:
+
+```python
+# tests/integration/test_git.py
+@pytest.fixture
+def git_repo(tmp_path):
+    """Create a git repo for testing."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo)
+    (repo / "README.md").write_text("# Test")
+    subprocess.run(["git", "add", "."], cwd=repo)
+    subprocess.run(["git", "commit", "-m", "Initial"], cwd=repo)
+    return repo
+
+def test_create_worktree(git_repo):
+    run_id = "test-run"
+    worktree_path = create_worktree(run_id, "test-agent", repo_path=git_repo)
+    assert worktree_path.exists()
+    assert (worktree_path / ".git").exists()
+
+def test_merge_branches(git_repo):
+    # Create two worktrees with changes
+    run_id = "test-run"
+    wt1 = create_worktree(run_id, "agent-1", repo_path=git_repo)
+    wt2 = create_worktree(run_id, "agent-2", repo_path=git_repo)
+
+    (wt1 / "file1.txt").write_text("content 1")
+    subprocess.run(["git", "add", "."], cwd=wt1)
+    subprocess.run(["git", "commit", "-m", "Agent 1"], cwd=wt1)
+
+    (wt2 / "file2.txt").write_text("content 2")
+    subprocess.run(["git", "add", "."], cwd=wt2)
+    subprocess.run(["git", "commit", "-m", "Agent 2"], cwd=wt2)
+
+    # Merge both
+    merge_branches(git_repo, [f"swarm/{run_id}/agent-1", f"swarm/{run_id}/agent-2"])
+
+    # Verify both files exist on main
+    assert (git_repo / "file1.txt").exists()
+    assert (git_repo / "file2.txt").exists()
+```
+
+### E2E Tests (Real Agents)
+
+Full system tests with real SDK (expensive, run sparingly):
+
+```python
+# tests/e2e/test_full_workflow.py
+@pytest.mark.e2e
+@pytest.mark.slow
+async def test_full_parallel_workflow(git_repo):
+    """Test complete workflow with real agents."""
+    plan_content = """
+    name: e2e-test
+    agents:
+      - name: hello
+        prompt: "Create a file hello.py that prints 'Hello'"
+        check: "python hello.py"
+      - name: world
+        prompt: "Create a file world.py that prints 'World'"
+        check: "python world.py"
+    on_complete: merge
+    """
+
+    plan_path = git_repo / ".swarm/plans/test.yaml"
+    plan_path.parent.mkdir(parents=True, exist_ok=True)
+    plan_path.write_text(plan_content)
+
+    # Run swarm
+    result = subprocess.run(
+        ["swarm", "run", str(plan_path)],
+        cwd=git_repo,
+        capture_output=True,
+        timeout=300,  # 5 min timeout
+    )
+
+    assert result.returncode == 0
+    assert (git_repo / "hello.py").exists()
+    assert (git_repo / "world.py").exists()
+```
+
+### Test Fixtures
+
+```python
+# tests/conftest.py
+@pytest.fixture
+def sample_plan_spec():
+    return PlanSpec(
+        name="test-plan",
+        defaults=Defaults(max_iterations=10, on_failure="continue"),
+        agents=[
+            AgentConfig(name="a", prompt="Task A", check="true"),
+            AgentConfig(name="b", prompt="Task B", depends_on=["a"]),
+        ],
+    )
+
+@pytest.fixture
+def agent_state():
+    return AgentState(
+        name="test",
+        status="running",
+        iteration=5,
+        max_iterations=30,
+        worktree=".swarm/runs/test-run/worktrees/test",
+        branch="swarm/test-run/test",
+    )
+```
+
+### CI Configuration
+
+```yaml
+# .github/workflows/test.yml
+name: Tests
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -e ".[dev]"
+
+      - name: Unit tests
+        run: pytest tests/unit/ -v
+
+      - name: Integration tests
+        run: pytest tests/integration/ -v
+
+  e2e:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - name: E2E tests (requires API key)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: pytest tests/e2e/ -v --timeout=600
+```
+
+## Implementation Phases
+
+### Release Strategy
+
+| Version | Phases | Key Features |
+|---------|--------|--------------|
+| **v0.1** | 1-3 | Core CLI, parallel execution, merge |
+| **v0.2** | +5 | Event system, manager-worker coordination |
+| **v0.3** | +4, +6 | Dashboard TUI, specialized roles |
+| **v0.4** | +7 | Slash command, DX polish |
+
+---
+
+### Phase 1: CLI Foundation (v0.1)
+**Goal**: Core CLI with single-agent execution
+
+```
+Files:
+├── swarm/
+│   ├── __init__.py
+│   ├── cli.py              # Click CLI: run, status, cancel, db
+│   ├── models.py           # Pydantic: AgentConfig, PlanSpec
+│   ├── db.py               # SQLite setup, migrations, queries
+│   ├── executor.py         # SDK agent spawning (workers)
+│   ├── tools.py            # Worker toolset (mark_complete, etc.)
+│   └── git.py              # Worktree creation/cleanup
+├── pyproject.toml
+└── tests/
+```
+
+Tasks:
+1. Click CLI skeleton with `swarm run`, `swarm status`, `swarm cancel`, `swarm db`
+2. Pydantic models for AgentConfig, PlanSpec
+3. SQLite database setup with WAL mode (.swarm/runs/{run_id}/swarm.db)
+4. Git worktree creation (.swarm/runs/{run_id}/worktrees/{name}/)
+5. Worker toolset implementation (mark_complete, report_progress)
+6. SDK agent spawning with standard toolset
+7. Basic status table output (from DB query)
+
+**Deliverable**: `swarm run -p "auth: Impl auth"` spawns one background agent with tool-based completion
+
+### Phase 2: Plan Specs & Parallel Execution (v0.1)
+**Goal**: YAML plan specs, parallel agent coordination
+
+```
+Files:
+├── swarm/
+│   ├── parser.py           # YAML plan spec parsing
+│   ├── scheduler.py        # Parallel/sequential execution
+│   └── deps.py             # Dependency resolution
+```
+
+Tasks:
+1. YAML plan spec parser (including cost_budget)
+2. Parallel agent spawning
+3. Sequential (`--seq`) coordination
+4. Dependency resolution for `depends_on`
+5. Inline execution (`-p` flags)
+6. Cost tracking and limits
+
+**Deliverable**: `swarm run plan.yaml` executes multi-agent pipeline with cost controls
+
+### Phase 3: Merge & Logs (v0.1)
+**Goal**: Branch consolidation, log viewing
+
+```
+Files:
+├── swarm/
+│   ├── merge.py            # Git merge logic with fallback config
+│   └── logs.py             # Log tailing
+```
+
+Tasks:
+1. `swarm merge` - consolidate completed branches
+2. `swarm logs {name}` - view agent logs
+3. `swarm logs {name} -f` - follow mode
+4. Auto-cleanup worktrees on merge
+5. Conflict detection with configurable fallback (spawn_resolver, manual, fail)
+6. Manual conflict resolution mode
+
+**Deliverable**: `swarm merge` consolidates all completed work with conflict handling options
+
+---
+
+### Phase 4: Dashboard TUI (v0.3)
+**Goal**: Rich terminal dashboard
+
+```
+Files:
+├── swarm/
+│   └── dashboard.py        # Textual TUI
+```
+
+Tasks:
+1. TUI with live agent status table (including cost)
+2. Log panel with agent output
+3. Keyboard controls (cancel, view logs)
+4. Auto-refresh from state files
+
+**Deliverable**: `swarm dashboard` shows live status with controls
+
+### Phase 5: Event System & Orchestration (v0.2)
+**Goal**: Manager-worker coordination via events and blocking tools
+
+```
+Files:
+├── swarm/
+│   ├── events.py           # Event queries and emission (uses DB)
+│   ├── orchestration.py    # Circuit breaker, failure cascades
+│   ├── manager_loop.py     # Manual loop for manager agents
+│   ├── manager_tools.py    # Manager toolset
+│   └── blocking.py         # Blocking tool implementation (DB polling)
+```
+
+Tasks:
+1. Event emission and querying via SQLite (events table)
+2. Event types: started, progress, clarification, blocker, done, error
+3. Manual loop for manager agents (full context control)
+4. Manager toolset (spawn_worker, respond_to_clarification, cancel_worker, etc.)
+5. Blocking tools using responses table polling
+6. Worker response polling/waiting mechanism
+7. Circuit breaker implementation
+8. Failure cascade handling
+
+**Deliverable**: Managers receive worker events and can respond; workers can block for guidance
+
+### Phase 6: Specialized Roles & Templates (v0.3)
+**Goal**: Built-in roles and problem-type templates
+
+```
+Files:
+├── swarm/
+│   ├── roles.py            # Role definitions and loading
+│   ├── templates.py        # Template expansion
+│   └── roles/              # Built-in role YAML files
+│       ├── architect.yaml
+│       ├── implementer.yaml
+│       ├── tester.yaml
+│       └── ...
+├── templates/              # Built-in templates
+│   ├── feature.yaml
+│   ├── bugfix.yaml
+│   └── refactor.yaml
+```
+
+Tasks:
+1. Role definition schema and loading
+2. Built-in roles: architect, implementer, tester, reviewer, debugger, refactorer, integrator
+3. Custom role definition in plan specs
+4. Template expansion logic
+5. `--template` flag for CLI
+6. Dynamic tree generation by architect agents
+
+**Deliverable**: `swarm run --template feature "Implement auth"` expands to full pipeline
+
+### Phase 7: Slash Command & Polish (v0.4)
+**Goal**: Claude Code integration, DX refinements
+
+```
+Files:
+├── commands/
+│   └── swarm.md            # Single /swarm slash command
+```
+
+Tasks:
+1. `/swarm` slash command (pass-through to CLI)
+2. Pattern mode (`--each`)
+3. Error handling improvements
+4. Auto-merge on completion (`on_complete: merge`)
+5. Per-agent failure modes (`on_failure: continue|stop|retry`)
+6. `swarm init` first-run setup
+
+**Deliverable**: Full integration with Claude Code
+
+## Key Differences from Original Plan
+
+| Aspect | Original | Revised |
+|--------|----------|---------|
+| Primary interface | Slash commands | CLI (`swarm`) |
+| Slash commands | 7 separate commands | 1 pass-through (`/swarm`) |
+| Input format | Inline prompts | Plan spec YAML files |
+| Agent naming | Explicit `--name` | Inferred from prompt |
+| Loop mode | Hook-based, in-session | Eliminated (background only) |
+| Completion signal | `<done/>` text marker | `mark_complete()` tool |
+| Execution model | All agents via SDK | Manual loop (managers) + SDK (workers) |
+| Worker coordination | Text markers, polling | Blocking tools (request_clarification, etc.) |
+| State storage | JSON files | SQLite database (.swarm/runs/{run_id}/swarm.db) |
+| Worktrees | `./worktrees/` (visible) | `.swarm/runs/{run_id}/worktrees/` (hidden) |
+| Branches | `{name}` | `swarm/{run_id}/{name}` (namespaced) |
+| Progress | Polling /status | Dashboard TUI |
+| Two-system arch | Loop vs Orchestration | Single system (SDK + manual loop) |
+| Target user | Human developer | Human + other agents |
+| Cost controls | None | Per-agent + per-plan limits |
+
+## Design Decisions
+
+| Decision | Choice | Rationale |
+|----------|--------|-----------|
+| Agent naming | Infer from prompt | "Implement auth" → `auth`, better DX |
+| Run identity | Generated `run_id` per run | Namespaces state + enables resume |
+| Worktree location | `.swarm/runs/{run_id}/worktrees/` | Hidden, cleaner project root |
+| Branch naming | Prefixed `swarm/{run_id}/{name}` | Namespaced, avoids conflicts |
+| Cleanup policy | Auto on merge | Less manual work, clean state |
+
+### Name Inference Algorithm
+
+```python
+def infer_agent_name(prompt: str) -> str:
+    """Extract key term from prompt for agent name."""
+    # Common patterns: "Implement X", "Add X", "Fix X", "Refactor X"
+    patterns = [
+        r"(?:implement|add|create|build)\s+(\w+)",
+        r"(?:fix|resolve|debug)\s+(\w+)",
+        r"(?:refactor|update|improve)\s+(\w+)",
+    ]
+    for pattern in patterns:
+        if match := re.search(pattern, prompt, re.I):
+            return match.group(1).lower()
+
+    # Fallback: first significant word
+    words = [w for w in prompt.split() if len(w) > 3]
+    return words[0].lower() if words else f"task-{uuid4().hex[:6]}"
+```
+
+### File Layout
+
+```
+PROJECT/
+├── .swarm/                      # All swarm state (per-project)
+│   ├── plans/                   # User-created plan specs (YAML)
+│   │   └── feature-auth.yaml
+│   └── runs/
+│       └── {run_id}/
+│           ├── plan.yaml         # Snapshot of plan used for resume
+│           ├── swarm.db          # SQLite database (WAL mode)
+│           ├── swarm.db-wal      # WAL file (auto-managed)
+│           ├── swarm.db-shm      # Shared memory (auto-managed)
+│           ├── worktrees/        # Agent worktrees (git ignored)
+│           │   ├── auth/
+│           │   └── cache/
+│           ├── logs/             # Per-agent logs (files, not DB)
+│           │   ├── auth.log
+│           │   └── cache.log
+│           └── telemetry/        # Prompt/tool traces (jsonl)
+│               ├── prompts.jsonl
+│               ├── tool_calls.jsonl
+│               └── costs.jsonl
+├── .gitignore                   # Contains: .swarm/runs/
+└── ...
+
+~/.claude/swarm/                 # Global config (shared across projects)
+└── config.yaml                  # User defaults
+```
+
+**Why logs stay as files:**
+- `tail -f` works natively
+- Can grow large without bloating DB
+- Easy to grep/stream
+- Append-only access pattern suits files
+
+### Branch Flow
+
+```
+main
+ │
+ ├── swarm/{run_id}/auth     (agent: auth)
+ ├── swarm/{run_id}/cache    (agent: cache)
+ └── swarm/{run_id}/logging  (agent: logging)
+
+After merge:
+main ← swarm/{run_id}/auth ← swarm/{run_id}/cache ← swarm/{run_id}/logging
+       (deleted)    (deleted)     (deleted)
 ```
