@@ -76,6 +76,9 @@ class Scheduler:
         self.resume = resume
         self.tasks: dict[str, asyncio.Task] = {}
         self.db: sqlite3.Connection | None = None
+        self.failure_count = 0
+        self.idle_iterations = 0
+        self.last_event_count = 0
 
     def _init_db(self) -> None:
         """Initialize database and insert plan/agents."""
@@ -251,6 +254,8 @@ class Scheduler:
 
         Returns True if run should stop.
         """
+        self.failure_count += 1
+
         agent = get_agent(self.db, self.run_id, name)
         if not agent:
             return False
@@ -314,6 +319,86 @@ This is retry attempt {retry_attempt + 1}. The previous attempt failed with:
 
 Please address this error and continue with the task.
 """
+
+    def _check_circuit_breaker(self) -> bool:
+        """Check if circuit breaker should trip.
+
+        Returns True if run should stop.
+        """
+        if not self.plan.orchestration or not self.plan.orchestration.circuit_breaker:
+            return False
+
+        cb = self.plan.orchestration.circuit_breaker
+        if self.failure_count >= cb.threshold:
+            logger.warning(f"Circuit breaker tripped: {self.failure_count} failures >= {cb.threshold}")
+            insert_event(
+                self.db,
+                self.run_id,
+                "_system",
+                "circuit_breaker_tripped",
+                {"failure_count": self.failure_count, "threshold": cb.threshold, "action": cb.action},
+            )
+
+            if cb.action == "cancel_all":
+                update_plan_status(self.db, self.run_id, "failed")
+                # Cancel all running agents
+                for name, task in self.tasks.items():
+                    if not task.done():
+                        task.cancel()
+                        update_agent_status(self.db, self.run_id, name, "cancelled", "Circuit breaker tripped")
+                # Mark pending as cancelled
+                for a in get_agents(self.db, self.run_id):
+                    if a["status"] == "pending":
+                        update_agent_status(self.db, self.run_id, a["name"], "cancelled", "Circuit breaker tripped")
+                return True
+
+            elif cb.action == "pause":
+                update_plan_status(self.db, self.run_id, "paused")
+                for name, task in self.tasks.items():
+                    if not task.done():
+                        task.cancel()
+                        update_agent_status(self.db, self.run_id, name, "paused")
+                return True
+
+            # notify_only - just log, don't stop
+            logger.warning(f"Circuit breaker notification: {self.failure_count} failures")
+
+        return False
+
+    def _check_stuck(self) -> bool:
+        """Check for stuck agents (no progress).
+
+        Returns True if run appears stuck.
+        """
+        # Get current event count
+        from swarm.db import get_recent_events
+        events = get_recent_events(self.db, self.run_id, since_seconds=60)
+        current_count = len(events)
+
+        if current_count == self.last_event_count and self.tasks:
+            self.idle_iterations += 1
+        else:
+            self.idle_iterations = 0
+
+        self.last_event_count = current_count
+
+        # Default stuck threshold: 30 iterations (30 seconds) of no progress
+        stuck_threshold = 30
+        if self.plan.orchestration and hasattr(self.plan.orchestration, "stuck_threshold"):
+            stuck_threshold = self.plan.orchestration.stuck_threshold
+
+        if self.idle_iterations >= stuck_threshold:
+            logger.warning(f"Run appears stuck: {self.idle_iterations} iterations with no events")
+            insert_event(
+                self.db,
+                self.run_id,
+                "_system",
+                "error",
+                {"error": "stuck_detected", "idle_iterations": self.idle_iterations},
+            )
+            return True
+
+        return False
 
     def _build_result(self) -> SchedulerResult:
         """Build scheduler result from current state."""
@@ -401,12 +486,19 @@ Please address this error and continue with the task.
                 if should_stop:
                     break
 
+                # Check circuit breaker
+                if self._check_circuit_breaker():
+                    break
+
                 # Check cost budget
                 if self.plan.cost_budget:
                     total_cost = get_total_cost(self.db, self.run_id)
                     if total_cost > self.plan.cost_budget.total_usd:
                         await self._handle_cost_exceeded()
                         break
+
+                # Check for stuck condition (but don't stop, just log)
+                self._check_stuck()
 
                 await asyncio.sleep(1)
 
