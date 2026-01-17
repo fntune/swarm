@@ -43,6 +43,7 @@ class AgentConfig:
     max_cost_usd: float = 5.0
     parent: str | None = None
     env: dict | None = None
+    shared_context: str = ""
 
     def tree_path(self) -> str:
         """Get full hierarchy path."""
@@ -51,7 +52,7 @@ class AgentConfig:
         return self.name
 
 
-def build_system_prompt(config: AgentConfig, shared_context: str = "") -> str:
+def build_system_prompt(config: AgentConfig) -> str:
     """Build system prompt for worker agent."""
     return f"""You are an autonomous coding agent working on a specific task.
 
@@ -69,7 +70,7 @@ Important:
 - Commit your changes frequently
 - If you encounter a blocker, describe it clearly
 
-{shared_context}
+{config.shared_context}
 """
 
 
@@ -138,6 +139,10 @@ async def run_worker_subprocess(config: AgentConfig) -> dict:
                 f.write(f"\nSTDERR:\n{stderr.decode()}")
 
         # Check result
+        # Note: Subprocess mode cannot track actual cost - CLI doesn't output cost data
+        # Use --sdk flag for accurate cost tracking
+        update_agent_cost(db, config.run_id, config.name, 0.0)
+
         if process.returncode == 0:
             # Run check command
             check_result = subprocess.run(
@@ -151,7 +156,7 @@ async def run_worker_subprocess(config: AgentConfig) -> dict:
             if check_result.returncode == 0:
                 update_agent_status(db, config.run_id, config.name, "completed")
                 insert_event(db, config.run_id, config.name, "done", {"summary": "Task completed"})
-                return {"success": True, "status": "completed"}
+                return {"success": True, "status": "completed", "cost": 0.0}
             else:
                 update_agent_status(
                     db,
@@ -161,7 +166,7 @@ async def run_worker_subprocess(config: AgentConfig) -> dict:
                     f"Check failed: {check_result.stderr}",
                 )
                 insert_event(db, config.run_id, config.name, "error", {"error": "Check failed"})
-                return {"success": False, "status": "failed", "error": "Check failed"}
+                return {"success": False, "status": "failed", "error": "Check failed", "cost": 0.0}
         else:
             update_agent_status(
                 db,
@@ -171,7 +176,7 @@ async def run_worker_subprocess(config: AgentConfig) -> dict:
                 stderr.decode()[:500],
             )
             insert_event(db, config.run_id, config.name, "error", {"error": stderr.decode()[:200]})
-            return {"success": False, "status": "failed", "error": stderr.decode()[:500]}
+            return {"success": False, "status": "failed", "error": stderr.decode()[:500], "cost": 0.0}
 
     except Exception as e:
         logger.error(f"Worker {config.name} failed: {e}")
@@ -224,18 +229,22 @@ async def run_worker_mock(config: AgentConfig) -> dict:
         db.close()
 
 
-async def spawn_worker(config: AgentConfig, use_mock: bool = False) -> asyncio.Task:
+async def spawn_worker(config: AgentConfig, use_mock: bool = False, use_sdk: bool = False) -> asyncio.Task:
     """Spawn a worker agent as an asyncio task.
 
     Args:
         config: Agent configuration
         use_mock: Use mock implementation (for testing)
+        use_sdk: Use Claude Agent SDK (preferred)
 
     Returns:
         asyncio.Task handle
     """
     if use_mock:
         return asyncio.create_task(run_worker_mock(config), name=f"worker-{config.name}")
+    elif use_sdk:
+        from swarm.executor_sdk import run_worker_sdk
+        return asyncio.create_task(run_worker_sdk(config), name=f"worker-sdk-{config.name}")
     else:
         return asyncio.create_task(run_worker_subprocess(config), name=f"worker-{config.name}")
 
@@ -344,13 +353,18 @@ If all work is complete, say "MANAGER_COMPLETE".
         db.close()
 
 
-async def spawn_manager(config: AgentConfig) -> asyncio.Task:
+async def spawn_manager(config: AgentConfig, use_sdk: bool = False) -> asyncio.Task:
     """Spawn a manager agent as an asyncio task.
 
     Args:
         config: Agent configuration
+        use_sdk: Use Claude Agent SDK (preferred)
 
     Returns:
         asyncio.Task handle
     """
-    return asyncio.create_task(run_manager_subprocess(config), name=f"manager-{config.name}")
+    if use_sdk:
+        from swarm.executor_sdk import run_manager_sdk
+        return asyncio.create_task(run_manager_sdk(config), name=f"manager-sdk-{config.name}")
+    else:
+        return asyncio.create_task(run_manager_subprocess(config), name=f"manager-{config.name}")

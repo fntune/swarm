@@ -1142,68 +1142,214 @@ SELECT * FROM events WHERE run_id = ? ORDER BY ts DESC LIMIT 100;
 
 ## Claude Agent SDK Integration
 
-**Note:** The SDK API shown here is based on expected patterns from the Claude Agent SDK.
-Actual implementation may differ; adapt as needed based on the real SDK documentation.
+**Architecture Decision:** Based on SDK research (Jan 2026), we use:
+- **Workers**: Independent `query()` calls wrapped in `asyncio.create_task()` for true parallelism
+- **Managers**: `ClaudeSDKClient` for stateful multi-turn conversations with event injection
+- **Coordination Tools**: In-process MCP servers via `@tool` decorator with direct DB access
+- **Hierarchy**: Up to 10 levels supported (not using SDK subagents which cap at 2 levels)
 
-### Helper Functions
+**Why not SDK subagents?** The SDK's Task tool subagents:
+1. Block until completion (no true parallelism)
+2. Are invoked by Claude's decision, not imperatively
+3. Limited to 2 nesting levels
+4. Cannot spawn their own subagents
+
+Instead, we spawn workers as separate `query()` calls, giving full control over parallelism and hierarchy.
+
+### Coordination Tools (In-Process MCP)
+
+Custom tools run in the same process, with direct SQLite access for coordination:
 
 ```python
-from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions
+import asyncio
+import sqlite3
+from pathlib import Path
+from uuid import uuid4
+from claude_agent_sdk import tool, create_sdk_mcp_server, query, ClaudeAgentOptions
+
+# Database connection (thread-local for async safety)
+_db_local = threading.local()
+
+def get_db() -> sqlite3.Connection:
+    """Get thread-local DB connection."""
+    if not hasattr(_db_local, "conn"):
+        run_id = os.environ["SWARM_RUN_ID"]
+        _db_local.conn = sqlite3.connect(f".swarm/runs/{run_id}/swarm.db")
+        _db_local.conn.row_factory = sqlite3.Row
+    return _db_local.conn
+
+
+@tool(
+    name="mark_complete",
+    description="Signal task completion. Runs check command automatically.",
+    input_schema={
+        "type": "object",
+        "properties": {
+            "summary": {"type": "string", "description": "Summary of work completed"}
+        },
+        "required": ["summary"]
+    }
+)
+async def mark_complete(args: dict) -> dict:
+    """Worker signals completion - runs check gate."""
+    db = get_db()
+    agent_name = os.environ["SWARM_AGENT_NAME"]
+    run_id = os.environ["SWARM_RUN_ID"]
+
+    # Get check command from DB
+    row = db.execute(
+        "SELECT check_command FROM agents WHERE run_id = ? AND name = ?",
+        (run_id, agent_name)
+    ).fetchone()
+    check_cmd = row["check_command"] or "pytest"
+
+    # Run check command
+    result = subprocess.run(check_cmd, shell=True, capture_output=True, text=True)
+
+    if result.returncode == 0:
+        # Success - mark completed
+        db.execute(
+            "UPDATE agents SET status = 'completed' WHERE run_id = ? AND name = ?",
+            (run_id, agent_name)
+        )
+        db.execute(
+            "INSERT INTO events (id, run_id, agent, event_type, data) VALUES (?, ?, ?, 'done', ?)",
+            (uuid4().hex, run_id, agent_name, json.dumps({"summary": args["summary"]}))
+        )
+        db.commit()
+        return {"content": [{"type": "text", "text": "Task completed successfully. Check passed."}]}
+    else:
+        # Failed - return error, agent continues
+        return {"content": [{"type": "text", "text": f"Check failed. Fix and retry.\n\nOutput:\n{result.stdout}\n{result.stderr}"}]}
+
+
+@tool(
+    name="request_clarification",
+    description="Ask manager for guidance. BLOCKS until response received.",
+    input_schema={
+        "type": "object",
+        "properties": {
+            "question": {"type": "string", "description": "Question to ask manager"},
+            "escalate_to": {
+                "type": "string",
+                "enum": ["parent", "human", "auto"],
+                "description": "Who to escalate to (default: auto)"
+            }
+        },
+        "required": ["question"]
+    }
+)
+async def request_clarification(args: dict, timeout: int = 300) -> dict:
+    """Blocking call - polls DB for manager response."""
+    db = get_db()
+    agent_name = os.environ["SWARM_AGENT_NAME"]
+    run_id = os.environ["SWARM_RUN_ID"]
+    clarification_id = uuid4().hex
+
+    # Emit clarification event
+    db.execute(
+        "INSERT INTO events (id, run_id, agent, event_type, data) VALUES (?, ?, ?, 'clarification', ?)",
+        (clarification_id, run_id, agent_name, json.dumps({
+            "question": args["question"],
+            "escalate_to": args.get("escalate_to", "auto"),
+            "parent_agent": os.environ.get("SWARM_PARENT_AGENT"),
+            "tree_path": os.environ.get("SWARM_TREE_PATH"),
+        }))
+    )
+    db.execute(
+        "UPDATE agents SET status = 'blocked' WHERE run_id = ? AND name = ?",
+        (run_id, agent_name)
+    )
+    db.commit()
+
+    # Poll for response
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        row = db.execute("""
+            SELECT id, response FROM responses
+            WHERE run_id = ? AND clarification_id = ? AND consumed = 0 LIMIT 1
+        """, (run_id, clarification_id)).fetchone()
+
+        if row:
+            db.execute("UPDATE responses SET consumed = 1 WHERE id = ?", (row["id"],))
+            db.execute(
+                "UPDATE agents SET status = 'running' WHERE run_id = ? AND name = ?",
+                (run_id, agent_name)
+            )
+            db.commit()
+            return {"content": [{"type": "text", "text": f"Manager response: {row['response']}"}]}
+
+        await asyncio.sleep(2)
+
+    # Timeout
+    db.execute(
+        "UPDATE agents SET status = 'timeout' WHERE run_id = ? AND name = ?",
+        (run_id, agent_name)
+    )
+    db.commit()
+    return {"content": [{"type": "text", "text": "ERROR: Clarification timeout. No response from manager."}]}
+
+
+@tool(
+    name="report_progress",
+    description="Report progress update. Use milestone param for named checkpoints.",
+    input_schema={
+        "type": "object",
+        "properties": {
+            "status": {"type": "string", "description": "Current status"},
+            "milestone": {"type": "string", "description": "Optional milestone name (e.g., 'core_impl')"}
+        },
+        "required": ["status"]
+    }
+)
+async def report_progress(args: dict) -> dict:
+    """Non-blocking progress update."""
+    db = get_db()
+    agent_name = os.environ["SWARM_AGENT_NAME"]
+    run_id = os.environ["SWARM_RUN_ID"]
+
+    db.execute(
+        "INSERT INTO events (id, run_id, agent, event_type, data) VALUES (?, ?, ?, 'progress', ?)",
+        (uuid4().hex, run_id, agent_name, json.dumps(args))
+    )
+    db.commit()
+    return {"content": [{"type": "text", "text": "Progress recorded."}]}
+
+
+@tool(
+    name="report_blocker",
+    description="Report blocking issue. BLOCKS until manager responds with guidance.",
+    input_schema={
+        "type": "object",
+        "properties": {
+            "issue": {"type": "string", "description": "Description of the blocking issue"}
+        },
+        "required": ["issue"]
+    }
+)
+async def report_blocker(args: dict, timeout: int = 300) -> dict:
+    """Blocking call for blockers - similar to clarification."""
+    # Reuse clarification logic with different event type
+    args["question"] = args.pop("issue")
+    args["escalate_to"] = "parent"
+    # ... same polling logic as request_clarification
+    return await request_clarification(args, timeout)
+
+
+# Create MCP server with coordination tools
+def create_coordination_server():
+    """Create in-process MCP server with coordination tools."""
+    return create_sdk_mcp_server(
+        name="swarm-coordination",
+        version="1.0.0",
+        tools=[mark_complete, request_clarification, report_progress, report_blocker]
+    )
+```
+
+### Worker Options Builder
+
+```python
 from dataclasses import dataclass
-
-
-def get_coordination_tools() -> list[dict]:
-    """Return virtual coordination tool definitions."""
-    return [
-        {"name": "mark_complete", "description": "Signal task completion", "input_schema": {"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"]}},
-        {"name": "request_clarification", "description": "Ask for guidance", "input_schema": {"type": "object", "properties": {"question": {"type": "string"}, "escalate_to": {"type": "string", "enum": ["parent", "human", "auto"]}}, "required": ["question"]}},
-        {"name": "report_progress", "description": "Report progress", "input_schema": {"type": "object", "properties": {"status": {"type": "string"}, "milestone": {"type": "string"}}, "required": ["status"]}},
-        {"name": "report_blocker", "description": "Report blocker", "input_schema": {"type": "object", "properties": {"question": {"type": "string"}}, "required": ["question"]}},
-    ]
-
-
-def build_system_prompt(agent_row: sqlite3.Row) -> str:
-    """Build system prompt for agent."""
-    return f"""You are an autonomous coding agent.
-
-Task: {agent_row['prompt']}
-Check command: {agent_row['check_command'] or 'pytest'}
-
-Coordination tools:
-- mark_complete(summary): Call when done
-- request_clarification(question, escalate_to?): Ask for guidance
-- report_progress(status, milestone?): Report progress
-- report_blocker(question): Report blocking issues
-"""
-
-
-def build_options(agent_row: sqlite3.Row, worktree_path: Path) -> ClaudeAgentOptions:
-    """Build SDK options from agent DB row."""
-    return ClaudeAgentOptions(
-        cwd=str(worktree_path),
-        allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
-        custom_tools=get_coordination_tools(),
-        permission_mode="bypassPermissions",
-        model=agent_row["model"] or "sonnet",
-        system_prompt=build_system_prompt(agent_row),
-    )
-
-
-def build_options_from_state(state: dict) -> ClaudeAgentOptions:
-    """Build SDK options from saved state dict."""
-    return ClaudeAgentOptions(
-        cwd=state["worktree"],
-        allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
-        custom_tools=get_coordination_tools(),
-        permission_mode="bypassPermissions",
-        model=state.get("model", "sonnet"),
-    )
-
-
-def parse_plan_spec(yaml_content: str) -> PlanSpec:
-    """Parse YAML content into PlanSpec."""
-    data = yaml.safe_load(yaml_content)
-    return PlanSpec(**data)
 
 
 @dataclass
@@ -1219,6 +1365,7 @@ class AgentConfig:
     worktree_path: Path = None
     shared_context: str = ""
     env: dict = None
+    parent: str = None  # For hierarchy tracking
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "AgentConfig":
@@ -1232,272 +1379,325 @@ class AgentConfig:
             max_iterations=row["max_iterations"] or 30,
             max_cost_usd=row["max_cost_usd"] or 5.0,
             worktree_path=Path(row["worktree"]) if row["worktree"] else None,
+            parent=row["parent"],
         )
-```
 
-### Agent Spawning
+    def tree_path(self) -> str:
+        """Get full hierarchy path (e.g., 'manager.auth.tokens')."""
+        if self.parent:
+            return f"{self.parent}.{self.name}"
+        return self.name
 
-Each agent is spawned via `ClaudeSDKClient`:
 
-```python
-async def spawn_agent(agent_config: AgentConfig) -> str:
-    """Spawn a background agent, return session_id."""
-
-    # Define coordination tools (virtual - intercepted by monitor_agent, never executed)
-    coordination_tools = [
-        {
-            "name": "mark_complete",
-            "description": "Signal task completion. Triggers check command automatically.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "summary": {"type": "string", "description": "Summary of work completed"}
-                },
-                "required": ["summary"]
-            }
-        },
-        {
-            "name": "request_clarification",
-            "description": "Ask for guidance. Blocks until response received.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "question": {"type": "string", "description": "Question to ask"},
-                    "escalate_to": {
-                        "type": "string",
-                        "enum": ["parent", "human", "auto"],
-                        "description": "Who to escalate to: parent agent, human, or auto-route (default: auto)"
-                    }
-                },
-                "required": ["question"]
-            }
-        },
-        {
-            "name": "report_progress",
-            "description": "Report progress update. Optional milestone for named checkpoints.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "status": {"type": "string", "description": "Current status"},
-                    "milestone": {"type": "string", "description": "Optional milestone name"}
-                },
-                "required": ["status"]
-            }
-        },
-        {
-            "name": "report_blocker",
-            "description": "Report blocking issue. Blocks until manager responds.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "question": {"type": "string", "description": "Description of blocking issue"}
-                },
-                "required": ["question"]
-            }
-        },
-    ]
-
-    options = ClaudeAgentOptions(
-        # Working directory is the worktree
-        cwd=agent_config.worktree_path,
-
-        # File tools for autonomous work + coordination tools (virtual)
+def build_worker_options(config: AgentConfig, run_id: str) -> ClaudeAgentOptions:
+    """Build SDK options for a worker agent."""
+    return ClaudeAgentOptions(
+        cwd=str(config.worktree_path),
         allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
-        custom_tools=coordination_tools,  # Virtual tools intercepted by monitor
-        permission_mode="bypassPermissions",  # Autonomous mode
-
-        # Inject context via system prompt
+        mcp_servers={"coordination": create_coordination_server()},
+        permission_mode="bypassPermissions",
+        model=config.model,
+        max_turns=config.max_iterations,
+        env={
+            "SWARM_RUN_ID": run_id,
+            "SWARM_AGENT_NAME": config.name,
+            "SWARM_PARENT_AGENT": config.parent or "",
+            "SWARM_TREE_PATH": config.tree_path(),
+            **(config.env or {}),
+        },
         system_prompt=f"""You are an autonomous coding agent.
 
-Task: {agent_config.prompt}
+Task: {config.prompt}
 
-Check command: {agent_config.check_command}
+Check command: {config.check_command}
 
 Coordination tools available:
 - mark_complete(summary): Call when task is done. Runs check command automatically.
-- request_clarification(question, escalate_to?): Ask for guidance (blocks until response).
-  escalate_to: "parent" (manager), "human" (dashboard), "auto" (default, routes automatically)
+- request_clarification(question, escalate_to?): Ask for guidance (BLOCKS until response).
 - report_progress(status, milestone?): Report progress updates.
-- report_blocker(question): Report blocking issues (blocks until response).
+- report_blocker(issue): Report blocking issues (BLOCKS until response).
 
-Shared context files:
-{agent_config.shared_context}
+{config.shared_context}
 """,
-
-        # Model selection
-        model="sonnet",  # or "opus" for complex tasks
-
-        # Environment
-        env=agent_config.env or {},
     )
 
-    client = ClaudeSDKClient(options=options)
-    await client.connect(agent_config.prompt)
 
-    # Store session_id for resumption
-    return client.session_id
+def parse_plan_spec(yaml_content: str) -> PlanSpec:
+    """Parse YAML content into PlanSpec."""
+    data = yaml.safe_load(yaml_content)
+    # Validate hierarchy depth
+    validate_hierarchy_depth(data.get("agents", []))
+    return PlanSpec(**data)
+
+
+def validate_hierarchy_depth(agents: list, current_depth: int = 1, max_depth: int = 10) -> None:
+    """Validate agent hierarchy doesn't exceed max depth."""
+    if current_depth > max_depth:
+        raise ValueError(f"Agent hierarchy exceeds maximum depth of {max_depth} levels")
+    # Hierarchy depth is tracked via parent field in DB, validated at spawn time
 ```
 
-### Agent Monitoring
+### Worker Spawning (via query())
+
+Workers are spawned as independent `query()` calls wrapped in asyncio tasks for true parallelism:
 
 ```python
-async def monitor_agent(
-    db: sqlite3.Connection,
-    client: ClaudeSDKClient,
+from claude_agent_sdk import query, ClaudeAgentOptions
+from typing import AsyncIterator
+import logging
+
+logger = logging.getLogger("swarm")
+
+
+async def run_worker(
+    config: AgentConfig,
     run_id: str,
-    agent_name: str,
-):
-    """Stream agent output, detect completion via mark_complete tool."""
+    db: sqlite3.Connection,
+) -> dict:
+    """Run a worker agent to completion. Returns result dict."""
 
-    async for message in client.receive_response():
-        # Update heartbeat
-        db.execute(
-            "UPDATE agents SET updated_at = CURRENT_TIMESTAMP WHERE run_id = ? AND name = ?",
-            (run_id, agent_name)
-        )
+    options = build_worker_options(config, run_id)
 
-        # Log output to file
-        if isinstance(message, TextBlock):
-            log_to_file(run_id, agent_name, message.text)
+    # Track cost and iterations
+    total_cost = 0.0
+    iteration = 0
 
-        # Track tool usage and handle coordination tools
-        if isinstance(message, ToolUseBlock):
+    try:
+        async for message in query(prompt=config.prompt, options=options):
+            iteration += 1
+
+            # Update iteration count in DB
             db.execute(
-                "UPDATE agents SET iteration = iteration + 1 WHERE run_id = ? AND name = ?",
-                (run_id, agent_name)
+                "UPDATE agents SET iteration = ? WHERE run_id = ? AND name = ?",
+                (iteration, run_id, config.name)
             )
-
-            # Handle mark_complete tool - runs check automatically
-            if message.name == "mark_complete":
-                db.execute(
-                    "UPDATE agents SET status = 'checking' WHERE run_id = ? AND name = ?",
-                    (run_id, agent_name)
-                )
-                check_result = await run_check(run_id, agent_name)
-                if check_result.success:
-                    db.execute(
-                        "UPDATE agents SET status = 'completed' WHERE run_id = ? AND name = ?",
-                        (run_id, agent_name)
-                    )
-                    # Emit done event
-                    db.execute(
-                        "INSERT INTO events (id, run_id, agent, event_type, data) VALUES (?, ?, ?, 'done', ?)",
-                        (str(uuid4()), run_id, agent_name, json.dumps({"summary": message.input.get("summary", "")}))
-                    )
-                    await client.send_tool_result(message.id, "Task completed successfully")
-                else:
-                    db.execute(
-                        "UPDATE agents SET status = 'running' WHERE run_id = ? AND name = ?",
-                        (run_id, agent_name)
-                    )
-                    await client.send_tool_result(message.id, f"Check failed: {check_result.output}")
-
-            # Handle blocking tools - emit event with clarification_id
-            elif message.name in ("request_clarification", "report_blocker"):
-                clarification_id = str(uuid4())
-                event_type = "clarification" if message.name == "request_clarification" else "blocker"
-
-                # Add agent context to event data
-                event_data = {
-                    **message.input,
-                    "root_agent": get_root_agent(db, run_id, agent_name),
-                    "parent_agent": get_parent_agent(db, run_id, agent_name),
-                    "tree_path": get_tree_path(db, run_id, agent_name),
-                }
-                db.execute(
-                    "INSERT INTO events (id, run_id, agent, event_type, data) VALUES (?, ?, ?, ?, ?)",
-                    (clarification_id, run_id, agent_name, event_type, json.dumps(event_data))
-                )
-                db.execute(
-                    "UPDATE agents SET status = 'blocked' WHERE run_id = ? AND name = ?",
-                    (run_id, agent_name)
-                )
-                db.commit()
-
-                # Poll for manager response using clarification_id
-                response = await wait_for_response(db, run_id, clarification_id, agent_name)
-                await client.send_tool_result(message.id, response)
-
-            # Handle progress reporting
-            elif message.name == "report_progress":
-                db.execute(
-                    "INSERT INTO events (id, run_id, agent, event_type, data) VALUES (?, ?, ?, 'progress', ?)",
-                    (str(uuid4()), run_id, agent_name, json.dumps(message.input))
-                )
-                await client.send_tool_result(message.id, "Progress recorded")
-
             db.commit()
 
-        # Final result
-        if isinstance(message, ResultMessage):
-            db.execute("""
-                UPDATE agents SET
-                    cost_usd = ?,
-                    status = CASE WHEN ? THEN 'failed' ELSE status END,
-                    error = CASE WHEN ? THEN ? ELSE error END
-                WHERE run_id = ? AND name = ?
-            """, (
-                message.total_cost_usd,
-                message.is_error,
-                message.is_error,
-                message.result if message.is_error else None,
-                run_id,
-                agent_name,
-            ))
-            # Update plan total cost
-            db.execute("""
-                UPDATE plans SET total_cost_usd = (
-                    SELECT SUM(cost_usd) FROM agents WHERE run_id = ?
-                ) WHERE run_id = ?
-            """, (run_id, run_id))
-            # Emit error event on failure
-            if message.is_error:
+            # Log output
+            if hasattr(message, "content"):
+                for block in message.content:
+                    if hasattr(block, "text"):
+                        log_to_file(run_id, config.name, block.text)
+
+            # Track cost from result message
+            if hasattr(message, "total_cost_usd"):
+                total_cost = message.total_cost_usd
+                db.execute(
+                    "UPDATE agents SET cost_usd = ? WHERE run_id = ? AND name = ?",
+                    (total_cost, run_id, config.name)
+                )
+
+            # Check for errors
+            if hasattr(message, "is_error") and message.is_error:
+                db.execute(
+                    "UPDATE agents SET status = 'failed', error = ? WHERE run_id = ? AND name = ?",
+                    (str(message.result), run_id, config.name)
+                )
                 db.execute(
                     "INSERT INTO events (id, run_id, agent, event_type, data) VALUES (?, ?, ?, 'error', ?)",
-                    (str(uuid4()), run_id, agent_name, json.dumps({"error": message.result}))
+                    (uuid4().hex, run_id, config.name, json.dumps({"error": str(message.result)}))
                 )
-            db.commit()
-            break
+                db.commit()
+                return {"success": False, "error": str(message.result), "cost": total_cost}
+
+        # Check final status (coordination tools update status directly)
+        final_status = db.execute(
+            "SELECT status FROM agents WHERE run_id = ? AND name = ?",
+            (run_id, config.name)
+        ).fetchone()["status"]
+
+        return {
+            "success": final_status == "completed",
+            "status": final_status,
+            "cost": total_cost,
+            "iterations": iteration,
+        }
+
+    except Exception as e:
+        logger.error(f"Worker {config.name} failed: {e}")
+        db.execute(
+            "UPDATE agents SET status = 'failed', error = ? WHERE run_id = ? AND name = ?",
+            (str(e), run_id, config.name)
+        )
+        db.commit()
+        return {"success": False, "error": str(e), "cost": total_cost}
 
 
-async def wait_for_response(
-    db: sqlite3.Connection,
+async def spawn_worker(
+    config: AgentConfig,
     run_id: str,
-    clarification_id: str,
-    agent_name: str,
-    timeout: int = 300,
-) -> str:
-    """Poll DB for manager response to a specific clarification."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        row = db.execute("""
-            SELECT id, response FROM responses
-            WHERE run_id = ? AND clarification_id = ? AND consumed = 0
-            LIMIT 1
-        """, (run_id, clarification_id)).fetchone()
+    db: sqlite3.Connection,
+) -> asyncio.Task:
+    """Spawn worker as background asyncio task. Returns task handle."""
 
-        if row:
-            db.execute("UPDATE responses SET consumed = 1 WHERE id = ?", (row[0],))
-            db.execute(
-                "UPDATE agents SET status = 'running' WHERE run_id = ? AND name = ?",
-                (run_id, agent_name)
-            )
-            db.commit()
-            return row[1]
-
-        await asyncio.sleep(2)
-
-    # Timeout: set agent to timeout status and emit error event
+    # Update DB status to running
     db.execute(
-        "UPDATE agents SET status = 'timeout' WHERE run_id = ? AND name = ?",
-        (run_id, agent_name)
+        "UPDATE agents SET status = 'running' WHERE run_id = ? AND name = ?",
+        (run_id, config.name)
     )
     db.execute(
-        "INSERT INTO events (id, run_id, agent, event_type, data) VALUES (?, ?, ?, 'error', ?)",
-        (str(uuid4()), run_id, agent_name, json.dumps({"error": "Clarification timeout"}))
+        "INSERT INTO events (id, run_id, agent, event_type, data) VALUES (?, ?, ?, 'started', ?)",
+        (uuid4().hex, run_id, config.name, json.dumps({"prompt": config.prompt[:200]}))
     )
     db.commit()
-    raise TimeoutError("No response from manager")
+
+    # Create and return asyncio task
+    return asyncio.create_task(
+        run_worker(config, run_id, db),
+        name=f"worker-{config.name}"
+    )
+```
+
+### Manager Loop (via ClaudeSDKClient)
+
+Managers use stateful `ClaudeSDKClient` for multi-turn conversations with event injection:
+
+```python
+from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions
+
+
+def build_manager_options(config: AgentConfig, run_id: str) -> ClaudeAgentOptions:
+    """Build SDK options for a manager agent."""
+    return ClaudeAgentOptions(
+        cwd=str(config.worktree_path),
+        allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
+        mcp_servers={"coordination": create_coordination_server()},
+        permission_mode="bypassPermissions",
+        model=config.model or "opus",  # Managers typically need stronger reasoning
+        env={
+            "SWARM_RUN_ID": run_id,
+            "SWARM_AGENT_NAME": config.name,
+            "SWARM_TREE_PATH": config.tree_path(),
+            **(config.env or {}),
+        },
+        system_prompt=f"""You are a manager agent coordinating worker agents.
+
+Task: {config.prompt}
+
+You can spawn workers, monitor their progress, and respond to their questions.
+
+Manager tools:
+- spawn_worker(name, prompt, check?): Create a new worker agent
+- respond_to_clarification(clarification_id, response): Answer a worker's question
+- cancel_worker(name): Stop a worker agent
+- get_worker_status(name?): Get status of worker(s)
+- get_pending_clarifications(): Get questions awaiting your response
+- mark_plan_complete(summary): Signal orchestration is done
+
+{config.shared_context}
+""",
+    )
+
+
+async def run_manager(
+    config: AgentConfig,
+    run_id: str,
+    db: sqlite3.Connection,
+) -> dict:
+    """Run manager agent with event injection loop."""
+
+    options = build_manager_options(config, run_id)
+
+    async with ClaudeSDKClient(options=options) as client:
+        # Initial prompt
+        await client.query(config.prompt)
+
+        while True:
+            # Process responses
+            async for message in client.receive_response():
+                if hasattr(message, "content"):
+                    for block in message.content:
+                        if hasattr(block, "text"):
+                            log_to_file(run_id, config.name, block.text)
+
+                # Check if manager called mark_plan_complete
+                if hasattr(message, "is_error"):
+                    break
+
+            # Check if manager is done
+            status = db.execute(
+                "SELECT status FROM agents WHERE run_id = ? AND name = ?",
+                (run_id, config.name)
+            ).fetchone()["status"]
+
+            if status == "completed":
+                return {"success": True}
+
+            # Inject events into next turn
+            events = get_recent_events(db, run_id)
+            clarifications = get_pending_clarifications(db, run_id)
+
+            if not events and not clarifications:
+                await asyncio.sleep(5)  # Poll interval
+                continue
+
+            # Build event summary for manager
+            event_summary = format_events_for_manager(events, clarifications)
+            await client.query(f"Events update:\n{event_summary}\n\nRespond to any pending clarifications or adjust strategy as needed.")
+
+    return {"success": False, "error": "Manager loop exited unexpectedly"}
+
+
+def get_recent_events(db: sqlite3.Connection, run_id: str, since_seconds: int = 30) -> list[dict]:
+    """Get events from the last N seconds."""
+    rows = db.execute("""
+        SELECT agent, event_type, data, ts FROM events
+        WHERE run_id = ? AND ts > datetime('now', ?)
+        ORDER BY ts DESC LIMIT 50
+    """, (run_id, f"-{since_seconds} seconds")).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_pending_clarifications(db: sqlite3.Connection, run_id: str) -> list[dict]:
+    """Get clarifications awaiting manager response."""
+    rows = db.execute("""
+        SELECT e.id, e.agent, json_extract(e.data, '$.question') as question
+        FROM events e
+        WHERE e.run_id = ? AND e.event_type IN ('clarification', 'blocker')
+        AND NOT EXISTS (SELECT 1 FROM responses r WHERE r.clarification_id = e.id)
+    """, (run_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def format_events_for_manager(events: list[dict], clarifications: list[dict]) -> str:
+    """Format events for injection into manager prompt."""
+    lines = []
+    if clarifications:
+        lines.append("## Pending Clarifications (respond with respond_to_clarification tool)")
+        for c in clarifications:
+            lines.append(f"- [{c['id'][:8]}] {c['agent']}: {c['question']}")
+    if events:
+        lines.append("\n## Recent Events")
+        for e in events:
+            lines.append(f"- [{e['ts']}] {e['agent']}: {e['event_type']}")
+    return "\n".join(lines) or "No new events."
+```
+
+### How Coordination Works
+
+With in-process MCP tools, coordination is handled **inside the tool functions** (see Coordination Tools section above):
+
+1. **Tool execution**: SDK automatically executes tools when Claude calls them
+2. **mark_complete**: Tool runs check command, updates DB status, returns result to Claude
+3. **request_clarification**: Tool emits event, polls DB, blocks until response, returns to Claude
+4. **report_progress**: Tool writes event to DB, returns immediately
+
+**No manual tool result handling required** - the SDK manages the tool call → result → continue loop.
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    Worker (query())                      │
+│                                                          │
+│  1. Claude works on task                                │
+│  2. Claude calls mark_complete(summary)                 │
+│  3. SDK executes @tool mark_complete                    │
+│     → Tool runs check command                           │
+│     → Tool updates DB (completed/running)               │
+│     → Tool returns result string                        │
+│  4. SDK sends result back to Claude                     │
+│  5. If check passed → query() ends                      │
+│     If check failed → Claude continues iterating        │
+└─────────────────────────────────────────────────────────┘
 ```
 
 ### Agent Context Helpers
@@ -1764,11 +1964,11 @@ This allows dependent agents to:
 
 ### Overview
 
-The scheduler is **CLI-driven** with **in-process async monitoring**:
+The scheduler is **CLI-driven** with **in-process async execution**:
 - `swarm run` starts the scheduler
-- Scheduler holds all SDK clients in memory
-- Monitors via asyncio tasks
-- Exits when all agents complete (or fail)
+- Workers run as independent `query()` calls in asyncio tasks
+- Managers run via `ClaudeSDKClient` with event injection
+- Scheduler polls DB for completion, handles cost limits
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -1785,12 +1985,15 @@ The scheduler is **CLI-driven** with **in-process async monitoring**:
          │               │               │
          ▼               ▼               ▼
    ┌───────────┐   ┌───────────┐   ┌───────────┐
-   │  Agent 1  │   │  Agent 2  │   │  Agent 3  │
+   │  Worker 1 │   │  Worker 2 │   │  Manager  │
    │  (task)   │   │  (task)   │   │  (task)   │
    │           │   │           │   │           │
-   │  SDK      │   │  SDK      │   │  SDK      │
-   │  Client   │   │  Client   │   │  Client   │
+   │  query()  │   │  query()  │   │  SDK      │
+   │           │   │           │   │  Client   │
    └───────────┘   └───────────┘   └───────────┘
+        ▲               ▲               │
+        │               │               ▼
+        └───────────────┴───── Events (SQLite) ─────
 ```
 
 ### Scheduler Implementation
@@ -1804,12 +2007,12 @@ class Scheduler:
         self.plan = plan
         # Auto-generate run_id if not provided
         self.run_id = plan.run.id if plan.run and plan.run.id else f"{plan.name}-{uuid4().hex[:8]}"
-        self.clients: dict[str, ClaudeSDKClient] = {}
+        self.tasks: dict[str, asyncio.Task] = {}  # Active asyncio tasks
 
         # Initialize plan in DB
         db.execute(
             "INSERT INTO plans (run_id, name, spec, max_cost_usd) VALUES (?, ?, ?, ?)",
-            (self.run_id, plan.name, yaml.dump(plan.dict()), plan.cost_budget.total_usd)
+            (self.run_id, plan.name, yaml.dump(plan.dict()), plan.cost_budget.total_usd if plan.cost_budget else 25.0)
         )
         db.commit()
 
@@ -1817,18 +2020,19 @@ class Scheduler:
         """Execute plan until all agents complete."""
 
         while not self._all_done():
-            # Find agents ready to start (deps in terminal state, status=pending)
+            # Find agents ready to start (deps completed, status=pending)
             ready = self.db.execute("""
                 SELECT a.* FROM agents a
                 WHERE a.run_id = ? AND a.status = 'pending'
                 AND NOT EXISTS (
                     SELECT 1 FROM agents dep
-                    WHERE dep.name IN (SELECT value FROM json_each(a.depends_on))
+                    WHERE dep.run_id = a.run_id
+                    AND dep.name IN (SELECT value FROM json_each(a.depends_on))
                     AND dep.status NOT IN ('completed', 'failed', 'timeout', 'cancelled', 'cost_exceeded')
                 )
             """, (self.run_id,)).fetchall()
 
-            # Check if any ready agents have failed dependencies - mark them failed too
+            # Check for failed dependencies - cascade failure
             for row in ready:
                 deps = json.loads(row["depends_on"] or "[]")
                 if deps:
@@ -1841,18 +2045,28 @@ class Scheduler:
                             "UPDATE agents SET status = 'failed', error = ? WHERE run_id = ? AND name = ?",
                             (f"Dependency failed: {[d['name'] for d in failed_deps]}", self.run_id, row["name"])
                         )
+                        self.db.execute(
+                            "INSERT INTO events (id, run_id, agent, event_type, data) VALUES (?, ?, ?, 'cascade_skip', ?)",
+                            (uuid4().hex, self.run_id, row["name"], json.dumps({"failed_deps": [d["name"] for d in failed_deps]}))
+                        )
                         self.db.commit()
                         continue
 
-            # Spawn ready agents
+            # Spawn ready agents as asyncio tasks
             for row in ready:
-                await self._spawn_agent(row)
+                if row["name"] not in self.tasks:
+                    task = await self._spawn_agent(row)
+                    self.tasks[row["name"]] = task
 
-            # Check for newly completed agents
-            completed = self.db.execute("""
-                SELECT name FROM agents
-                WHERE run_id = ? AND status IN ('completed', 'failed', 'timeout')
-            """, (self.run_id,)).fetchall()
+            # Clean up completed tasks
+            for name, task in list(self.tasks.items()):
+                if task.done():
+                    try:
+                        result = task.result()
+                        logger.info(f"Agent {name} finished: {result}")
+                    except Exception as e:
+                        logger.error(f"Agent {name} raised exception: {e}")
+                    del self.tasks[name]
 
             # Check cost budget
             total_cost = self.db.execute(
@@ -1860,49 +2074,45 @@ class Scheduler:
                 (self.run_id,)
             ).fetchone()[0] or 0
 
-            if total_cost > self.plan.cost_budget.total_usd:
+            if self.plan.cost_budget and total_cost > self.plan.cost_budget.total_usd:
                 await self._handle_cost_exceeded()
 
             await asyncio.sleep(1)  # Poll every second
 
         return self._build_result()
 
-    async def _spawn_agent(self, agent_row: sqlite3.Row) -> None:
-        """Create worktree, merge deps, and spawn agent."""
+    async def _spawn_agent(self, agent_row: sqlite3.Row) -> asyncio.Task:
+        """Create worktree, merge deps, and spawn agent as asyncio task."""
         name = agent_row["name"]
+        agent_type = agent_row.get("type", "worker")
         agent_config = AgentConfig.from_row(agent_row)
 
         # 1. Create git worktree
         worktree_path = create_worktree(self.run_id, name)
+        agent_config.worktree_path = worktree_path
 
         # 2. Merge dependency branches into worktree (if any)
         if agent_config.depends_on:
             setup_worktree_with_deps(
                 self.run_id, name, agent_config.depends_on, worktree_path,
-                self.plan.orchestration.dependency_context or DependencyContextConfig()
+                self.plan.orchestration.dependency_context if self.plan.orchestration else None
             )
 
-        # 3. Update DB with worktree info and emit started event
+        # 3. Update DB with worktree info
         self.db.execute("""
-            UPDATE agents SET
-                status = 'running',
-                worktree = ?,
-                branch = ?
+            UPDATE agents SET worktree = ?, branch = ?
             WHERE run_id = ? AND name = ?
         """, (str(worktree_path), f"swarm/{self.run_id}/{name}", self.run_id, name))
-        self.db.execute(
-            "INSERT INTO events (id, run_id, agent, event_type, data) VALUES (?, ?, ?, 'started', ?)",
-            (str(uuid4()), self.run_id, name, json.dumps({"prompt": agent_config.prompt}))
-        )
         self.db.commit()
 
-        # 4. Create SDK client and connect
-        client = ClaudeSDKClient(options=build_options(agent_row, worktree_path))
-        await client.connect(agent_config.prompt)
-        self.clients[name] = client
-
-        # 5. Start monitoring in background
-        asyncio.create_task(monitor_agent(self.db, client, self.run_id, name))
+        # 4. Spawn as asyncio task based on type
+        if agent_type == "manager":
+            return asyncio.create_task(
+                run_manager(agent_config, self.run_id, self.db),
+                name=f"manager-{name}"
+            )
+        else:
+            return await spawn_worker(agent_config, self.run_id, self.db)
 
     def _all_done(self) -> bool:
         """Check if all agents are in terminal state."""
@@ -3646,16 +3856,18 @@ Tasks:
 | Input format | Inline prompts | Plan spec YAML files |
 | Agent naming | Explicit `--name` | Inferred from prompt |
 | Loop mode | Hook-based, in-session | Eliminated (background only) |
-| Completion signal | `<done/>` text marker | `mark_complete()` tool |
-| Execution model | All agents via SDK | Manual loop (managers) + SDK (workers) |
-| Worker coordination | Text markers, polling | Blocking tools (request_clarification, etc.) |
+| Completion signal | `<done/>` text marker | `mark_complete()` tool via MCP |
+| Execution model | SDK subagents | `query()` tasks (workers) + `ClaudeSDKClient` (managers) |
+| Worker coordination | Text markers, polling | In-process MCP tools with DB polling |
 | State storage | JSON files | SQLite database (.swarm/runs/{run_id}/swarm.db) |
 | Worktrees | `./worktrees/` (visible) | `.swarm/runs/{run_id}/worktrees/` (hidden) |
 | Branches | `{name}` | `swarm/{run_id}/{name}` (namespaced) |
 | Progress | Polling /status | Dashboard TUI |
-| Two-system arch | Loop vs Orchestration | Single system (SDK + manual loop) |
+| Two-system arch | Loop vs Orchestration | Single system (async tasks + MCP tools) |
 | Target user | Human developer | Human + other agents |
 | Cost controls | None | Per-agent + per-plan limits |
+| Hierarchy depth | Unlimited | Up to 10 levels (validated at spawn) |
+| SDK subagents | Used for workers | Not used (max 2 levels, blocks, Claude-decided) |
 
 ## Design Decisions
 
@@ -3666,6 +3878,10 @@ Tasks:
 | Worktree location | `.swarm/runs/{run_id}/worktrees/` | Hidden, cleaner project root |
 | Branch naming | Prefixed `swarm/{run_id}/{name}` | Namespaced, avoids conflicts |
 | Cleanup policy | Auto on merge | Less manual work, clean state |
+| Worker execution | Async `query()` tasks | True parallelism, no SDK subagent limits |
+| Manager execution | `ClaudeSDKClient` | Stateful multi-turn with event injection |
+| Coordination tools | In-process MCP | Direct DB access, asyncio blocking |
+| Hierarchy limit | 10 levels | Practical for automation, prevents runaway |
 
 ### Name Inference Algorithm
 
@@ -3736,3 +3952,115 @@ After merge:
 main ← swarm/{run_id}/auth ← swarm/{run_id}/cache ← swarm/{run_id}/logging
        (deleted)    (deleted)     (deleted)
 ```
+
+## Implementation Gaps
+
+Status as of 2025-01-18. Features documented above but not yet fully implemented.
+
+### Critical (Breaking or Non-functional)
+
+| Feature | Location | Issue | Priority |
+|---------|----------|-------|----------|
+| ~~Merge conflict resolver~~ | ~~`models.py:54-57`, `merge.py`~~ | ~~`spawn_resolver` action defined but never invoked~~ | ~~P1~~ FIXED |
+| ~~Plan completion status~~ | ~~`scheduler.py:406-514`~~ | ~~Plan never set to completed/failed on success path~~ | ~~P1~~ FIXED |
+| ~~Cancel command~~ | ~~`cli.py:209-233`~~ | ~~Updates DB only, doesn't stop running processes~~ | ~~P1~~ FIXED |
+| ~~`interactive_merge()`~~ | ~~`merge.py:162-189`~~ | ~~Calls undefined `merge_branch()` - NameError~~ | ~~P1~~ FIXED |
+| Manager subprocess tools | `executor.py:262-340` | Text marker parsing instead of MCP tool calls | P2 (deferred - SDK mode recommended) |
+
+### Partial Implementation
+
+| Feature | Location | Issue |
+|---------|----------|-------|
+| ~~Cost budget `on_exceed`~~ | ~~`scheduler.py:231-253`~~ | ~~Only `pause` works; `cancel` and `warn` not implemented~~ FIXED |
+| ~~Circuit breaker `pause`~~ | ~~`scheduler.py:326-365`~~ | ~~Only `cancel_all` and `notify_only` implemented~~ FIXED (was already implemented) |
+| ~~Dependency context `paths` mode~~ | ~~`git.py:244-247`~~ | ~~Comment says filter, code does full merge~~ FIXED |
+| ~~Resume worktrees~~ | ~~`scheduler.py:144-170`~~ | ~~Re-creates worktrees instead of reusing existing~~ FIXED |
+| ~~Shared context injection~~ | ~~`scheduler.py:180-184`~~ | ~~Loaded then dropped, never passed to agents~~ FIXED |
+| ~~Per-agent `max_cost_usd`~~ | ~~`executor_sdk.py`~~ | ~~Field exists but never enforced~~ FIXED (SDK mode; subprocess has cost=0 limitation) |
+
+### Unused/Dead Code
+
+| Item | Location | Notes |
+|------|----------|-------|
+| `ManagerSettings` model | `models.py:77-82` | Never instantiated or applied |
+| `PlanSpec.run` field | `models.py` | Defined but never used |
+| `MAX_HIERARCHY_DEPTH` | `parser.py:15-18` | Constant defined, never checked |
+| `Milestone` model | `models.py:70-75` | Defined but never validated/tracked/displayed |
+| `PlanSpec.on_complete` | `models.py` | Merge config ignored (merge is manual only) |
+
+### Missing from Phases
+
+**Phase 4: Dashboard TUI (v0.3)**
+- Current: Basic polling loop in `cli.py:305-358`
+- Missing: Rich panels, agent status, cost tracking, controls
+
+**Phase 5: Event System (v0.2)**
+- Missing: `events.py` module - coordination is ad-hoc in scheduler
+- Missing: `manager_loop.py` - manager orchestration
+- Missing: `blocking.py` - clarification blocking primitives
+
+**Phase 6: Templates (v0.3)**
+- Missing: `templates.py` module
+- Missing: `--template` CLI flag
+- Missing: Template YAML files
+- Current: Roles hard-coded in `swarm/roles.py`
+
+**Phase 7: Slash Commands (v0.4)**
+- Missing: Plugin integration
+- Missing: `/swarm` pass-through command
+
+### Test Coverage Gaps
+
+**No tests exist for:**
+- ~~Scheduler execution flow~~ ADDED (test_scheduler.py - 13 tests)
+- ~~Executor (subprocess and SDK)~~ ADDED (test_executor.py - 6 tests)
+- ~~CLI commands (run/status/cancel/merge/dashboard)~~ ADDED (test_cli.py - 21 tests)
+- ~~Git worktree management~~ ADDED (test_git.py - 7 tests)
+- Coordination tools (mark_complete, request_clarification, etc.)
+- ~~Merge helpers~~ ADDED (test_merge.py - 8 tests)
+- Retry/stop failure handling
+- ~~Circuit breaker behavior~~ ADDED (test_scheduler.py)
+- ~~Cost budget enforcement~~ ADDED (test_scheduler.py)
+- Resume handling
+- Manager-worker clarification flows
+
+**Current coverage (85 tests total):**
+- `test_parser.py` - Plan YAML parsing
+- `test_deps.py` - Dependency graph
+- `test_db.py` - SQLite operations
+- `test_roles.py` - Role templates
+- `test_scheduler.py` - Scheduler init, result building, circuit breaker, cost budget (13 tests)
+- `test_executor.py` - AgentConfig, system prompt building, mock worker (6 tests)
+- `test_git.py` - Worktree create/reuse/remove, merge operations (7 tests)
+- `test_cli.py` - CLI commands (run, status, cancel, logs, merge, clean, db, roles) (21 tests)
+- `test_merge.py` - Merge order, conflict detection, squash merge (8 tests)
+
+### SDK vs Subprocess Parity
+
+| Feature | SDK (`executor_sdk.py`) | Subprocess (`executor.py`) |
+|---------|------------------------|---------------------------|
+| Coordination tools | MCP tools work correctly | Text marker parsing (fragile) |
+| Cost tracking | Captured from ResultMessage | Not captured |
+| Check failure handling | Sets failed + error event | Same |
+| Env injection | `env=` param + os.environ | os.environ only |
+| Manager loop | Multi-turn with ClaudeSDKClient | Single-shot with event injection |
+
+### Recommended Fix Order
+
+1. **P1 Critical** - Fix broken functionality
+   - ~~`interactive_merge()` NameError~~ FIXED
+   - ~~Plan completion status~~ FIXED
+   - ~~Cancel command process termination~~ FIXED
+
+2. **P2 Core** - Complete partial implementations
+   - ~~Cost budget actions (cancel/warn)~~ FIXED
+   - ~~Circuit breaker pause~~ FIXED (was already implemented)
+   - ~~Shared context injection~~ FIXED
+
+3. **P3 Tests** - Add test coverage for scheduler/executor
+   - ~~Scheduler tests~~ ADDED (13 tests)
+
+4. **P4 Features** - Implement missing phases
+   - Dashboard TUI
+   - Event system
+   - Templates

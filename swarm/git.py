@@ -58,17 +58,24 @@ def create_worktree(
 ) -> Path:
     """Create a git worktree for an agent.
 
+    If worktree already exists (resume scenario), returns existing path.
+
     Args:
         run_id: The run identifier
         agent_name: Name of the agent
         repo_path: Path to git repo (defaults to cwd)
 
     Returns:
-        Path to the created worktree
+        Path to the created or existing worktree
     """
     repo = repo_path or Path.cwd()
     worktree_path = repo / ".swarm" / "runs" / run_id / "worktrees" / agent_name
     branch_name = f"swarm/{run_id}/{agent_name}"
+
+    # Check if worktree already exists (resume case)
+    if worktree_path.exists() and (worktree_path / ".git").exists():
+        logger.info(f"Reusing existing worktree at {worktree_path}")
+        return worktree_path
 
     worktree_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -237,14 +244,62 @@ def setup_worktree_with_deps(
             base = get_default_branch(repo)
             changed_files = get_changed_files(dep_branch, base, repo)
             # Cherry-pick only changed files
+            checkout_failed = []
             for file in changed_files:
-                run_git(["checkout", dep_branch, "--", file], cwd=worktree_path, check=False)
-            commit(worktree_path, f"Import changes from {dep_name}")
+                result = run_git(["checkout", dep_branch, "--", file], cwd=worktree_path, check=False)
+                if result.returncode != 0:
+                    checkout_failed.append(file)
+                    logger.warning(f"Failed to checkout {file} from {dep_branch}: {result.stderr}")
+            if checkout_failed:
+                logger.error(f"Failed to checkout {len(checkout_failed)} files from {dep_name}")
+            if changed_files and not all(f in checkout_failed for f in changed_files):
+                commit(worktree_path, f"Import changes from {dep_name}")
 
         elif mode == "paths":
-            # Filter by include/exclude paths
-            if not merge_branch(worktree_path, dep_branch, f"Merge {dep_name} dependency"):
-                raise GitError(f"Conflict merging dependency {dep_name}")
+            # Filter by include/exclude paths - cherry-pick only matching files
+            base = get_default_branch(repo)
+            changed_files = get_changed_files(dep_branch, base, repo)
+
+            def matches_path(file: str, pattern: str) -> bool:
+                """Check if file matches a path pattern (prefix or exact)."""
+                pattern = pattern.rstrip("/")
+                # Exact match or directory prefix match
+                return file == pattern or file.startswith(pattern + "/")
+
+            # Apply include/exclude filters
+            filtered_files = []
+            for file in changed_files:
+                # Check include paths (if specified, file must match at least one)
+                if include_paths:
+                    included = any(matches_path(file, p) for p in include_paths)
+                    if not included:
+                        logger.debug(f"Excluding {file} - not in include_paths")
+                        continue
+
+                # Check exclude paths
+                if exclude_paths:
+                    excluded = any(matches_path(file, p) for p in exclude_paths)
+                    if excluded:
+                        logger.debug(f"Excluding {file} - matches exclude_paths")
+                        continue
+
+                filtered_files.append(file)
+
+            # Import only filtered files
+            if filtered_files:
+                logger.info(f"Importing {len(filtered_files)} filtered files from {dep_name}")
+                checkout_failed = []
+                for file in filtered_files:
+                    result = run_git(["checkout", dep_branch, "--", file], cwd=worktree_path, check=False)
+                    if result.returncode != 0:
+                        checkout_failed.append(file)
+                        logger.warning(f"Failed to checkout {file} from {dep_branch}: {result.stderr}")
+                if checkout_failed:
+                    logger.error(f"Failed to checkout {len(checkout_failed)} files from {dep_name}")
+                if not all(f in checkout_failed for f in filtered_files):
+                    commit(worktree_path, f"Import filtered changes from {dep_name}")
+            else:
+                logger.info(f"No files matched filters for {dep_name}")
 
     logger.info(f"Setup worktree with deps: {depends_on}")
 

@@ -15,6 +15,7 @@ from swarm.db import (
     get_agent,
     get_agents,
     get_pending_agents,
+    get_plan,
     get_retryable_agents,
     get_total_cost,
     increment_retry_attempt,
@@ -61,6 +62,7 @@ class Scheduler:
         run_id: str | None = None,
         use_mock: bool = False,
         resume: bool = False,
+        use_sdk: bool = False,
     ):
         """Initialize scheduler.
 
@@ -69,11 +71,13 @@ class Scheduler:
             run_id: Optional run ID (generated if not provided)
             use_mock: Use mock workers (for testing)
             resume: Resume existing run (skip completed agents, reset failed)
+            use_sdk: Use Claude Agent SDK (preferred over CLI subprocess)
         """
         self.plan = plan
         self.run_id = run_id or generate_run_id(plan.name)
         self.use_mock = use_mock
         self.resume = resume
+        self.use_sdk = use_sdk
         self.tasks: dict[str, asyncio.Task] = {}
         self.db: sqlite3.Connection | None = None
         self.failure_count = 0
@@ -196,13 +200,14 @@ class Scheduler:
             max_iterations=agent_row["max_iterations"] or 30,
             max_cost_usd=agent_row["max_cost_usd"] or 5.0,
             parent=agent_row["parent"],
+            shared_context=shared_context,
         )
 
         # Spawn based on type
         if agent_type == "manager":
-            return await spawn_manager(config)
+            return await spawn_manager(config, use_sdk=self.use_sdk)
         else:
-            return await spawn_worker(config, use_mock=self.use_mock)
+            return await spawn_worker(config, use_mock=self.use_mock, use_sdk=self.use_sdk)
 
     def _check_failed_deps(self, agent_row: sqlite3.Row) -> list[str]:
         """Check if agent has failed dependencies.
@@ -225,29 +230,47 @@ class Scheduler:
 
         return failed
 
-    async def _handle_cost_exceeded(self) -> None:
-        """Handle cost budget exceeded."""
-        logger.warning(f"Run {self.run_id}: cost budget exceeded")
+    async def _handle_cost_exceeded(self) -> bool:
+        """Handle cost budget exceeded based on on_exceed setting.
 
-        # Update plan status
-        update_plan_status(self.db, self.run_id, "paused")
-
-        # Cancel running tasks
-        for name, task in self.tasks.items():
-            if not task.done():
-                task.cancel()
-                update_agent_status(self.db, self.run_id, name, "paused")
-
-        # Emit event
+        Returns True if run should stop.
+        """
         total_cost = get_total_cost(self.db, self.run_id)
         budget = self.plan.cost_budget.total_usd if self.plan.cost_budget else 25.0
+        action = self.plan.cost_budget.on_exceed if self.plan.cost_budget else "pause"
+
+        logger.warning(f"Run {self.run_id}: cost budget exceeded (${total_cost:.2f} > ${budget:.2f}), action={action}")
+
+        # Emit event
         insert_event(
             self.db,
             self.run_id,
             "_system",
             "error",
-            {"error": "cost_exceeded", "total_cost": total_cost, "budget": budget},
+            {"error": "cost_exceeded", "total_cost": total_cost, "budget": budget, "action": action},
         )
+
+        if action == "warn":
+            # Just log warning, continue execution
+            return False
+
+        elif action == "cancel":
+            # Cancel all agents and fail the run
+            update_plan_status(self.db, self.run_id, "failed")
+            for name, task in self.tasks.items():
+                if not task.done():
+                    task.cancel()
+                    update_agent_status(self.db, self.run_id, name, "cancelled", "Cost budget exceeded")
+            return True
+
+        else:  # pause (default)
+            # Pause for manual resume
+            update_plan_status(self.db, self.run_id, "paused")
+            for name, task in self.tasks.items():
+                if not task.done():
+                    task.cancel()
+                    update_agent_status(self.db, self.run_id, name, "paused")
+            return True
 
     async def _handle_agent_failure(self, name: str, error: str) -> bool:
         """Handle agent failure based on on_failure setting.
@@ -410,6 +433,10 @@ Please address this error and continue with the task.
 
         success = len(failed) == 0 and len(completed) == len(agents)
 
+        # Update plan status based on outcome
+        plan_status = "completed" if success else "failed"
+        update_plan_status(self.db, self.run_id, plan_status)
+
         return SchedulerResult(
             run_id=self.run_id,
             success=success,
@@ -428,6 +455,17 @@ Please address this error and continue with the task.
 
         try:
             while not all_agents_done(self.db, self.run_id):
+                # Check for external cancellation
+                plan = get_plan(self.db, self.run_id)
+                if plan and plan["status"] == "cancelled":
+                    logger.info("Run cancelled externally")
+                    # Cancel all running tasks
+                    for name, task in self.tasks.items():
+                        if not task.done():
+                            task.cancel()
+                            update_agent_status(self.db, self.run_id, name, "cancelled")
+                    break
+
                 # Find ready agents
                 ready = get_pending_agents(self.db, self.run_id)
 
@@ -494,8 +532,9 @@ Please address this error and continue with the task.
                 if self.plan.cost_budget:
                     total_cost = get_total_cost(self.db, self.run_id)
                     if total_cost > self.plan.cost_budget.total_usd:
-                        await self._handle_cost_exceeded()
-                        break
+                        if await self._handle_cost_exceeded():
+                            break
+                        # warn action returns False, continue execution
 
                 # Check for stuck condition (but don't stop, just log)
                 self._check_stuck()
@@ -518,6 +557,7 @@ async def run_plan(
     run_id: str | None = None,
     use_mock: bool = False,
     resume: bool = False,
+    use_sdk: bool = False,
 ) -> SchedulerResult:
     """Run a plan.
 
@@ -526,9 +566,10 @@ async def run_plan(
         run_id: Optional run ID
         use_mock: Use mock workers
         resume: Resume existing run
+        use_sdk: Use Claude Agent SDK
 
     Returns:
         SchedulerResult
     """
-    scheduler = Scheduler(plan, run_id, use_mock, resume)
+    scheduler = Scheduler(plan, run_id, use_mock, resume, use_sdk)
     return await scheduler.run()

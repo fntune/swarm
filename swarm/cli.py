@@ -29,6 +29,7 @@ def main() -> None:
 @click.option("--run-id", "run_id", default=None, help="Explicit run ID")
 @click.option("--resume", is_flag=True, help="Resume existing run")
 @click.option("--mock", is_flag=True, help="Use mock workers (for testing)")
+@click.option("--sdk", is_flag=True, help="Use Claude Agent SDK (recommended)")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose output")
 def run(
     plan_file: str | None,
@@ -38,6 +39,7 @@ def run(
     run_id: str | None,
     resume: bool,
     mock: bool,
+    sdk: bool,
     verbose: bool,
 ) -> None:
     """Run a swarm plan."""
@@ -94,7 +96,7 @@ def run(
     click.echo(f"Agents: {[a.name for a in plan.agents]}")
 
     # Run
-    result = asyncio.run(run_plan(plan, actual_run_id, use_mock=mock, resume=resume))
+    result = asyncio.run(run_plan(plan, actual_run_id, use_mock=mock, resume=resume, use_sdk=sdk))
 
     # Output result
     click.echo(f"\nRun completed: {result.run_id}")
@@ -362,8 +364,9 @@ def dashboard(run_id: str) -> None:
 
 @main.command()
 @click.argument("run_id")
+@click.option("--sdk", is_flag=True, help="Use Claude Agent SDK (recommended)")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose output")
-def resume(run_id: str, verbose: bool) -> None:
+def resume(run_id: str, sdk: bool, verbose: bool) -> None:
     """Resume a previous run (alias for run --resume --run-id)."""
     from swarm.db import get_plan, open_db, run_exists
     import yaml
@@ -388,7 +391,7 @@ def resume(run_id: str, verbose: bool) -> None:
     click.echo(f"Resuming run: {run_id}")
     click.echo(f"Agents: {[a.name for a in plan.agents]}")
 
-    result = asyncio.run(run_plan(plan, run_id, resume=True))
+    result = asyncio.run(run_plan(plan, run_id, resume=True, use_sdk=sdk))
 
     click.echo(f"\nRun completed: {result.run_id}")
     click.echo(f"Success: {result.success}")

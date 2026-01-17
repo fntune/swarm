@@ -1,0 +1,8 @@
+name: test-refactor
+agents:
+  - name: analyze
+    prompt: "List all Python files in the swarm/ directory and briefly describe what each one does"
+    check: "true"
+  - name: report
+    prompt: "Summarize what the analyze agent found about the codebase structure"
+    depends_on: [analyze]
