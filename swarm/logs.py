@@ -3,33 +3,27 @@
 import logging
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
+
+from swarm.db import ensure_log_file, get_log_path, get_logs_dir
 
 logger = logging.getLogger("swarm.logs")
 
 
-def get_log_dir(run_id: str) -> Path:
-    """Get log directory for a run."""
-    return Path(f".swarm/runs/{run_id}/logs")
-
-
-def get_agent_log_path(run_id: str, agent_name: str) -> Path:
-    """Get log file path for an agent."""
-    return get_log_dir(run_id) / f"{agent_name}.log"
-
-
-def read_log(run_id: str, agent_name: str, lines: int | None = None) -> str:
+def read_log(run_id: str, agent_name: str, lines: int | None = None, base_path: Path | None = None) -> str:
     """Read agent log file.
 
     Args:
         run_id: Run identifier
         agent_name: Agent name
         lines: Number of lines to read (None for all)
+        base_path: Base path for .swarm directory (defaults to cwd)
 
     Returns:
         Log content
     """
-    log_path = get_agent_log_path(run_id, agent_name)
+    log_path = get_log_path(run_id, agent_name, base_path)
 
     if not log_path.exists():
         return f"Log file not found: {log_path}"
@@ -48,6 +42,7 @@ def tail_log(
     agent_name: str,
     follow: bool = True,
     interval: float = 0.5,
+    base_path: Path | None = None,
 ) -> None:
     """Tail an agent log file.
 
@@ -56,8 +51,9 @@ def tail_log(
         agent_name: Agent name
         follow: If True, continue following
         interval: Poll interval in seconds
+        base_path: Base path for .swarm directory (defaults to cwd)
     """
-    log_path = get_agent_log_path(run_id, agent_name)
+    log_path = get_log_path(run_id, agent_name, base_path)
 
     if not log_path.exists():
         print(f"Log file not found: {log_path}")
@@ -91,16 +87,17 @@ def tail_log(
             print("\n")
 
 
-def list_logs(run_id: str) -> list[str]:
+def list_logs(run_id: str, base_path: Path | None = None) -> list[str]:
     """List available log files for a run.
 
     Args:
         run_id: Run identifier
+        base_path: Base path for .swarm directory (defaults to cwd)
 
     Returns:
         List of agent names with logs
     """
-    log_dir = get_log_dir(run_id)
+    log_dir = get_logs_dir(run_id, base_path)
 
     if not log_dir.exists():
         return []
@@ -108,17 +105,18 @@ def list_logs(run_id: str) -> list[str]:
     return [p.stem for p in log_dir.glob("*.log")]
 
 
-def read_all_logs(run_id: str, interleaved: bool = False) -> str:
+def read_all_logs(run_id: str, interleaved: bool = False, base_path: Path | None = None) -> str:
     """Read all logs for a run.
 
     Args:
         run_id: Run identifier
         interleaved: If True, interleave logs by timestamp
+        base_path: Base path for .swarm directory (defaults to cwd)
 
     Returns:
         Combined log content
     """
-    agent_names = list_logs(run_id)
+    agent_names = list_logs(run_id, base_path)
 
     if not agent_names:
         return "No logs found"
@@ -128,13 +126,13 @@ def read_all_logs(run_id: str, interleaved: bool = False) -> str:
         output = []
         for name in sorted(agent_names):
             output.append(f"\n{'='*60}\n{name}\n{'='*60}\n")
-            output.append(read_log(run_id, name))
+            output.append(read_log(run_id, name, base_path=base_path))
         return "".join(output)
 
     # Interleave by timestamp (simplified - assumes ISO timestamp prefix)
     entries = []
     for name in agent_names:
-        content = read_log(run_id, name)
+        content = read_log(run_id, name, base_path=base_path)
         for line in content.split("\n"):
             if line.strip():
                 entries.append((name, line))
@@ -146,14 +144,15 @@ def read_all_logs(run_id: str, interleaved: bool = False) -> str:
     return "\n".join(f"[{name}] {line}" for name, line in entries)
 
 
-def setup_logging(run_id: str, verbose: bool = False) -> None:
+def setup_logging(run_id: str, verbose: bool = False, base_path: Path | None = None) -> None:
     """Set up logging for a run.
 
     Args:
         run_id: Run identifier
         verbose: Enable debug logging
+        base_path: Base path for .swarm directory (defaults to cwd)
     """
-    log_dir = get_log_dir(run_id)
+    log_dir = get_logs_dir(run_id, base_path)
     log_dir.mkdir(parents=True, exist_ok=True)
 
     # Root logger
@@ -179,18 +178,16 @@ def setup_logging(run_id: str, verbose: bool = False) -> None:
     root.addHandler(console_handler)
 
 
-def log_to_agent_file(run_id: str, agent_name: str, text: str) -> None:
+def log_to_agent_file(run_id: str, agent_name: str, text: str, base_path: Path | None = None) -> None:
     """Append text to agent log file.
 
     Args:
         run_id: Run identifier
         agent_name: Agent name
         text: Text to append
+        base_path: Base path for .swarm directory (defaults to cwd)
     """
-    from datetime import datetime
-
-    log_path = get_agent_log_path(run_id, agent_name)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path = ensure_log_file(run_id, agent_name, base_path)
 
     with open(log_path, "a") as f:
         timestamp = datetime.now().isoformat()

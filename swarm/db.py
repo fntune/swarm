@@ -3,7 +3,9 @@
 import json
 import logging
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Generator
 from uuid import uuid4
 
 logger = logging.getLogger("swarm.db")
@@ -83,10 +85,37 @@ CREATE INDEX IF NOT EXISTS idx_responses_pending ON responses(run_id, clarificat
 """
 
 
+def get_run_dir(run_id: str, base_path: Path | None = None) -> Path:
+    """Get the run directory for a run."""
+    base = base_path or Path.cwd()
+    return base / ".swarm" / "runs" / run_id
+
+
 def get_db_path(run_id: str, base_path: Path | None = None) -> Path:
     """Get the database path for a run."""
-    base = base_path or Path.cwd()
-    return base / ".swarm" / "runs" / run_id / "swarm.db"
+    return get_run_dir(run_id, base_path) / "swarm.db"
+
+
+def get_logs_dir(run_id: str, base_path: Path | None = None) -> Path:
+    """Get the logs directory for a run."""
+    return get_run_dir(run_id, base_path) / "logs"
+
+
+def get_worktrees_dir(run_id: str, base_path: Path | None = None) -> Path:
+    """Get the worktrees directory for a run."""
+    return get_run_dir(run_id, base_path) / "worktrees"
+
+
+def get_log_path(run_id: str, agent_name: str, base_path: Path | None = None) -> Path:
+    """Get the log file path for an agent."""
+    return get_logs_dir(run_id, base_path) / f"{agent_name}.log"
+
+
+def ensure_log_file(run_id: str, agent_name: str, base_path: Path | None = None) -> Path:
+    """Get or create log file path for an agent."""
+    log_path = get_log_path(run_id, agent_name, base_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    return log_path
 
 
 def open_db(run_id: str, base_path: Path | None = None) -> sqlite3.Connection:
@@ -105,6 +134,21 @@ def open_db(run_id: str, base_path: Path | None = None) -> sqlite3.Connection:
     db.execute("PRAGMA synchronous = NORMAL")
 
     return db
+
+
+@contextmanager
+def get_db(run_id: str, base_path: Path | None = None) -> Generator[sqlite3.Connection, None, None]:
+    """Context manager for database access.
+
+    Usage:
+        with get_db(run_id) as db:
+            agent = get_agent(db, run_id, name)
+    """
+    db = open_db(run_id, base_path)
+    try:
+        yield db
+    finally:
+        db.close()
 
 
 def init_db(run_id: str, base_path: Path | None = None) -> sqlite3.Connection:

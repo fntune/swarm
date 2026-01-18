@@ -5,8 +5,6 @@ import json
 import logging
 import sqlite3
 from dataclasses import dataclass
-from pathlib import Path
-from uuid import uuid4
 
 import yaml
 
@@ -16,7 +14,7 @@ from swarm.db import (
     get_agents,
     get_pending_agents,
     get_plan,
-    get_retryable_agents,
+    get_recent_events,
     get_total_cost,
     increment_retry_attempt,
     init_db,
@@ -31,10 +29,9 @@ from swarm.db import (
     update_agent_worktree,
     update_plan_status,
 )
-from swarm.deps import DependencyGraph
 from swarm.executor import AgentConfig, spawn_manager, spawn_worker
 from swarm.git import create_worktree, setup_worktree_with_deps
-from swarm.models import AgentSpec, PlanSpec
+from swarm.models import PlanSpec
 from swarm.parser import generate_run_id, load_shared_context
 from swarm.roles import apply_role, get_role_defaults
 
@@ -62,7 +59,6 @@ class Scheduler:
         run_id: str | None = None,
         use_mock: bool = False,
         resume: bool = False,
-        use_sdk: bool = False,
     ):
         """Initialize scheduler.
 
@@ -71,13 +67,11 @@ class Scheduler:
             run_id: Optional run ID (generated if not provided)
             use_mock: Use mock workers (for testing)
             resume: Resume existing run (skip completed agents, reset failed)
-            use_sdk: Use Claude Agent SDK (preferred over CLI subprocess)
         """
         self.plan = plan
         self.run_id = run_id or generate_run_id(plan.name)
         self.use_mock = use_mock
         self.resume = resume
-        self.use_sdk = use_sdk
         self.tasks: dict[str, asyncio.Task] = {}
         self.db: sqlite3.Connection | None = None
         self.failure_count = 0
@@ -205,9 +199,9 @@ class Scheduler:
 
         # Spawn based on type
         if agent_type == "manager":
-            return await spawn_manager(config, use_sdk=self.use_sdk)
+            return spawn_manager(config)
         else:
-            return await spawn_worker(config, use_mock=self.use_mock, use_sdk=self.use_sdk)
+            return spawn_worker(config, use_mock=self.use_mock)
 
     def _check_failed_deps(self, agent_row: sqlite3.Row) -> list[str]:
         """Check if agent has failed dependencies.
@@ -394,7 +388,6 @@ Please address this error and continue with the task.
         Returns True if run appears stuck.
         """
         # Get current event count
-        from swarm.db import get_recent_events
         events = get_recent_events(self.db, self.run_id, since_seconds=60)
         current_count = len(events)
 
@@ -557,7 +550,6 @@ async def run_plan(
     run_id: str | None = None,
     use_mock: bool = False,
     resume: bool = False,
-    use_sdk: bool = False,
 ) -> SchedulerResult:
     """Run a plan.
 
@@ -566,10 +558,9 @@ async def run_plan(
         run_id: Optional run ID
         use_mock: Use mock workers
         resume: Resume existing run
-        use_sdk: Use Claude Agent SDK
 
     Returns:
         SchedulerResult
     """
-    scheduler = Scheduler(plan, run_id, use_mock, resume, use_sdk)
+    scheduler = Scheduler(plan, run_id, use_mock, resume)
     return await scheduler.run()

@@ -4,6 +4,8 @@ import logging
 import subprocess
 from pathlib import Path
 
+from swarm.db import get_worktrees_dir
+
 logger = logging.getLogger("swarm.git")
 
 
@@ -69,7 +71,7 @@ def create_worktree(
         Path to the created or existing worktree
     """
     repo = repo_path or Path.cwd()
-    worktree_path = repo / ".swarm" / "runs" / run_id / "worktrees" / agent_name
+    worktree_path = get_worktrees_dir(run_id, repo) / agent_name
     branch_name = f"swarm/{run_id}/{agent_name}"
 
     # Check if worktree already exists (resume case)
@@ -308,10 +310,11 @@ def cleanup_run_worktrees(run_id: str, repo_path: Path | None = None) -> None:
     """Clean up all worktrees and branches for a run."""
     repo = repo_path or Path.cwd()
     worktrees = list_worktrees(repo)
+    expected_prefix = str(get_worktrees_dir(run_id, repo))
 
     # Remove worktrees
     for wt in worktrees:
-        if f".swarm/runs/{run_id}/worktrees" in wt.get("path", ""):
+        if expected_prefix in wt.get("path", ""):
             remove_worktree(Path(wt["path"]), repo)
 
     # Delete branches

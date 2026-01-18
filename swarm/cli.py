@@ -1,14 +1,34 @@
 """CLI for claude-swarm."""
 
 import asyncio
+import json
 import logging
+import shutil
+import time
 from pathlib import Path
 
 import click
+import yaml
 
+from swarm.db import (
+    get_agents,
+    get_db,
+    get_db_path,
+    get_plan,
+    get_run_dir,
+    get_total_cost,
+    list_runs,
+    open_db,
+    run_exists,
+    update_agent_status,
+    update_plan_status,
+)
+from swarm.deps import DependencyGraph
+from swarm.git import merge_branch_to_current
 from swarm.logs import list_logs, read_all_logs, read_log, setup_logging, tail_log
-from swarm.models import Defaults
-from swarm.parser import create_inline_plan, parse_plan_file, validate_plan
+from swarm.models import AgentSpec, Defaults, PlanSpec
+from swarm.parser import create_inline_plan, generate_run_id, parse_plan_file, validate_plan
+from swarm.roles import BUILTIN_ROLES, get_role
 from swarm.scheduler import run_plan
 
 logger = logging.getLogger("swarm.cli")
@@ -29,7 +49,6 @@ def main() -> None:
 @click.option("--run-id", "run_id", default=None, help="Explicit run ID")
 @click.option("--resume", is_flag=True, help="Resume existing run")
 @click.option("--mock", is_flag=True, help="Use mock workers (for testing)")
-@click.option("--sdk", is_flag=True, help="Use Claude Agent SDK (recommended)")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose output")
 def run(
     plan_file: str | None,
@@ -39,12 +58,9 @@ def run(
     run_id: str | None,
     resume: bool,
     mock: bool,
-    sdk: bool,
     verbose: bool,
 ) -> None:
     """Run a swarm plan."""
-    from swarm.db import run_exists
-
     # Resume requires run_id
     if resume and not run_id:
         raise click.UsageError("--resume requires --run-id")
@@ -59,14 +75,10 @@ def run(
             plan = create_inline_plan(list(prompt), sequential=sequential, defaults=defaults)
         else:
             # Load plan from DB
-            from swarm.db import get_plan, open_db
-            import yaml
-            db = open_db(run_id)
-            plan_row = get_plan(db, run_id)
-            db.close()
+            with get_db(run_id) as db:
+                plan_row = get_plan(db, run_id)
             if not plan_row:
                 raise click.UsageError(f"Plan not found for run: {run_id}")
-            from swarm.models import PlanSpec
             plan = PlanSpec(**yaml.safe_load(plan_row["spec"]))
     elif plan_file:
         plan = parse_plan_file(Path(plan_file))
@@ -85,7 +97,6 @@ def run(
             raise click.Abort()
 
     # Set up logging
-    from swarm.parser import generate_run_id
     actual_run_id = run_id or generate_run_id(plan.name)
     setup_logging(actual_run_id, verbose)
 
@@ -96,7 +107,7 @@ def run(
     click.echo(f"Agents: {[a.name for a in plan.agents]}")
 
     # Run
-    result = asyncio.run(run_plan(plan, actual_run_id, use_mock=mock, resume=resume, use_sdk=sdk))
+    result = asyncio.run(run_plan(plan, actual_run_id, use_mock=mock, resume=resume))
 
     # Output result
     click.echo(f"\nRun completed: {result.run_id}")
@@ -111,9 +122,6 @@ def run(
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON")
 def status(run_id: str | None, as_json: bool) -> None:
     """Show status of a run. If no run_id, shows latest."""
-    import json
-    from swarm.db import get_agents, get_plan, get_total_cost, list_runs, open_db
-
     # Get latest run if not specified
     if not run_id:
         runs = list_runs()
@@ -123,53 +131,50 @@ def status(run_id: str | None, as_json: bool) -> None:
         run_id = runs[0]
 
     try:
-        db = open_db(run_id)
+        with get_db(run_id) as db:
+            plan = get_plan(db, run_id)
+            if not plan:
+                click.echo(f"Plan not found for run: {run_id}", err=True)
+                raise click.Abort()
+
+            agents = get_agents(db, run_id)
+            total_cost = get_total_cost(db, run_id)
+
+            if as_json:
+                output = {
+                    "run_id": run_id,
+                    "plan": plan["name"],
+                    "status": plan["status"],
+                    "total_cost": total_cost,
+                    "agents": [
+                        {
+                            "name": a["name"],
+                            "status": a["status"],
+                            "type": a["type"],
+                            "iteration": a["iteration"],
+                            "max_iterations": a["max_iterations"],
+                            "cost": a["cost_usd"],
+                            "error": a["error"],
+                        }
+                        for a in agents
+                    ],
+                }
+                click.echo(json.dumps(output, indent=2))
+            else:
+                click.echo(f"Run: {run_id}")
+                click.echo(f"Plan: {plan['name']}")
+                click.echo(f"Status: {plan['status']}")
+                click.echo(f"Cost: ${total_cost:.4f}")
+                click.echo("\nAgents:")
+
+                for agent in agents:
+                    status_str = agent["status"]
+                    if agent["error"]:
+                        status_str += f" ({agent['error'][:50]})"
+                    click.echo(f"  {agent['name']}: {status_str}")
     except FileNotFoundError:
         click.echo(f"Run not found: {run_id}", err=True)
         raise click.Abort()
-
-    plan = get_plan(db, run_id)
-    if not plan:
-        click.echo(f"Plan not found for run: {run_id}", err=True)
-        raise click.Abort()
-
-    agents = get_agents(db, run_id)
-    total_cost = get_total_cost(db, run_id)
-
-    if as_json:
-        output = {
-            "run_id": run_id,
-            "plan": plan["name"],
-            "status": plan["status"],
-            "total_cost": total_cost,
-            "agents": [
-                {
-                    "name": a["name"],
-                    "status": a["status"],
-                    "type": a["type"],
-                    "iteration": a["iteration"],
-                    "max_iterations": a["max_iterations"],
-                    "cost": a["cost_usd"],
-                    "error": a["error"],
-                }
-                for a in agents
-            ],
-        }
-        click.echo(json.dumps(output, indent=2))
-    else:
-        click.echo(f"Run: {run_id}")
-        click.echo(f"Plan: {plan['name']}")
-        click.echo(f"Status: {plan['status']}")
-        click.echo(f"Cost: ${total_cost:.4f}")
-        click.echo(f"\nAgents:")
-
-        for agent in agents:
-            status_str = agent["status"]
-            if agent["error"]:
-                status_str += f" ({agent['error'][:50]})"
-            click.echo(f"  {agent['name']}: {status_str}")
-
-    db.close()
 
 
 @main.command()
@@ -210,29 +215,24 @@ def logs(
 @click.argument("run_id")
 def cancel(run_id: str) -> None:
     """Cancel a running swarm."""
-    from swarm.db import get_agents, open_db, update_agent_status, update_plan_status
-
     try:
-        db = open_db(run_id)
+        with get_db(run_id) as db:
+            # Update plan status
+            update_plan_status(db, run_id, "cancelled")
+
+            # Cancel running agents
+            agents = get_agents(db, run_id)
+            cancelled = 0
+            for agent in agents:
+                if agent["status"] == "running":
+                    update_agent_status(db, run_id, agent["name"], "cancelled")
+                    cancelled += 1
+
+            click.echo(f"Cancelled run {run_id}")
+            click.echo(f"Agents cancelled: {cancelled}")
     except FileNotFoundError:
         click.echo(f"Run not found: {run_id}", err=True)
         raise click.Abort()
-
-    # Update plan status
-    update_plan_status(db, run_id, "cancelled")
-
-    # Cancel running agents
-    agents = get_agents(db, run_id)
-    cancelled = 0
-    for agent in agents:
-        if agent["status"] == "running":
-            update_agent_status(db, run_id, agent["name"], "cancelled")
-            cancelled += 1
-
-    click.echo(f"Cancelled run {run_id}")
-    click.echo(f"Agents cancelled: {cancelled}")
-
-    db.close()
 
 
 @main.command()
@@ -240,75 +240,59 @@ def cancel(run_id: str) -> None:
 @click.option("--dry-run", is_flag=True, help="Show what would be merged")
 def merge(run_id: str, dry_run: bool) -> None:
     """Merge completed agent branches."""
-    import json
-
-    from swarm.db import get_agents, open_db
-    from swarm.deps import DependencyGraph
-    from swarm.git import merge_branch_to_current
-    from swarm.models import AgentSpec
-
     try:
-        db = open_db(run_id)
+        with get_db(run_id) as db:
+            agents = get_agents(db, run_id)
+
+            # Filter completed agents
+            completed = [a for a in agents if a["status"] == "completed"]
+            if not completed:
+                click.echo("No completed agents to merge")
+                return
+
+            # Build dependency graph for merge order
+            specs = [
+                AgentSpec(
+                    name=a["name"],
+                    prompt=a["prompt"],
+                    depends_on=json.loads(a["depends_on"]) if a["depends_on"] else [],
+                )
+                for a in completed
+            ]
+            graph = DependencyGraph(specs)
+
+            try:
+                merge_order = graph.topological_order()
+            except ValueError as e:
+                click.echo(f"Error: {e}", err=True)
+                raise click.Abort()
+
+            click.echo(f"Merge order: {merge_order}")
+
+            if dry_run:
+                click.echo("(dry run - no changes made)")
+                return
+
+            # Merge in order
+            for name in merge_order:
+                agent = next(a for a in completed if a["name"] == name)
+                branch = agent["branch"]
+                if branch:
+                    click.echo(f"Merging {name} ({branch})...")
+                    try:
+                        merge_branch_to_current(branch)
+                        click.echo("  Merged successfully")
+                    except Exception as e:
+                        click.echo(f"  Failed: {e}", err=True)
     except FileNotFoundError:
         click.echo(f"Run not found: {run_id}", err=True)
         raise click.Abort()
-
-    agents = get_agents(db, run_id)
-
-    # Filter completed agents
-    completed = [a for a in agents if a["status"] == "completed"]
-    if not completed:
-        click.echo("No completed agents to merge")
-        db.close()
-        return
-
-    # Build dependency graph for merge order
-    specs = [
-        AgentSpec(
-            name=a["name"],
-            prompt=a["prompt"],
-            depends_on=json.loads(a["depends_on"]) if a["depends_on"] else [],
-        )
-        for a in completed
-    ]
-    graph = DependencyGraph(specs)
-
-    try:
-        merge_order = graph.topological_order()
-    except ValueError as e:
-        click.echo(f"Error: {e}", err=True)
-        db.close()
-        raise click.Abort()
-
-    click.echo(f"Merge order: {merge_order}")
-
-    if dry_run:
-        click.echo("(dry run - no changes made)")
-        db.close()
-        return
-
-    # Merge in order
-    for name in merge_order:
-        agent = next(a for a in completed if a["name"] == name)
-        branch = agent["branch"]
-        if branch:
-            click.echo(f"Merging {name} ({branch})...")
-            try:
-                merge_branch_to_current(branch)
-                click.echo(f"  Merged successfully")
-            except Exception as e:
-                click.echo(f"  Failed: {e}", err=True)
-
-    db.close()
 
 
 @main.command()
 @click.argument("run_id")
 def dashboard(run_id: str) -> None:
     """Show live dashboard for a run."""
-    import time
-    from swarm.db import get_agents, get_plan, get_total_cost, open_db
-
     try:
         db = open_db(run_id)
     except FileNotFoundError:
@@ -364,34 +348,28 @@ def dashboard(run_id: str) -> None:
 
 @main.command()
 @click.argument("run_id")
-@click.option("--sdk", is_flag=True, help="Use Claude Agent SDK (recommended)")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose output")
-def resume(run_id: str, sdk: bool, verbose: bool) -> None:
+def resume(run_id: str, verbose: bool) -> None:
     """Resume a previous run (alias for run --resume --run-id)."""
-    from swarm.db import get_plan, open_db, run_exists
-    import yaml
-
     if not run_exists(run_id):
         click.echo(f"Run not found: {run_id}", err=True)
         raise click.Abort()
 
     # Load plan from DB
-    db = open_db(run_id)
-    plan_row = get_plan(db, run_id)
-    db.close()
+    with get_db(run_id) as db:
+        plan_row = get_plan(db, run_id)
 
     if not plan_row:
         click.echo(f"Plan not found for run: {run_id}", err=True)
         raise click.Abort()
 
-    from swarm.models import PlanSpec
     plan = PlanSpec(**yaml.safe_load(plan_row["spec"]))
 
     setup_logging(run_id, verbose)
     click.echo(f"Resuming run: {run_id}")
     click.echo(f"Agents: {[a.name for a in plan.agents]}")
 
-    result = asyncio.run(run_plan(plan, run_id, resume=True, use_sdk=sdk))
+    result = asyncio.run(run_plan(plan, run_id, resume=True))
 
     click.echo(f"\nRun completed: {result.run_id}")
     click.echo(f"Success: {result.success}")
@@ -405,22 +383,19 @@ def resume(run_id: str, sdk: bool, verbose: bool) -> None:
 @click.option("--all", "clean_all", is_flag=True, help="Clean all runs")
 def clean(run_id: str | None, clean_all: bool) -> None:
     """Clean up run artifacts (worktrees, db)."""
-    import shutil
-    from swarm.db import list_runs
-
     if clean_all:
         runs = list_runs()
         if not runs:
             click.echo("No runs found")
             return
         for rid in runs:
-            run_dir = Path(f".swarm/runs/{rid}")
+            run_dir = get_run_dir(rid)
             if run_dir.exists():
                 shutil.rmtree(run_dir)
                 click.echo(f"Cleaned: {rid}")
         click.echo(f"Cleaned {len(runs)} runs")
     elif run_id:
-        run_dir = Path(f".swarm/runs/{run_id}")
+        run_dir = get_run_dir(run_id)
         if run_dir.exists():
             shutil.rmtree(run_dir)
             click.echo(f"Cleaned: {run_id}")
@@ -435,8 +410,6 @@ def clean(run_id: str | None, clean_all: bool) -> None:
 @click.argument("query", required=False)
 def db(run_id: str | None, query: str | None) -> None:
     """Query the SQLite database."""
-    from swarm.db import list_runs, open_db
-
     if not run_id:
         # List runs
         runs = list_runs()
@@ -451,42 +424,37 @@ def db(run_id: str | None, query: str | None) -> None:
         return
 
     try:
-        conn = open_db(run_id)
-    except Exception:
+        with get_db(run_id) as conn:
+            if query:
+                # Execute query
+                try:
+                    cursor = conn.execute(query)
+                    rows = cursor.fetchall()
+                    if rows:
+                        # Print header
+                        cols = [desc[0] for desc in cursor.description]
+                        click.echo("\t".join(cols))
+                        click.echo("-" * 60)
+                        for row in rows:
+                            click.echo("\t".join(str(v) for v in row))
+                    else:
+                        click.echo("No results")
+                except Exception as e:
+                    click.echo(f"Query error: {e}", err=True)
+            else:
+                # Interactive mode hint
+                click.echo(f"Database: {get_db_path(run_id)}")
+                click.echo("Usage: swarm db <run_id> \"SELECT * FROM agents\"")
+                click.echo("\nTables: plans, agents, events, responses")
+    except FileNotFoundError:
         click.echo(f"Run not found: {run_id}", err=True)
         raise click.Abort()
-
-    if query:
-        # Execute query
-        try:
-            cursor = conn.execute(query)
-            rows = cursor.fetchall()
-            if rows:
-                # Print header
-                cols = [desc[0] for desc in cursor.description]
-                click.echo("\t".join(cols))
-                click.echo("-" * 60)
-                for row in rows:
-                    click.echo("\t".join(str(v) for v in row))
-            else:
-                click.echo("No results")
-        except Exception as e:
-            click.echo(f"Query error: {e}", err=True)
-    else:
-        # Interactive mode hint
-        click.echo(f"Database: .swarm/runs/{run_id}/swarm.db")
-        click.echo("Usage: swarm db <run_id> \"SELECT * FROM agents\"")
-        click.echo("\nTables: plans, agents, events, responses")
-
-    conn.close()
 
 
 @main.command()
 @click.argument("role_name", required=False)
 def roles(role_name: str | None) -> None:
     """List available roles or show role details."""
-    from swarm.roles import BUILTIN_ROLES, get_role
-
     if role_name:
         role = get_role(role_name)
         if not role:

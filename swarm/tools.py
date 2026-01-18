@@ -6,7 +6,6 @@ called directly from the executor.
 """
 
 import asyncio
-import json
 import logging
 import os
 import subprocess
@@ -16,12 +15,12 @@ from swarm.db import (
     consume_response,
     get_agent,
     get_agents,
+    get_db,
     get_pending_clarifications as db_get_pending_clarifications,
     get_response,
     insert_agent,
     insert_event,
     insert_response,
-    open_db,
     update_agent_status,
 )
 
@@ -37,6 +36,40 @@ def get_run_context() -> tuple[str, str]:
     return run_id, agent_name
 
 
+async def _poll_for_response(
+    run_id: str,
+    agent_name: str,
+    clarification_id: str,
+    timeout: int,
+    response_type: str,
+) -> dict | None:
+    """Poll for manager response to clarification/blocker.
+
+    Args:
+        run_id: Run identifier
+        agent_name: Agent name
+        clarification_id: ID of the clarification request
+        timeout: Max seconds to wait
+        response_type: "clarification" or "blocker" (for logging)
+
+    Returns:
+        Response dict if received, None if timeout
+    """
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        with get_db(run_id) as db:
+            response = get_response(db, run_id, clarification_id)
+            if response:
+                consume_response(db, response["id"])
+                update_agent_status(db, run_id, agent_name, "running")
+                logger.info(f"Agent {agent_name} received {response_type}: {response['response']}")
+                return response
+
+        await asyncio.sleep(2)
+
+    return None
+
+
 async def mark_complete(summary: str) -> dict:
     """Signal task completion. Runs check command automatically.
 
@@ -47,9 +80,8 @@ async def mark_complete(summary: str) -> dict:
         Tool result dict with success/failure message
     """
     run_id, agent_name = get_run_context()
-    db = open_db(run_id)
 
-    try:
+    with get_db(run_id) as db:
         # Get check command from DB
         agent = get_agent(db, run_id, agent_name)
         if not agent:
@@ -80,9 +112,6 @@ async def mark_complete(summary: str) -> dict:
             logger.warning(f"Check failed for {agent_name}: {output}")
             return {"content": [{"type": "text", "text": f"Check failed. Fix and retry.\n\nOutput:\n{output}"}]}
 
-    finally:
-        db.close()
-
 
 async def request_clarification(
     question: str,
@@ -100,11 +129,9 @@ async def request_clarification(
         Tool result dict with manager's response
     """
     run_id, agent_name = get_run_context()
-    db = open_db(run_id)
+    clarification_id = uuid4().hex
 
-    try:
-        clarification_id = uuid4().hex
-
+    with get_db(run_id) as db:
         # Emit clarification event
         insert_event(
             db,
@@ -122,26 +149,17 @@ async def request_clarification(
         update_agent_status(db, run_id, agent_name, "blocked")
         logger.info(f"Agent {agent_name} blocked on clarification: {question}")
 
-        # Poll for response
-        deadline = asyncio.get_event_loop().time() + timeout
-        while asyncio.get_event_loop().time() < deadline:
-            response = get_response(db, run_id, clarification_id)
-            if response:
-                consume_response(db, response["id"])
-                update_agent_status(db, run_id, agent_name, "running")
-                logger.info(f"Agent {agent_name} received response: {response['response']}")
-                return {"content": [{"type": "text", "text": f"Manager response: {response['response']}"}]}
+    # Poll for response
+    response = await _poll_for_response(run_id, agent_name, clarification_id, timeout, "response")
+    if response:
+        return {"content": [{"type": "text", "text": f"Manager response: {response['response']}"}]}
 
-            await asyncio.sleep(2)
-
-        # Timeout
+    # Timeout
+    with get_db(run_id) as db:
         update_agent_status(db, run_id, agent_name, "timeout", "Clarification timeout")
         insert_event(db, run_id, agent_name, "error", {"error": "Clarification timeout", "question": question})
-        logger.error(f"Agent {agent_name} timed out waiting for clarification")
-        return {"content": [{"type": "text", "text": "ERROR: Clarification timeout. No response from manager."}]}
-
-    finally:
-        db.close()
+    logger.error(f"Agent {agent_name} timed out waiting for clarification")
+    return {"content": [{"type": "text", "text": "ERROR: Clarification timeout. No response from manager."}]}
 
 
 async def report_progress(status: str, milestone: str | None = None) -> dict:
@@ -155,9 +173,8 @@ async def report_progress(status: str, milestone: str | None = None) -> dict:
         Tool result dict
     """
     run_id, agent_name = get_run_context()
-    db = open_db(run_id)
 
-    try:
+    with get_db(run_id) as db:
         data = {"status": status}
         if milestone:
             data["milestone"] = milestone
@@ -165,9 +182,6 @@ async def report_progress(status: str, milestone: str | None = None) -> dict:
         insert_event(db, run_id, agent_name, "progress", data)
         logger.info(f"Agent {agent_name} progress: {status}" + (f" (milestone: {milestone})" if milestone else ""))
         return {"content": [{"type": "text", "text": "Progress recorded."}]}
-
-    finally:
-        db.close()
 
 
 async def report_blocker(issue: str, timeout: int = 300) -> dict:
@@ -181,11 +195,9 @@ async def report_blocker(issue: str, timeout: int = 300) -> dict:
         Tool result dict with manager's guidance
     """
     run_id, agent_name = get_run_context()
-    db = open_db(run_id)
+    clarification_id = uuid4().hex
 
-    try:
-        clarification_id = uuid4().hex
-
+    with get_db(run_id) as db:
         # Emit blocker event
         insert_event(
             db,
@@ -203,26 +215,17 @@ async def report_blocker(issue: str, timeout: int = 300) -> dict:
         update_agent_status(db, run_id, agent_name, "blocked")
         logger.info(f"Agent {agent_name} blocked on issue: {issue}")
 
-        # Poll for response (same as request_clarification)
-        deadline = asyncio.get_event_loop().time() + timeout
-        while asyncio.get_event_loop().time() < deadline:
-            response = get_response(db, run_id, clarification_id)
-            if response:
-                consume_response(db, response["id"])
-                update_agent_status(db, run_id, agent_name, "running")
-                logger.info(f"Agent {agent_name} received guidance: {response['response']}")
-                return {"content": [{"type": "text", "text": f"Manager guidance: {response['response']}"}]}
+    # Poll for response
+    response = await _poll_for_response(run_id, agent_name, clarification_id, timeout, "guidance")
+    if response:
+        return {"content": [{"type": "text", "text": f"Manager guidance: {response['response']}"}]}
 
-            await asyncio.sleep(2)
-
-        # Timeout
+    # Timeout
+    with get_db(run_id) as db:
         update_agent_status(db, run_id, agent_name, "timeout", "Blocker timeout")
         insert_event(db, run_id, agent_name, "error", {"error": "Blocker timeout", "issue": issue})
-        logger.error(f"Agent {agent_name} timed out waiting for blocker resolution")
-        return {"content": [{"type": "text", "text": "ERROR: Blocker timeout. No response from manager."}]}
-
-    finally:
-        db.close()
+    logger.error(f"Agent {agent_name} timed out waiting for blocker resolution")
+    return {"content": [{"type": "text", "text": "ERROR: Blocker timeout. No response from manager."}]}
 
 
 # =============================================================================
@@ -248,9 +251,8 @@ async def spawn_worker(
         Tool result dict
     """
     run_id, manager_name = get_run_context()
-    db = open_db(run_id)
 
-    try:
+    with get_db(run_id) as db:
         # Create hierarchical name
         worker_name = f"{manager_name}.{name}"
 
@@ -283,9 +285,6 @@ async def spawn_worker(
         logger.info(f"Manager {manager_name} spawned worker {worker_name}")
         return {"content": [{"type": "text", "text": f"Spawned worker: {worker_name}"}]}
 
-    finally:
-        db.close()
-
 
 async def respond_to_clarification(clarification_id: str, response: str) -> dict:
     """Respond to a worker's clarification request.
@@ -298,15 +297,11 @@ async def respond_to_clarification(clarification_id: str, response: str) -> dict
         Tool result dict
     """
     run_id, manager_name = get_run_context()
-    db = open_db(run_id)
 
-    try:
+    with get_db(run_id) as db:
         insert_response(db, run_id, clarification_id, response)
         logger.info(f"Manager {manager_name} responded to clarification {clarification_id[:8]}")
         return {"content": [{"type": "text", "text": f"Response sent to clarification {clarification_id[:8]}"}]}
-
-    finally:
-        db.close()
 
 
 async def cancel_worker(name: str) -> dict:
@@ -319,9 +314,8 @@ async def cancel_worker(name: str) -> dict:
         Tool result dict
     """
     run_id, manager_name = get_run_context()
-    db = open_db(run_id)
 
-    try:
+    with get_db(run_id) as db:
         # Try hierarchical name first
         worker_name = name if "." in name else f"{manager_name}.{name}"
         agent = get_agent(db, run_id, worker_name)
@@ -346,9 +340,6 @@ async def cancel_worker(name: str) -> dict:
         logger.info(f"Manager {manager_name} cancelled worker {worker_name}")
         return {"content": [{"type": "text", "text": f"Cancelled worker: {worker_name}"}]}
 
-    finally:
-        db.close()
-
 
 async def get_worker_status(name: str | None = None) -> dict:
     """Get status of workers.
@@ -360,9 +351,8 @@ async def get_worker_status(name: str | None = None) -> dict:
         Tool result dict with worker status
     """
     run_id, manager_name = get_run_context()
-    db = open_db(run_id)
 
-    try:
+    with get_db(run_id) as db:
         if name:
             # Get specific worker
             worker_name = name if "." in name else f"{manager_name}.{name}"
@@ -395,9 +385,6 @@ async def get_worker_status(name: str | None = None) -> dict:
 
             return {"content": [{"type": "text", "text": "\n".join(lines)}]}
 
-    finally:
-        db.close()
-
 
 async def get_pending_clarifications() -> dict:
     """Get all pending clarifications from workers.
@@ -406,9 +393,8 @@ async def get_pending_clarifications() -> dict:
         Tool result dict with list of pending clarifications
     """
     run_id, manager_name = get_run_context()
-    db = open_db(run_id)
 
-    try:
+    with get_db(run_id) as db:
         clarifications = db_get_pending_clarifications(db, run_id)
 
         # Filter to workers under this manager
@@ -427,9 +413,6 @@ async def get_pending_clarifications() -> dict:
 
         return {"content": [{"type": "text", "text": "\n".join(lines)}]}
 
-    finally:
-        db.close()
-
 
 async def mark_plan_complete(summary: str) -> dict:
     """Signal that the manager's plan is complete.
@@ -441,9 +424,8 @@ async def mark_plan_complete(summary: str) -> dict:
         Tool result dict
     """
     run_id, manager_name = get_run_context()
-    db = open_db(run_id)
 
-    try:
+    with get_db(run_id) as db:
         # Check if all workers are done
         all_agents = get_agents(db, run_id)
         workers = [a for a in all_agents if a["parent"] == manager_name]
@@ -466,9 +448,6 @@ async def mark_plan_complete(summary: str) -> dict:
 
         logger.info(f"Manager {manager_name} completed: {summary}")
         return {"content": [{"type": "text", "text": result}]}
-
-    finally:
-        db.close()
 
 
 # Tool definitions for SDK integration

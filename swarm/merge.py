@@ -1,17 +1,18 @@
 """Branch merging utilities for claude-swarm."""
 
 import asyncio
+import concurrent.futures
+import json
 import logging
 import subprocess
 from pathlib import Path
 from typing import Literal
 
-import json
-
-from swarm.db import get_agents, get_plan, insert_agent, open_db, update_agent_status
+from swarm.db import get_agents, get_db, insert_agent, update_agent_status
 from swarm.deps import DependencyGraph
+from swarm.executor import AgentConfig
 from swarm.git import merge_branch_to_current, remove_worktree
-from swarm.models import AgentSpec, MergeConfig
+from swarm.models import AgentSpec
 
 logger = logging.getLogger("swarm.merge")
 
@@ -25,9 +26,8 @@ def get_merge_order(run_id: str) -> list[str]:
     Returns:
         List of agent names in merge order
     """
-    db = open_db(run_id)
-    agents = get_agents(db, run_id)
-    db.close()
+    with get_db(run_id) as db:
+        agents = get_agents(db, run_id)
 
     # Build specs for completed agents
     completed = [a for a in agents if a["status"] == "completed"]
@@ -71,10 +71,6 @@ def spawn_resolver(
         logger.warning("spawn_resolver called with empty conflict_files list")
         return False
 
-    from swarm.executor import AgentConfig
-
-    db = open_db(run_id)
-
     # Use full branch path to avoid name collisions
     resolver_name = f"resolver-{branch.replace('/', '-')}"
     conflict_list = "\n".join(f"- {f}" for f in conflict_files)
@@ -89,21 +85,21 @@ After resolving, stage the files with git add.
 Do NOT run git merge --continue - that will be handled automatically."""
 
     # Insert resolver agent
-    insert_agent(
-        db,
-        run_id,
-        resolver_name,
-        prompt,
-        agent_type="worker",
-        model="sonnet",
-        max_iterations=10,
-        max_cost_usd=max_cost,
-    )
-    db.close()
+    with get_db(run_id) as db:
+        insert_agent(
+            db,
+            run_id,
+            resolver_name,
+            prompt,
+            agent_type="worker",
+            model="sonnet",
+            max_iterations=10,
+            max_cost_usd=max_cost,
+        )
 
-    # Run the resolver using SDK if available, otherwise mock
+    # Run the resolver
     try:
-        from swarm.executor_sdk import run_worker_sdk
+        from swarm.executor import run_worker
 
         config = AgentConfig(
             name=resolver_name,
@@ -116,13 +112,12 @@ Do NOT run git merge --continue - that will be handled automatically."""
         )
 
         async def run_with_timeout():
-            return await asyncio.wait_for(run_worker_sdk(config), timeout=timeout)
+            return await asyncio.wait_for(run_worker(config), timeout=timeout)
 
         # Handle case where event loop may already be running
         try:
-            loop = asyncio.get_running_loop()
-            # Already in async context - create task
-            import concurrent.futures
+            asyncio.get_running_loop()
+            # Already in async context - use thread pool
             with concurrent.futures.ThreadPoolExecutor() as pool:
                 result = pool.submit(asyncio.run, run_with_timeout()).result()
         except RuntimeError:
@@ -151,17 +146,15 @@ Do NOT run git merge --continue - that will be handled automatically."""
         return False
     except asyncio.TimeoutError:
         logger.error(f"Resolver {resolver_name} timed out after {timeout}s")
-        db = open_db(run_id)
-        update_agent_status(db, run_id, resolver_name, "failed", "timeout")
-        db.close()
+        with get_db(run_id) as db:
+            update_agent_status(db, run_id, resolver_name, "failed", "timeout")
         return False
     except Exception as e:
         logger.error(f"Resolver {resolver_name} error: {e}")
         # Update agent status on failure
         try:
-            db = open_db(run_id)
-            update_agent_status(db, run_id, resolver_name, "failed", str(e)[:100])
-            db.close()
+            with get_db(run_id) as db:
+                update_agent_status(db, run_id, resolver_name, "failed", str(e)[:100])
         except Exception as db_err:
             logger.warning(f"Failed to update resolver status in DB: {db_err}")
         return False
@@ -198,8 +191,8 @@ def merge_run(
     Returns:
         Dict with merge results
     """
-    db = open_db(run_id)
-    agents = get_agents(db, run_id)
+    with get_db(run_id) as db:
+        agents = get_agents(db, run_id)
 
     results = {
         "merged": [],
@@ -290,7 +283,6 @@ def merge_run(
                 results["failed"].append({"name": name, "error": str(e)})
                 logger.error(f"Failed to merge {name}: {e}")
 
-    db.close()
     return results
 
 
@@ -303,9 +295,8 @@ def check_conflicts(run_id: str) -> list[dict]:
     Returns:
         List of conflict info dicts
     """
-    db = open_db(run_id)
-    agents = get_agents(db, run_id)
-    db.close()
+    with get_db(run_id) as db:
+        agents = get_agents(db, run_id)
 
     completed = [a for a in agents if a["status"] == "completed" and a["branch"]]
     conflicts = []
@@ -359,9 +350,8 @@ def interactive_merge(run_id: str) -> None:
         run_id: Run identifier
     """
     order = get_merge_order(run_id)
-    db = open_db(run_id)
-    agents = get_agents(db, run_id)
-    db.close()
+    with get_db(run_id) as db:
+        agents = get_agents(db, run_id)
 
     agent_map = {a["name"]: a for a in agents}
 
@@ -376,9 +366,9 @@ def interactive_merge(run_id: str) -> None:
         try:
             if not merge_branch_to_current(branch):
                 raise subprocess.CalledProcessError(1, f"git merge {branch}")
-            print(f"  ✓ Merged successfully")
-        except subprocess.CalledProcessError as e:
-            print(f"  ✗ Conflict detected")
-            print(f"    Resolve conflicts and run: git merge --continue")
-            print(f"    Or abort: git merge --abort")
+            print("  ✓ Merged successfully")
+        except subprocess.CalledProcessError:
+            print("  ✗ Conflict detected")
+            print("    Resolve conflicts and run: git merge --continue")
+            print("    Or abort: git merge --abort")
             break

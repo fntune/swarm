@@ -34,7 +34,7 @@ swarm clean [run_id] [--all]              # Clean up artifacts
 swarm db [run_id] [query]                 # Query SQLite database
 swarm roles [name]                        # List/view available roles
 
-# Testing without Claude CLI
+# Testing without Claude SDK
 swarm run -p "test: true" --mock
 ```
 
@@ -45,12 +45,12 @@ swarm/                    # Python package
 ├── cli.py               # Click CLI entrypoint (10 commands)
 ├── models.py            # Pydantic: AgentSpec, PlanSpec, Defaults
 ├── parser.py            # YAML parsing, inline plan creation
-├── db.py                # SQLite setup, queries (WAL mode)
+├── db.py                # SQLite setup, queries, path helpers (WAL mode)
 ├── deps.py              # Dependency graph, topological sort
 ├── scheduler.py         # Parallel execution, circuit breaker, stuck detection
-├── executor.py          # Agent worker (subprocess or mock)
+├── executor.py          # Agent execution (SDK + MCP tools)
 ├── git.py               # Worktree creation, branch merging
-├── merge.py             # Branch consolidation CLI helper
+├── merge.py             # Branch consolidation, conflict resolution
 ├── logs.py              # Log file management
 ├── roles.py             # Built-in role templates (7 roles)
 └── tools.py             # Worker + Manager coordination tools
@@ -122,3 +122,27 @@ agents:
 - Follow global CLAUDE.md conventions
 - SQLite WAL mode for concurrent agent access
 - Logs stay as files (for tail -f compatibility)
+
+## Code Patterns
+
+### Database Access
+Use `get_db()` context manager for all DB operations:
+```python
+from swarm.db import get_db, get_agents
+
+with get_db(run_id) as db:
+    agents = get_agents(db, run_id)
+```
+
+### Path Helpers
+Use centralized path helpers from `db.py`:
+- `get_run_dir(run_id)` - Base run directory
+- `get_db_path(run_id)` - SQLite database path
+- `get_logs_dir(run_id)` - Logs directory
+- `get_worktrees_dir(run_id)` - Git worktrees directory
+- `ensure_log_file(run_id, agent_name)` - Create/get agent log path
+
+### Coordination Tools
+Tool implementations live in `tools.py`, wrapped as SDK MCP tools in `executor.py`:
+- Worker tools: `mark_complete`, `request_clarification`, `report_progress`, `report_blocker`
+- Manager tools: `spawn_worker`, `respond_to_clarification`, `cancel_worker`, etc.

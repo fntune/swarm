@@ -1,25 +1,31 @@
 """Agent execution for claude-swarm.
 
-This module handles running worker and manager agents. Since the Claude Agent SDK
-may not be available, we provide a subprocess-based implementation that runs
-the `claude` CLI command.
+Uses the Claude Agent SDK for native execution with MCP tools
+for coordination between agents.
 """
 
 import asyncio
-import json
 import logging
 import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import AsyncIterator
 
+from claude_agent_sdk import (
+    AssistantMessage,
+    ClaudeAgentOptions,
+    ClaudeSDKClient,
+    ResultMessage,
+    TextBlock,
+    create_sdk_mcp_server,
+    tool,
+)
+
+from swarm import tools as tool_impl
 from swarm.db import (
+    ensure_log_file,
     get_agent,
-    get_pending_clarifications,
-    get_recent_events,
     insert_event,
-    insert_response,
     open_db,
     update_agent_cost,
     update_agent_iteration,
@@ -52,6 +58,19 @@ class AgentConfig:
         return self.name
 
 
+def build_agent_env(config: AgentConfig) -> dict[str, str]:
+    """Build environment variables for an agent."""
+    env = {
+        "SWARM_RUN_ID": config.run_id,
+        "SWARM_AGENT_NAME": config.name,
+        "SWARM_PARENT_AGENT": config.parent or "",
+        "SWARM_TREE_PATH": config.tree_path(),
+    }
+    if config.env:
+        env.update(config.env)
+    return env
+
+
 def build_system_prompt(config: AgentConfig) -> str:
     """Build system prompt for worker agent."""
     return f"""You are an autonomous coding agent working on a specific task.
@@ -74,109 +93,151 @@ Important:
 """
 
 
-async def run_worker_subprocess(config: AgentConfig) -> dict:
-    """Run a worker agent via subprocess.
+def create_worker_tools(run_id: str, agent_name: str):
+    """Create worker coordination tools as SDK MCP tools."""
+    os.environ["SWARM_RUN_ID"] = run_id
+    os.environ["SWARM_AGENT_NAME"] = agent_name
 
-    This is a fallback implementation that runs the `claude` CLI.
-    In production, this would use the Claude Agent SDK.
+    @tool("mark_complete", "Signal task completion. Runs check command automatically.", {"summary": str})
+    async def mark_complete(args: dict) -> dict:
+        return await tool_impl.mark_complete(args["summary"])
 
-    Args:
-        config: Agent configuration
+    @tool("request_clarification", "Ask manager for guidance. BLOCKS until response.",
+          {"question": str, "escalate_to": str})
+    async def request_clarification(args: dict) -> dict:
+        return await tool_impl.request_clarification(
+            args["question"],
+            args.get("escalate_to", "auto"),
+        )
 
-    Returns:
-        Result dict with success status and details
-    """
+    @tool("report_progress", "Report progress update.", {"status": str, "milestone": str})
+    async def report_progress(args: dict) -> dict:
+        return await tool_impl.report_progress(args["status"], args.get("milestone"))
+
+    @tool("report_blocker", "Report blocking issue. BLOCKS until resolved.", {"issue": str})
+    async def report_blocker(args: dict) -> dict:
+        return await tool_impl.report_blocker(args["issue"])
+
+    return [mark_complete, request_clarification, report_progress, report_blocker]
+
+
+def create_manager_tools(run_id: str, manager_name: str):
+    """Create manager coordination tools as SDK MCP tools."""
+    os.environ["SWARM_RUN_ID"] = run_id
+    os.environ["SWARM_AGENT_NAME"] = manager_name
+
+    @tool("spawn_worker", "Spawn a new worker agent.", {"name": str, "prompt": str, "check": str, "model": str})
+    async def spawn_worker(args: dict) -> dict:
+        return await tool_impl.spawn_worker(
+            args["name"],
+            args["prompt"],
+            args.get("check"),
+            args.get("model", "sonnet"),
+        )
+
+    @tool("respond_to_clarification", "Respond to worker's clarification.", {"clarification_id": str, "response": str})
+    async def respond_to_clarification(args: dict) -> dict:
+        return await tool_impl.respond_to_clarification(
+            args["clarification_id"],
+            args["response"],
+        )
+
+    @tool("cancel_worker", "Cancel a worker agent.", {"name": str})
+    async def cancel_worker(args: dict) -> dict:
+        return await tool_impl.cancel_worker(args["name"])
+
+    @tool("get_worker_status", "Get status of workers.", {"name": str})
+    async def get_worker_status(args: dict) -> dict:
+        return await tool_impl.get_worker_status(args.get("name"))
+
+    @tool("get_pending_clarifications", "Get pending clarifications from workers.", {})
+    async def get_pending_clarifications(args: dict) -> dict:
+        return await tool_impl.get_pending_clarifications()
+
+    @tool("mark_plan_complete", "Signal plan completion.", {"summary": str})
+    async def mark_plan_complete(args: dict) -> dict:
+        return await tool_impl.mark_plan_complete(args["summary"])
+
+    return [spawn_worker, respond_to_clarification, cancel_worker, get_worker_status, get_pending_clarifications, mark_plan_complete]
+
+
+async def run_worker(config: AgentConfig) -> dict:
+    """Run a worker agent using the Claude Agent SDK."""
     db = open_db(config.run_id)
 
     try:
-        # Set up environment
-        env = os.environ.copy()
-        env.update({
-            "SWARM_RUN_ID": config.run_id,
-            "SWARM_AGENT_NAME": config.name,
-            "SWARM_PARENT_AGENT": config.parent or "",
-            "SWARM_TREE_PATH": config.tree_path(),
-        })
-        if config.env:
-            env.update(config.env)
+        agent_env = build_agent_env(config)
+        os.environ.update(agent_env)
 
-        # Update status to running
         update_agent_status(db, config.run_id, config.name, "running")
         insert_event(db, config.run_id, config.name, "started", {"prompt": config.prompt[:200]})
 
-        # Build the prompt
-        system_prompt = build_system_prompt(config)
-        full_prompt = f"{system_prompt}\n\nNow execute the task."
+        worker_tools = create_worker_tools(config.run_id, config.name)
+        server = create_sdk_mcp_server("swarm", "1.0.0", worker_tools)
 
-        # Run claude CLI
-        # Note: In production, this would use the SDK's query() function
-        cmd = [
-            "claude",
-            "--print",
-            "--dangerously-skip-permissions",
-            "--model", config.model,
-            "-p", full_prompt,
-        ]
-
-        logger.info(f"Starting worker {config.name} in {config.worktree}")
-
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
+        options = ClaudeAgentOptions(
             cwd=str(config.worktree),
-            env=env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            env=agent_env,
+            mcp_servers={"swarm": server},
+            allowed_tools=[
+                "Read", "Write", "Edit", "Bash", "Glob", "Grep",
+                "mcp__swarm__mark_complete",
+                "mcp__swarm__request_clarification",
+                "mcp__swarm__report_progress",
+                "mcp__swarm__report_blocker",
+            ],
+            model=config.model,
+            max_turns=config.max_iterations,
+            permission_mode="bypassPermissions",
+            system_prompt=build_system_prompt(config),
         )
 
-        stdout, stderr = await process.communicate()
+        logger.info(f"Starting worker {config.name} in {config.worktree}")
+        log_path = ensure_log_file(config.run_id, config.name)
 
-        # Log output
-        log_path = Path(f".swarm/runs/{config.run_id}/logs/{config.name}.log")
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(log_path, "a") as f:
-            f.write(stdout.decode())
-            if stderr:
-                f.write(f"\nSTDERR:\n{stderr.decode()}")
+        session_id = None
+        total_cost = 0.0
+        iteration = 0
 
-        # Check result
-        # Note: Subprocess mode cannot track actual cost - CLI doesn't output cost data
-        # Use --sdk flag for accurate cost tracking
-        update_agent_cost(db, config.run_id, config.name, 0.0)
+        async with ClaudeSDKClient(options=options) as client:
+            await client.query(f"Execute the task now. When done, call mark_complete with a summary.\n\nTask: {config.prompt}")
 
-        if process.returncode == 0:
-            # Run check command
-            check_result = subprocess.run(
-                config.check_command,
-                shell=True,
-                cwd=str(config.worktree),
-                capture_output=True,
-                text=True,
-            )
+            async for message in client.receive_response():
+                if isinstance(message, AssistantMessage):
+                    iteration += 1
+                    update_agent_iteration(db, config.run_id, config.name, iteration)
 
-            if check_result.returncode == 0:
-                update_agent_status(db, config.run_id, config.name, "completed")
-                insert_event(db, config.run_id, config.name, "done", {"summary": "Task completed"})
-                return {"success": True, "status": "completed", "cost": 0.0}
-            else:
-                update_agent_status(
-                    db,
-                    config.run_id,
-                    config.name,
-                    "failed",
-                    f"Check failed: {check_result.stderr}",
-                )
-                insert_event(db, config.run_id, config.name, "error", {"error": "Check failed"})
-                return {"success": False, "status": "failed", "error": "Check failed", "cost": 0.0}
+                    with open(log_path, "a") as f:
+                        for block in message.content or []:
+                            if isinstance(block, TextBlock):
+                                f.write(block.text + "\n")
+
+                if isinstance(message, ResultMessage):
+                    session_id = message.session_id
+                    total_cost = message.total_cost_usd
+                    break
+
+        update_agent_cost(db, config.run_id, config.name, total_cost)
+
+        if total_cost > config.max_cost_usd:
+            logger.warning(f"Worker {config.name} exceeded cost budget (${total_cost:.4f} > ${config.max_cost_usd:.2f})")
+            update_agent_status(db, config.run_id, config.name, "failed", f"Cost exceeded: ${total_cost:.4f}")
+            insert_event(db, config.run_id, config.name, "error", {"error": "cost_exceeded", "cost": total_cost, "budget": config.max_cost_usd})
+            return {"success": False, "status": "failed", "cost": total_cost, "error": "cost_exceeded"}
+
+        agent = get_agent(db, config.run_id, config.name)
+        final_status = agent["status"] if agent else "unknown"
+
+        if final_status == "completed":
+            logger.info(f"Worker {config.name} completed (cost: ${total_cost:.4f})")
+            return {"success": True, "status": "completed", "cost": total_cost, "session_id": session_id}
+        elif final_status in ("failed", "timeout", "cancelled"):
+            logger.warning(f"Worker {config.name} ended with status: {final_status}")
+            return {"success": False, "status": final_status, "cost": total_cost}
         else:
-            update_agent_status(
-                db,
-                config.run_id,
-                config.name,
-                "failed",
-                stderr.decode()[:500],
-            )
-            insert_event(db, config.run_id, config.name, "error", {"error": stderr.decode()[:200]})
-            return {"success": False, "status": "failed", "error": stderr.decode()[:500], "cost": 0.0}
+            update_agent_status(db, config.run_id, config.name, "timeout", "Max iterations without completion")
+            logger.warning(f"Worker {config.name} timed out")
+            return {"success": False, "status": "timeout", "cost": total_cost}
 
     except Exception as e:
         logger.error(f"Worker {config.name} failed: {e}")
@@ -189,20 +250,15 @@ async def run_worker_subprocess(config: AgentConfig) -> dict:
 
 
 async def run_worker_mock(config: AgentConfig) -> dict:
-    """Mock worker for testing without the Claude CLI.
-
-    Just runs the check command directly.
-    """
+    """Mock worker for testing without the Claude SDK."""
     db = open_db(config.run_id)
 
     try:
         update_agent_status(db, config.run_id, config.name, "running")
         insert_event(db, config.run_id, config.name, "started", {"prompt": config.prompt[:200]})
 
-        # Simulate some work
         await asyncio.sleep(0.5)
 
-        # Run check command
         result = subprocess.run(
             config.check_command,
             shell=True,
@@ -229,142 +285,113 @@ async def run_worker_mock(config: AgentConfig) -> dict:
         db.close()
 
 
-async def spawn_worker(config: AgentConfig, use_mock: bool = False, use_sdk: bool = False) -> asyncio.Task:
-    """Spawn a worker agent as an asyncio task.
-
-    Args:
-        config: Agent configuration
-        use_mock: Use mock implementation (for testing)
-        use_sdk: Use Claude Agent SDK (preferred)
-
-    Returns:
-        asyncio.Task handle
-    """
-    if use_mock:
-        return asyncio.create_task(run_worker_mock(config), name=f"worker-{config.name}")
-    elif use_sdk:
-        from swarm.executor_sdk import run_worker_sdk
-        return asyncio.create_task(run_worker_sdk(config), name=f"worker-sdk-{config.name}")
-    else:
-        return asyncio.create_task(run_worker_subprocess(config), name=f"worker-{config.name}")
-
-
-def format_events_for_manager(events: list, clarifications: list) -> str:
-    """Format events for injection into manager prompt."""
-    lines = []
-    if clarifications:
-        lines.append("## Pending Clarifications")
-        for c in clarifications:
-            lines.append(f"- [{c['id'][:8]}] {c['agent']}: {c['question']}")
-    if events:
-        lines.append("\n## Recent Events")
-        for e in events:
-            data = json.loads(e["data"]) if e["data"] else {}
-            lines.append(f"- [{e['ts']}] {e['agent']}: {e['event_type']}")
-    return "\n".join(lines) or "No new events."
-
-
-async def run_manager_subprocess(config: AgentConfig) -> dict:
-    """Run a manager agent with event injection loop.
-
-    This is a simplified implementation. In production, this would use
-    ClaudeSDKClient for multi-turn conversations.
-    """
+async def run_manager(config: AgentConfig) -> dict:
+    """Run a manager agent using the Claude Agent SDK."""
     db = open_db(config.run_id)
 
     try:
+        agent_env = build_agent_env(config)
+        os.environ.update(agent_env)
+
         update_agent_status(db, config.run_id, config.name, "running")
         insert_event(db, config.run_id, config.name, "started", {"prompt": config.prompt[:200]})
 
-        iteration = 0
-        max_iterations = config.max_iterations
+        manager_tools = create_manager_tools(config.run_id, config.name)
+        server = create_sdk_mcp_server("swarm", "1.0.0", manager_tools)
 
-        while iteration < max_iterations:
-            iteration += 1
-            update_agent_iteration(db, config.run_id, config.name, iteration)
-
-            # Get events and clarifications
-            events = get_recent_events(db, config.run_id)
-            clarifications = get_pending_clarifications(db, config.run_id)
-
-            # Build prompt with events
-            event_summary = format_events_for_manager(events, clarifications)
-            prompt = f"""You are a manager agent coordinating workers.
+        options = ClaudeAgentOptions(
+            cwd=str(config.worktree),
+            env=agent_env,
+            mcp_servers={"swarm": server},
+            allowed_tools=[
+                "Read", "Write", "Edit", "Bash", "Glob", "Grep",
+                "mcp__swarm__spawn_worker",
+                "mcp__swarm__respond_to_clarification",
+                "mcp__swarm__cancel_worker",
+                "mcp__swarm__get_worker_status",
+                "mcp__swarm__get_pending_clarifications",
+                "mcp__swarm__mark_plan_complete",
+            ],
+            model=config.model,
+            max_turns=config.max_iterations,
+            permission_mode="bypassPermissions",
+            system_prompt=f"""You are a manager agent coordinating worker agents.
 
 Task: {config.prompt}
 
-{event_summary}
+Your tools:
+- spawn_worker: Create new workers to handle subtasks
+- get_worker_status: Check worker progress
+- get_pending_clarifications: See worker questions
+- respond_to_clarification: Answer worker questions
+- cancel_worker: Stop a worker
+- mark_plan_complete: Signal when done (all workers must be complete first)
 
-Respond to any pending clarifications or check if workers are done.
-If all work is complete, say "MANAGER_COMPLETE".
-"""
+Orchestrate the work, respond to clarifications, and call mark_plan_complete when finished.
+""",
+        )
 
-            # Run claude CLI
-            cmd = [
-                "claude",
-                "--print",
-                "--dangerously-skip-permissions",
-                "--model", config.model,
-                "-p", prompt,
-            ]
+        logger.info(f"Starting manager {config.name} in {config.worktree}")
+        log_path = ensure_log_file(config.run_id, config.name)
 
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                cwd=str(config.worktree),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
+        session_id = None
+        total_cost = 0.0
+        iteration = 0
 
-            stdout, stderr = await process.communicate()
-            output = stdout.decode()
+        async with ClaudeSDKClient(options=options) as client:
+            await client.query(f"Execute the task. Spawn workers as needed. When all work is done, call mark_plan_complete.\n\nTask: {config.prompt}")
 
-            # Log output
-            log_path = Path(f".swarm/runs/{config.run_id}/logs/{config.name}.log")
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(log_path, "a") as f:
-                f.write(f"\n--- Iteration {iteration} ---\n")
-                f.write(output)
+            async for message in client.receive_response():
+                if isinstance(message, AssistantMessage):
+                    iteration += 1
+                    update_agent_iteration(db, config.run_id, config.name, iteration)
 
-            # Check for completion signal
-            if "MANAGER_COMPLETE" in output:
-                update_agent_status(db, config.run_id, config.name, "completed")
-                insert_event(db, config.run_id, config.name, "done", {"summary": "Manager completed"})
-                return {"success": True, "status": "completed"}
+                    with open(log_path, "a") as f:
+                        for block in message.content or []:
+                            if isinstance(block, TextBlock):
+                                f.write(block.text + "\n")
 
-            # Parse responses to clarifications from output
-            # (simplified - in production would parse structured output)
-            for c in clarifications:
-                if c["id"][:8] in output:
-                    # Extract response (naive implementation)
-                    insert_response(db, config.run_id, c["id"], f"Manager response at iteration {iteration}")
+                if isinstance(message, ResultMessage):
+                    session_id = message.session_id
+                    total_cost = message.total_cost_usd
+                    break
 
-            await asyncio.sleep(5)  # Poll interval
+        update_agent_cost(db, config.run_id, config.name, total_cost)
 
-        # Max iterations reached
-        update_agent_status(db, config.run_id, config.name, "timeout", "Max iterations reached")
-        return {"success": False, "status": "timeout", "error": "Max iterations reached"}
+        if total_cost > config.max_cost_usd:
+            logger.warning(f"Manager {config.name} exceeded cost budget (${total_cost:.4f} > ${config.max_cost_usd:.2f})")
+            update_agent_status(db, config.run_id, config.name, "failed", f"Cost exceeded: ${total_cost:.4f}")
+            insert_event(db, config.run_id, config.name, "error", {"error": "cost_exceeded", "cost": total_cost, "budget": config.max_cost_usd})
+            return {"success": False, "status": "failed", "cost": total_cost, "error": "cost_exceeded"}
+
+        agent = get_agent(db, config.run_id, config.name)
+        final_status = agent["status"] if agent else "unknown"
+
+        if final_status == "completed":
+            logger.info(f"Manager {config.name} completed (cost: ${total_cost:.4f})")
+            return {"success": True, "status": "completed", "cost": total_cost, "session_id": session_id}
+        else:
+            if final_status not in ("failed", "timeout", "cancelled"):
+                update_agent_status(db, config.run_id, config.name, "timeout", "Max iterations")
+            return {"success": False, "status": final_status, "cost": total_cost}
 
     except Exception as e:
         logger.error(f"Manager {config.name} failed: {e}")
         update_agent_status(db, config.run_id, config.name, "failed", str(e))
+        insert_event(db, config.run_id, config.name, "error", {"error": str(e)})
         return {"success": False, "status": "failed", "error": str(e)}
 
     finally:
         db.close()
 
 
-async def spawn_manager(config: AgentConfig, use_sdk: bool = False) -> asyncio.Task:
-    """Spawn a manager agent as an asyncio task.
+def spawn_worker(config: AgentConfig, use_mock: bool = False) -> asyncio.Task:
+    """Spawn a worker agent as an asyncio task."""
+    if use_mock:
+        return asyncio.create_task(run_worker_mock(config), name=f"worker-{config.name}")
+    return asyncio.create_task(run_worker(config), name=f"worker-{config.name}")
 
-    Args:
-        config: Agent configuration
-        use_sdk: Use Claude Agent SDK (preferred)
 
-    Returns:
-        asyncio.Task handle
-    """
-    if use_sdk:
-        from swarm.executor_sdk import run_manager_sdk
-        return asyncio.create_task(run_manager_sdk(config), name=f"manager-sdk-{config.name}")
-    else:
-        return asyncio.create_task(run_manager_subprocess(config), name=f"manager-{config.name}")
+def spawn_manager(config: AgentConfig) -> asyncio.Task:
+    """Spawn a manager agent as an asyncio task."""
+    return asyncio.create_task(run_manager(config), name=f"manager-{config.name}")
