@@ -37,6 +37,10 @@ from swarm.roles import apply_role, get_role_defaults
 
 logger = logging.getLogger("swarm.scheduler")
 
+# Scheduler constants
+STUCK_THRESHOLD_ITERATIONS = 30
+POLL_INTERVAL_SECONDS = 1.0
+
 
 @dataclass
 class SchedulerResult:
@@ -77,6 +81,24 @@ class Scheduler:
         self.failure_count = 0
         self.idle_iterations = 0
         self.last_event_count = 0
+
+    def _cancel_all_tasks(self, status: str, message: str = "", include_pending: bool = False) -> None:
+        """Cancel all running tasks and update their status.
+
+        Args:
+            status: Status to set for cancelled agents
+            message: Optional error message
+            include_pending: Also mark pending agents with the status
+        """
+        for name, task in self.tasks.items():
+            if not task.done():
+                task.cancel()
+                update_agent_status(self.db, self.run_id, name, status, message)
+
+        if include_pending:
+            for a in get_agents(self.db, self.run_id):
+                if a["status"] == "pending":
+                    update_agent_status(self.db, self.run_id, a["name"], status, message)
 
     def _init_db(self) -> None:
         """Initialize database and insert plan/agents."""
@@ -251,19 +273,13 @@ class Scheduler:
         elif action == "cancel":
             # Cancel all agents and fail the run
             update_plan_status(self.db, self.run_id, "failed")
-            for name, task in self.tasks.items():
-                if not task.done():
-                    task.cancel()
-                    update_agent_status(self.db, self.run_id, name, "cancelled", "Cost budget exceeded")
+            self._cancel_all_tasks("cancelled", "Cost budget exceeded")
             return True
 
         else:  # pause (default)
             # Pause for manual resume
             update_plan_status(self.db, self.run_id, "paused")
-            for name, task in self.tasks.items():
-                if not task.done():
-                    task.cancel()
-                    update_agent_status(self.db, self.run_id, name, "paused")
+            self._cancel_all_tasks("paused")
             return True
 
     async def _handle_agent_failure(self, name: str, error: str) -> bool:
@@ -282,18 +298,7 @@ class Scheduler:
         if on_failure == "stop":
             logger.warning(f"Agent {name} failed with on_failure=stop, cancelling run")
             update_plan_status(self.db, self.run_id, "failed")
-
-            # Cancel all running tasks
-            for task_name, task in self.tasks.items():
-                if not task.done() and task_name != name:
-                    task.cancel()
-                    update_agent_status(self.db, self.run_id, task_name, "cancelled")
-
-            # Mark remaining pending agents as cancelled
-            for a in get_agents(self.db, self.run_id):
-                if a["status"] == "pending":
-                    update_agent_status(self.db, self.run_id, a["name"], "cancelled", "Run stopped due to failure")
-
+            self._cancel_all_tasks("cancelled", "Run stopped due to failure", include_pending=True)
             return True
 
         elif on_failure == "retry":
@@ -358,23 +363,12 @@ Please address this error and continue with the task.
 
             if cb.action == "cancel_all":
                 update_plan_status(self.db, self.run_id, "failed")
-                # Cancel all running agents
-                for name, task in self.tasks.items():
-                    if not task.done():
-                        task.cancel()
-                        update_agent_status(self.db, self.run_id, name, "cancelled", "Circuit breaker tripped")
-                # Mark pending as cancelled
-                for a in get_agents(self.db, self.run_id):
-                    if a["status"] == "pending":
-                        update_agent_status(self.db, self.run_id, a["name"], "cancelled", "Circuit breaker tripped")
+                self._cancel_all_tasks("cancelled", "Circuit breaker tripped", include_pending=True)
                 return True
 
             elif cb.action == "pause":
                 update_plan_status(self.db, self.run_id, "paused")
-                for name, task in self.tasks.items():
-                    if not task.done():
-                        task.cancel()
-                        update_agent_status(self.db, self.run_id, name, "paused")
+                self._cancel_all_tasks("paused")
                 return True
 
             # notify_only - just log, don't stop
@@ -398,8 +392,8 @@ Please address this error and continue with the task.
 
         self.last_event_count = current_count
 
-        # Default stuck threshold: 30 iterations (30 seconds) of no progress
-        stuck_threshold = 30
+        # Default stuck threshold: N iterations of no progress
+        stuck_threshold = STUCK_THRESHOLD_ITERATIONS
         if self.plan.orchestration and hasattr(self.plan.orchestration, "stuck_threshold"):
             stuck_threshold = self.plan.orchestration.stuck_threshold
 
@@ -532,7 +526,7 @@ Please address this error and continue with the task.
                 # Check for stuck condition (but don't stop, just log)
                 self._check_stuck()
 
-                await asyncio.sleep(1)
+                await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
             # Wait for any remaining tasks
             if self.tasks:
