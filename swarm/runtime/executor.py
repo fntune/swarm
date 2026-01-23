@@ -6,7 +6,6 @@ for coordination between agents.
 
 import asyncio
 import logging
-import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,12 +17,10 @@ from claude_agent_sdk import (
     ResultMessage,
     TextBlock,
     create_sdk_mcp_server,
-    tool,
 )
 
-from swarm import tools as tool_impl
-from swarm.db import (
-    ensure_log_file,
+from swarm.tools.factory import create_manager_tools, create_worker_tools
+from swarm.storage.db import (
     get_agent,
     insert_event,
     open_db,
@@ -31,6 +28,7 @@ from swarm.db import (
     update_agent_iteration,
     update_agent_status,
 )
+from swarm.storage.paths import ensure_log_file
 
 logger = logging.getLogger("swarm.executor")
 
@@ -93,81 +91,12 @@ Important:
 """
 
 
-def create_worker_tools(run_id: str, agent_name: str):
-    """Create worker coordination tools as SDK MCP tools."""
-    os.environ["SWARM_RUN_ID"] = run_id
-    os.environ["SWARM_AGENT_NAME"] = agent_name
-
-    @tool("mark_complete", "Signal task completion. Runs check command automatically.", {"summary": str})
-    async def mark_complete(args: dict) -> dict:
-        return await tool_impl.mark_complete(args["summary"])
-
-    @tool("request_clarification", "Ask manager for guidance. BLOCKS until response.",
-          {"question": str, "escalate_to": str})
-    async def request_clarification(args: dict) -> dict:
-        return await tool_impl.request_clarification(
-            args["question"],
-            args.get("escalate_to", "auto"),
-        )
-
-    @tool("report_progress", "Report progress update.", {"status": str, "milestone": str})
-    async def report_progress(args: dict) -> dict:
-        return await tool_impl.report_progress(args["status"], args.get("milestone"))
-
-    @tool("report_blocker", "Report blocking issue. BLOCKS until resolved.", {"issue": str})
-    async def report_blocker(args: dict) -> dict:
-        return await tool_impl.report_blocker(args["issue"])
-
-    return [mark_complete, request_clarification, report_progress, report_blocker]
-
-
-def create_manager_tools(run_id: str, manager_name: str):
-    """Create manager coordination tools as SDK MCP tools."""
-    os.environ["SWARM_RUN_ID"] = run_id
-    os.environ["SWARM_AGENT_NAME"] = manager_name
-
-    @tool("spawn_worker", "Spawn a new worker agent.", {"name": str, "prompt": str, "check": str, "model": str})
-    async def spawn_worker(args: dict) -> dict:
-        return await tool_impl.spawn_worker(
-            args["name"],
-            args["prompt"],
-            args.get("check"),
-            args.get("model", "sonnet"),
-        )
-
-    @tool("respond_to_clarification", "Respond to worker's clarification.", {"clarification_id": str, "response": str})
-    async def respond_to_clarification(args: dict) -> dict:
-        return await tool_impl.respond_to_clarification(
-            args["clarification_id"],
-            args["response"],
-        )
-
-    @tool("cancel_worker", "Cancel a worker agent.", {"name": str})
-    async def cancel_worker(args: dict) -> dict:
-        return await tool_impl.cancel_worker(args["name"])
-
-    @tool("get_worker_status", "Get status of workers.", {"name": str})
-    async def get_worker_status(args: dict) -> dict:
-        return await tool_impl.get_worker_status(args.get("name"))
-
-    @tool("get_pending_clarifications", "Get pending clarifications from workers.", {})
-    async def get_pending_clarifications(args: dict) -> dict:
-        return await tool_impl.get_pending_clarifications()
-
-    @tool("mark_plan_complete", "Signal plan completion.", {"summary": str})
-    async def mark_plan_complete(args: dict) -> dict:
-        return await tool_impl.mark_plan_complete(args["summary"])
-
-    return [spawn_worker, respond_to_clarification, cancel_worker, get_worker_status, get_pending_clarifications, mark_plan_complete]
-
-
 async def run_worker(config: AgentConfig) -> dict:
     """Run a worker agent using the Claude Agent SDK."""
     db = open_db(config.run_id)
 
     try:
         agent_env = build_agent_env(config)
-        os.environ.update(agent_env)
 
         update_agent_status(db, config.run_id, config.name, "running")
         insert_event(db, config.run_id, config.name, "started", {"prompt": config.prompt[:200]})
@@ -214,7 +143,7 @@ async def run_worker(config: AgentConfig) -> dict:
 
                 if isinstance(message, ResultMessage):
                     session_id = message.session_id
-                    total_cost = message.total_cost_usd
+                    total_cost = message.total_cost_usd or 0.0
                     break
 
         update_agent_cost(db, config.run_id, config.name, total_cost)
@@ -291,7 +220,6 @@ async def run_manager(config: AgentConfig) -> dict:
 
     try:
         agent_env = build_agent_env(config)
-        os.environ.update(agent_env)
 
         update_agent_status(db, config.run_id, config.name, "running")
         insert_event(db, config.run_id, config.name, "started", {"prompt": config.prompt[:200]})
@@ -353,7 +281,7 @@ Orchestrate the work, respond to clarifications, and call mark_plan_complete whe
 
                 if isinstance(message, ResultMessage):
                     session_id = message.session_id
-                    total_cost = message.total_cost_usd
+                    total_cost = message.total_cost_usd or 0.0
                     break
 
         update_agent_cost(db, config.run_id, config.name, total_cost)

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from swarm.db import (
+from swarm.storage.db import (
     get_agent,
     get_agents,
     get_plan,
@@ -18,8 +18,8 @@ from swarm.db import (
     update_agent_status,
     update_plan_status,
 )
-from swarm.models import AgentSpec, CostBudget, Orchestration, CircuitBreaker, PlanSpec
-from swarm.scheduler import Scheduler, SchedulerResult
+from swarm.models.specs import AgentSpec, CostBudget, Orchestration, CircuitBreaker, PlanSpec
+from swarm.runtime.scheduler import Scheduler, SchedulerResult
 
 
 @pytest.fixture

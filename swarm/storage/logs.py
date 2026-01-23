@@ -6,7 +6,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from swarm.db import ensure_log_file, get_log_path, get_logs_dir
+from swarm.storage.paths import ensure_log_file, get_log_path, get_logs_dir
 
 logger = logging.getLogger("swarm.logs")
 

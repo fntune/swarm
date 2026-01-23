@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 import yaml
 
-from swarm.db import (
+from swarm.storage.db import (
     all_agents_done,
     get_agent,
     get_agents,
@@ -29,10 +29,11 @@ from swarm.db import (
     update_agent_worktree,
     update_plan_status,
 )
-from swarm.executor import AgentConfig, spawn_manager, spawn_worker
-from swarm.git import create_worktree, setup_worktree_with_deps
-from swarm.models import PlanSpec
-from swarm.parser import generate_run_id, load_shared_context
+from swarm.runtime.executor import AgentConfig, spawn_manager, spawn_worker
+from swarm.gitops.worktrees import create_worktree, setup_worktree_with_deps
+from swarm.models.specs import PlanSpec
+from swarm.io.plan_builder import load_shared_context
+from swarm.io.parser import generate_run_id
 from swarm.roles import apply_role, get_role_defaults
 
 logger = logging.getLogger("swarm.scheduler")
@@ -77,7 +78,7 @@ class Scheduler:
         self.use_mock = use_mock
         self.resume = resume
         self.tasks: dict[str, asyncio.Task] = {}
-        self.db: sqlite3.Connection | None = None
+        self.db: sqlite3.Connection = None  # type: ignore[assignment]  # Set in run()
         self.failure_count = 0
         self.idle_iterations = 0
         self.last_event_count = 0
@@ -394,7 +395,7 @@ Please address this error and continue with the task.
 
         # Default stuck threshold: N iterations of no progress
         stuck_threshold = STUCK_THRESHOLD_ITERATIONS
-        if self.plan.orchestration and hasattr(self.plan.orchestration, "stuck_threshold"):
+        if self.plan.orchestration and self.plan.orchestration.stuck_threshold is not None:
             stuck_threshold = self.plan.orchestration.stuck_threshold
 
         if self.idle_iterations >= stuck_threshold:
@@ -420,9 +421,16 @@ Please address this error and continue with the task.
 
         success = len(failed) == 0 and len(completed) == len(agents)
 
-        # Update plan status based on outcome
-        plan_status = "completed" if success else "failed"
-        update_plan_status(self.db, self.run_id, plan_status)
+        # Update plan status - preserve paused/cancelled states
+        current_plan = get_plan(self.db, self.run_id)
+        current_status = current_plan["status"] if current_plan else "running"
+        error = None
+        if current_status in ("paused", "cancelled"):
+            success = False
+            error = f"Run {current_status}"
+        else:
+            plan_status = "completed" if success else "failed"
+            update_plan_status(self.db, self.run_id, plan_status)
 
         return SchedulerResult(
             run_id=self.run_id,
@@ -430,6 +438,7 @@ Please address this error and continue with the task.
             completed=completed,
             failed=failed,
             total_cost=total_cost,
+            error=error,
         )
 
     async def run(self) -> SchedulerResult:

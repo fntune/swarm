@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from swarm.db import get_agent, init_db, insert_agent, open_db, update_agent_status
-from swarm.executor import AgentConfig, build_system_prompt, run_worker_mock
+from swarm.storage.db import get_agent, init_db, insert_agent, open_db, update_agent_status
+from swarm.runtime.executor import AgentConfig, build_system_prompt, run_worker_mock
 
 
 @pytest.fixture

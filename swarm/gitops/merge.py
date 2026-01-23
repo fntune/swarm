@@ -8,11 +8,11 @@ import subprocess
 from pathlib import Path
 from typing import Literal
 
-from swarm.db import get_agents, get_db, insert_agent, update_agent_status
-from swarm.deps import DependencyGraph
-from swarm.executor import AgentConfig
-from swarm.git import merge_branch_to_current, remove_worktree
-from swarm.models import AgentSpec
+from swarm.storage.db import get_agents, get_db, insert_agent, update_agent_status
+from swarm.core.deps import DependencyGraph
+from swarm.runtime.executor import AgentConfig
+from swarm.gitops.worktrees import merge_branch_to_current, remove_worktree
+from swarm.models.specs import AgentSpec
 
 logger = logging.getLogger("swarm.merge")
 
@@ -99,7 +99,7 @@ Do NOT run git merge --continue - that will be handled automatically."""
 
     # Run the resolver
     try:
-        from swarm.executor import run_worker
+        from swarm.runtime.executor import run_worker
 
         config = AgentConfig(
             name=resolver_name,

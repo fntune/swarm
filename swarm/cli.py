@@ -10,12 +10,10 @@ from pathlib import Path
 import click
 import yaml
 
-from swarm.db import (
+from swarm.storage.db import (
     get_agents,
     get_db,
-    get_db_path,
     get_plan,
-    get_run_dir,
     get_total_cost,
     list_runs,
     open_db,
@@ -23,13 +21,16 @@ from swarm.db import (
     update_agent_status,
     update_plan_status,
 )
-from swarm.deps import DependencyGraph
-from swarm.git import merge_branch_to_current
-from swarm.logs import list_logs, read_all_logs, read_log, setup_logging, tail_log
-from swarm.models import AgentSpec, Defaults, PlanSpec
-from swarm.parser import create_inline_plan, generate_run_id, parse_plan_file, validate_plan
+from swarm.storage.paths import get_db_path, get_run_dir
+from swarm.core.deps import DependencyGraph
+from swarm.gitops.worktrees import merge_branch_to_current
+from swarm.storage.logs import list_logs, read_all_logs, read_log, setup_logging, tail_log
+from swarm.models.specs import AgentSpec, Defaults, PlanSpec
+from swarm.io.parser import generate_run_id, parse_plan_file
+from swarm.io.validation import validate_plan
+from swarm.io.plan_builder import create_inline_plan
 from swarm.roles import BUILTIN_ROLES, get_role
-from swarm.scheduler import run_plan
+from swarm.runtime.scheduler import run_plan
 
 logger = logging.getLogger("swarm.cli")
 

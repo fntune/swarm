@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from swarm.db import init_db, insert_agent, insert_plan, update_agent_status
-from swarm.merge import get_merge_order, merge_run, check_conflicts, squash_merge
+from swarm.storage.db import init_db, insert_agent, insert_plan, update_agent_status
+from swarm.gitops.merge import get_merge_order, merge_run, check_conflicts, squash_merge
 
 
 @pytest.fixture
@@ -181,7 +181,7 @@ def test_merge_run_on_conflict_fail(temp_swarm_dir):
 
 def test_get_conflict_files_no_conflicts(git_repo, monkeypatch):
     """Test get_conflict_files when no conflicts exist."""
-    from swarm.merge import get_conflict_files
+    from swarm.gitops.merge import get_conflict_files
     monkeypatch.chdir(git_repo)
 
     files = get_conflict_files()

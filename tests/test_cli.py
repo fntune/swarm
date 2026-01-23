@@ -6,7 +6,7 @@ import pytest
 from click.testing import CliRunner
 
 from swarm.cli import main
-from swarm.db import init_db, insert_agent, insert_plan, update_agent_status
+from swarm.storage.db import init_db, insert_agent, insert_plan, update_agent_status
 
 
 @pytest.fixture

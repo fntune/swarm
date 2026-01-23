@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from swarm.git import (
+from swarm.gitops.worktrees import (
     create_worktree,
     get_current_branch,
     merge_branch,

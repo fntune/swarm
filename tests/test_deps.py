@@ -2,8 +2,8 @@
 
 import pytest
 
-from swarm.deps import DependencyGraph, get_merge_order, resolve_dependencies
-from swarm.models import AgentSpec
+from swarm.core.deps import DependencyGraph, get_merge_order, resolve_dependencies
+from swarm.models.specs import AgentSpec
 
 
 def test_dependency_graph_ready_agents():

@@ -4,7 +4,7 @@ import logging
 import subprocess
 from pathlib import Path
 
-from swarm.db import get_worktrees_dir
+from swarm.storage.paths import get_worktrees_dir
 
 logger = logging.getLogger("swarm.git")
 

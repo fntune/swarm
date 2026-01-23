@@ -2,15 +2,10 @@
 
 import pytest
 
-from swarm.models import AgentSpec, Defaults, PlanSpec
-from swarm.parser import (
-    create_inline_plan,
-    has_circular_deps,
-    infer_agent_name,
-    parse_inline_agents,
-    parse_plan_yaml,
-    validate_plan,
-)
+from swarm.models.specs import AgentSpec, Defaults, PlanSpec
+from swarm.io.parser import parse_plan_yaml
+from swarm.io.plan_builder import create_inline_plan, infer_agent_name, parse_inline_agents
+from swarm.io.validation import has_circular_deps, validate_plan
 
 
 def test_parse_plan_yaml_minimal():

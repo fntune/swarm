@@ -3,7 +3,7 @@
 import logging
 from typing import Iterator
 
-from swarm.models import AgentSpec
+from swarm.models.specs import AgentSpec
 
 logger = logging.getLogger("swarm.deps")
 

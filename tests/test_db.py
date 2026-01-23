@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from swarm.db import (
+from swarm.storage.db import (
     get_agent,
     get_agents,
     get_pending_agents,
