@@ -1,6 +1,6 @@
 # swarm
 
-Multi-agent orchestration CLI for Claude Code. Define agents in a YAML plan, run them in parallel across isolated git worktrees, and merge the results.
+> Multi-agent orchestration for Claude Code. Parallel worktrees. Resumable runs.
 
 ```bash
 swarm run -f plan.yaml
@@ -8,27 +8,32 @@ swarm dashboard <run-id>
 swarm merge <run-id>
 ```
 
+Write a YAML plan. Swarm resolves dependencies, spawns agents in isolated git worktrees, tracks everything in SQLite, and merges branches when done. Crash mid-run? `swarm resume`.
+
 ---
 
-## How it works
+## Why
 
-You write a plan spec — a YAML file describing agents, their tasks, and dependencies. Swarm resolves the dependency graph, spawns agents in parallel git worktrees, tracks state in SQLite, and merges branches when done.
+Chaining Claude sessions by hand doesn't scale. Copy-pasting outputs between windows, manually rebasing branches, losing all context when a session dies — this is friction that shouldn't exist.
 
-Each agent gets its own worktree so they can edit files without conflicts. Workers signal completion via tool calls; managers can spawn subagents and respond to clarification requests mid-run.
+Swarm treats multi-agent work as a **data structure**: a plan spec with named agents, dependency edges, and completion conditions. Every run is tracked, every branch is isolated, every failure is recoverable.
+
+- **Declarative plans.** YAML specs with `depends_on` edges. Swarm resolves topological order and runs independent agents in parallel.
+- **Worktree isolation.** Each agent gets its own git worktree and branch. No file conflicts between parallel agents. Merge when done.
+- **Resume-first.** Every run is a SQLite record. `swarm resume <run-id>` re-enters from the last known state — agents that completed stay completed.
+- **Failure modes.** Per-agent: `continue`, `stop`, or `retry` (with error context injected back into the retry prompt). Circuit breaker trips on threshold.
+- **Roles.** Seven built-in role templates (architect, implementer, tester, reviewer, debugger, refactorer, documenter) with specialized prompts and default completion checks.
+
+---
 
 ## Installation
 
-Requires Python 3.10+ and the Claude Agent SDK.
-
 ```bash
-pip install -e ".[sdk]"
+pip install -e ".[sdk]"   # with Claude Agent SDK
+pip install -e .           # without (use --mock for dry runs)
 ```
 
-Or without the SDK (for `--mock` runs):
-
-```bash
-pip install -e .
-```
+---
 
 ## Quick start
 
@@ -36,38 +41,91 @@ Write a plan:
 
 ```yaml
 # plan.yaml
-name: add-feature
+name: auth-feature
+
 agents:
   - name: design
-    prompt: "Design the API for a rate limiter module. Output a spec."
+    use_role: architect
+    prompt: "Design the JWT auth middleware. Output a spec with interface contracts."
 
   - name: implement
-    prompt: "Implement the rate limiter from the spec in design's output."
+    use_role: implementer
+    prompt: "Implement the JWT auth middleware from design's spec."
     depends_on: [design]
+    check: "cargo build"
 
   - name: test
-    prompt: "Write tests for the rate limiter."
+    use_role: tester
+    prompt: "Write unit and integration tests for the auth middleware."
     depends_on: [implement]
-    check: "pytest tests/rate_limiter/ -v"
+    check: "cargo test auth"
+
+  - name: review
+    use_role: reviewer
+    prompt: "Review the implementation and tests."
+    depends_on: [implement, test]
+    model: opus
 ```
 
 Run it:
 
 ```bash
-swarm run -f plan.yaml
-swarm dashboard <run-id>   # live status
-swarm merge <run-id>        # merge completed branches
+swarm run -f plan.yaml        # launch all agents
+swarm dashboard <run-id>      # live status
+swarm logs <run-id> -a test   # stream agent logs
+swarm merge <run-id>           # merge completed branches
 ```
 
-Or run inline without a file:
+Or skip the file for quick tasks:
 
 ```bash
-# Single agent
-swarm run -p "auth: Implement JWT middleware"
+# single agent
+swarm run -p "audit: Find all SQL injection risks in the codebase"
 
-# Sequential chain
-swarm run -p "analyze: Audit auth code" -p "fix: Apply the fixes from analyze" --sequential
+# sequential pipeline
+swarm run -p "find: List all deprecated API usages" \
+          -p "fix: Apply fixes from find's output" \
+          --sequential
 ```
+
+---
+
+## Plan spec
+
+```yaml
+name: plan-name
+
+defaults:
+  model: sonnet          # claude-sonnet-4-6 by default
+  on_failure: continue   # continue | stop | retry
+
+agents:
+  - name: agent-name
+    prompt: "Task description"
+    use_role: implementer       # optional built-in role
+    depends_on: [other-agent]   # wait for these to complete
+    check: "pytest tests/"      # shell command; must exit 0
+    on_failure: retry           # override per-agent
+    model: opus                 # override per-agent
+```
+
+Agents with no `depends_on` run immediately in parallel. Agents with `depends_on` wait until all listed agents complete.
+
+---
+
+## Built-in roles
+
+| Role | System prompt focus | Default check |
+|------|---------------------|---------------|
+| `architect` | Design, specs, interfaces | — (uses Opus) |
+| `implementer` | Implement from spec, commit often | — |
+| `tester` | Coverage, happy paths + edge cases | `pytest` |
+| `reviewer` | Correctness, security, clarity | — |
+| `debugger` | Reproduce, root cause, minimal repro | — |
+| `refactorer` | Code quality, no behavior changes | lint + type check |
+| `documenter` | Accurate, maintainable docs | — |
+
+---
 
 ## Commands
 
@@ -75,91 +133,76 @@ swarm run -p "analyze: Audit auth code" -p "fix: Apply the fixes from analyze" -
 |---------|-------------|
 | `swarm run -f plan.yaml` | Execute a plan spec |
 | `swarm run -p "name: task"` | Inline single agent |
-| `swarm resume <run-id>` | Resume a paused or failed run |
-| `swarm status [run-id]` | View run status (latest if no ID) |
+| `swarm run ... --sequential` | Force sequential execution |
+| `swarm run ... --mock` | Dry run without API calls |
+| `swarm resume <run-id>` | Resume from last known state |
+| `swarm status [run-id]` | Run status (latest if no ID) |
 | `swarm dashboard <run-id>` | Live status view |
-| `swarm logs <run-id> -a <agent>` | View agent logs |
-| `swarm merge <run-id>` | Merge completed branches into current |
+| `swarm logs <run-id> -a <agent>` | Stream agent logs |
+| `swarm logs <run-id> --all` | All agent logs |
+| `swarm merge <run-id>` | Merge completed branches |
+| `swarm merge <run-id> --dry-run` | Preview merge |
 | `swarm cancel <run-id>` | Cancel running agents |
-| `swarm clean [run-id]` | Remove artifacts for a run |
-| `swarm roles` | List built-in role templates |
+| `swarm clean [run-id]` | Remove artifacts |
+| `swarm db <run-id> [query]` | Query run state in SQLite |
+| `swarm roles [name]` | List / inspect roles |
 
-## Plan spec
+---
 
-```yaml
-name: my-plan
+## How it works
 
-defaults:
-  model: sonnet          # default model for all agents
-  check: null            # default completion check
-
-agents:
-  - name: architect
-    use_role: architect  # use a built-in role template
-    prompt: "Design the auth system for this service"
-
-  - name: implementer
-    use_role: implementer
-    prompt: "Implement the design from architect's output"
-    depends_on: [architect]
-    check: "cargo build"  # must pass for agent to be marked complete
-
-  - name: reviewer
-    use_role: reviewer
-    prompt: "Review the implementation"
-    depends_on: [implementer]
-    model: opus
+```
+you write a plan spec
+        │
+        ▼
+swarm resolves dependency graph (topological sort)
+        │
+        ├─── independent agents → launch in parallel, each in its own worktree
+        │
+        └─── dependent agents → wait for dependencies, then launch
+                │
+                ▼
+        each agent runs with:
+          - its own git worktree (branch: agent-{name})
+          - worker tool set: mark_complete, request_clarification,
+                             report_progress, report_blocker
+                │
+                ▼
+        completion: check command passes → branch ready
+        failure: on_failure policy applies (continue/stop/retry)
+                │
+                ▼
+swarm merge: consolidate branches → resolve conflicts → done
 ```
 
-## Built-in roles
+Manager agents (type: manager) run with a direct API loop — full context control, can spawn subagents and read worker events before each turn. Worker agents run via the SDK Agent class for autonomous task execution.
 
-| Role | Description |
-|------|-------------|
-| `architect` | Designs system architecture and produces specs (uses Opus) |
-| `implementer` | Implements features from specs |
-| `tester` | Writes and runs tests (check: `pytest`) |
-| `reviewer` | Reviews code for quality and correctness |
-| `debugger` | Investigates and fixes bugs |
-| `documenter` | Writes documentation |
-| `refactorer` | Refactors code for quality |
-
-Roles set a specialized system prompt and optionally a default model and check command.
-
-## Resumable runs
-
-Every run gets a unique `run-id`. State is persisted to SQLite so interrupted runs can be resumed:
-
-```bash
-swarm run -f plan.yaml --run-id my-run
-# ... interrupted
-
-swarm resume my-run
-```
-
-## Testing without the SDK
-
-Use `--mock` to test plan parsing and dependency resolution without making API calls:
-
-```bash
-swarm run -p "test: true" --mock
-```
+---
 
 ## Architecture
 
 ```
 swarm/
-├── cli.py          10 Click commands
-├── models.py       AgentSpec, PlanSpec, Defaults (Pydantic)
-├── deps.py         Dependency graph, topological sort
-├── scheduler.py    Parallel execution, circuit breaker
-├── executor.py     Agent execution (SDK + MCP tools)
-├── git.py          Worktree creation, branch management
-├── merge.py        Branch consolidation, conflict handling
-├── roles.py        Built-in role templates
-├── tools.py        Worker + manager coordination tools
-└── db.py           SQLite state (WAL mode)
+├── cli.py          10 Click commands, entry point
+├── models/         AgentSpec, PlanSpec, Defaults (Pydantic)
+├── core/
+│   └── deps.py     Dependency graph, topological sort, cycle detection
+├── runtime/
+│   ├── scheduler.py  Parallel execution, circuit breaker, stuck detection
+│   └── executor.py   Agent execution (SDK + MCP tools)
+├── gitops/
+│   ├── git.py        Worktree creation, branch management
+│   └── merge.py      Branch consolidation, conflict handling
+├── io/
+│   └── logs.py       Log file management
+├── storage/
+│   └── db.py         SQLite state (WAL mode, concurrent-safe)
+├── roles.py          7 built-in role templates
+└── tools.py          Worker + manager coordination tools
 ```
 
-## License
+---
 
-MIT
+## Status
+
+Beta. All 10 CLI commands implemented, 7 roles built in, SQLite persistence with WAL mode, worktree isolation, circuit breaker. Test plans with `--mock` to validate specs without API calls.
