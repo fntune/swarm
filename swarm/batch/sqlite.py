@@ -70,6 +70,8 @@ CREATE TABLE IF NOT EXISTS nodes (
     depends_on TEXT NOT NULL,
     max_iterations INTEGER NOT NULL,
     max_cost_usd REAL NOT NULL,
+    on_failure TEXT NOT NULL DEFAULT 'continue',
+    retry_count INTEGER NOT NULL DEFAULT 3,
     parent TEXT,
     tree_path TEXT NOT NULL,
     output_schema TEXT,
@@ -251,6 +253,8 @@ def insert_node(
     depends_on: Iterable[str],
     max_iterations: int,
     max_cost_usd: float,
+    on_failure: str,
+    retry_count: int,
     parent: str | None,
     tree_path: str,
     env: dict[str, str] | None = None,
@@ -260,8 +264,8 @@ def insert_node(
         """INSERT INTO nodes (
             run_id, name, plan_name, runtime, profile, model, prompt,
             check_command, depends_on, max_iterations, max_cost_usd,
-            parent, tree_path, output_schema, env
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            on_failure, retry_count, parent, tree_path, output_schema, env
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             run_id,
             name,
@@ -274,6 +278,8 @@ def insert_node(
             json.dumps(list(depends_on)),
             max_iterations,
             max_cost_usd,
+            on_failure,
+            retry_count,
             parent,
             tree_path,
             json.dumps(output_schema) if output_schema is not None else None,
@@ -863,6 +869,8 @@ class SqliteCoordinationBackend:
                 depends_on=[],
                 max_iterations=resolved.limits.max_iterations,
                 max_cost_usd=resolved.limits.max_cost_usd,
+                on_failure=resolved.on_failure,
+                retry_count=resolved.retry_count,
                 parent=parent,
                 tree_path=resolved.tree_path,
                 env=dict(resolved.env),

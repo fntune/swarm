@@ -22,6 +22,9 @@ class Limits:
     max_cost_usd: float = 5.0
 
 
+OnFailure = Literal["continue", "stop", "retry"]
+
+
 @dataclass(frozen=True)
 class AgentRequest:
     name: str
@@ -36,6 +39,8 @@ class AgentRequest:
     env: tuple[tuple[str, str], ...] = ()
     output_schema: dict[str, Any] | None = None
     parent: str | None = None
+    on_failure: OnFailure | None = None
+    retry_count: int | None = None
 
     def env_dict(self) -> dict[str, str]:
         return dict(self.env)
@@ -55,6 +60,9 @@ class ResolvedAgent:
     output_schema: dict[str, Any] | None
     parent: str | None
     tree_path: str
+    depends_on: tuple[str, ...] = ()
+    on_failure: OnFailure = "continue"
+    retry_count: int = 3
 
     def env_dict(self) -> dict[str, str]:
         return dict(self.env)
