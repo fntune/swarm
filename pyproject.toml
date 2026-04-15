@@ -13,10 +13,16 @@ dependencies = [
 sdk = [
     "claude-agent-sdk>=0.1.19",
 ]
+openai = [
+    "openai-agents>=0.0.9",
+    "openai>=1.50",
+]
 dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.21",
     "claude-agent-sdk>=0.1.19",
+    "openai-agents>=0.0.9",
+    "openai>=1.50",
 ]
 
 [project.scripts]
