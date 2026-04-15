@@ -101,7 +101,7 @@ class Scheduler:
     def __init__(
         self,
         plan: PlanSpec,
-        resolved: list[ResolvedAgent],
+        resolved: list[ResolvedAgent] | None = None,
         *,
         run_id: str | None = None,
         resume: bool = False,
@@ -109,7 +109,9 @@ class Scheduler:
         workspace_provider: Any | None = None,
     ):
         self.plan = plan
-        self.resolved_by_name: dict[str, ResolvedAgent] = {r.name: r for r in resolved}
+        self.resolved_by_name: dict[str, ResolvedAgent] = (
+            {r.name: r for r in resolved} if resolved else {}
+        )
         self.run_id = run_id or generate_run_id(plan.name)
         self.resume = resume
         self.base_path = base_path or Path.cwd()
@@ -169,6 +171,10 @@ class Scheduler:
         with get_db(self.run_id, self.base_path) as db:
             nodes = get_nodes(db, self.run_id)
             for row in nodes:
+                # Rebuild the in-memory resolved-by-name from the persisted
+                # row so dispatch doesn't have to reach back into the DB.
+                if row["name"] not in self.resolved_by_name:
+                    self.resolved_by_name[row["name"]] = _resolved_from_row(row)
                 attempt = latest_attempt(db, self.run_id, row["name"])
                 if attempt is None:
                     insert_attempt(
@@ -768,7 +774,7 @@ def _resolved_from_row(row: sqlite3.Row) -> ResolvedAgent:
 
 async def run_plan(
     plan: PlanSpec,
-    resolved: list[ResolvedAgent],
+    resolved: list[ResolvedAgent] | None = None,
     *,
     run_id: str | None = None,
     resume: bool = False,
