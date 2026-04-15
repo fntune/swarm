@@ -1,252 +1,739 @@
-# swarm multi-runtime refactor
+# swarm multi-runtime restructure
 
 ## Context
 
-`~/dev/swarm` is a Python multi-agent orchestration framework. Today it runs on the Claude Agent SDK only. The user wants swarm to also run OpenAI Agents SDK workers as a first-class runtime, and to add a "live mode" for single-run agent handoffs (no YAML, no SQLite, no worktree ceremony).
+`~/dev/swarm` is a Python multi-agent orchestration framework currently hardcoded to the Claude Agent SDK. The goal: make it run **OpenAI Agents SDK workers** as a first-class second runtime, add a **live mode** for single-run agent handoffs without YAML/SQLite ceremony, and — critically — **restructure the package aggressively now, while it's pre-production**, rather than bolt features onto the existing shape.
 
-Why this matters now: the user's `.claude/skills/` directory already encodes cross-vendor workflows (`debt`, `audit-fix-loop`, `swarm-audit`) that orchestrate Claude + Codex (GPT-5) interactively inside Claude Code sessions. There is no way to run those patterns as batch swarm plans today. swarm is the right home — the orchestration graph, worktree isolation, SQLite resume, and circuit breaker are already there; the only thing missing is vendor neutrality in the execution layer.
+### What changed vs the earlier draft
 
-Exploration confirmed the coupling surface is narrower than expected: `runtime/executor.py`, `tools/factory.py`, ~4 lines in `models/specs.py`, `scheduler.py:_spawn_agent()`, and the `agents` table schema. Everything above the executor (CLI, parser, deps graph, scheduler poll loop, gitops, merge, db helpers) is already vendor-neutral. `tools/worker.py` and `tools/manager.py` have no Claude SDK imports — only their return shape happens to match Claude's content-block format.
+The earlier draft of this plan treated the work as a cautious 4-phase refactor with a "zero behavior change" Phase 1 and back-compat shims preserving `run_worker`/`run_manager` re-exports, the `session_id` column name, and the existing `AgentConfig` shape. The user has now explicitly said: *"Treat this entire plan as one atomic and breaking change. The current codebase is not in production. If we can cut deeper slices for better modularity, separation of concerns, and hierarchy, we should do that now."*
 
-A stress-test pass surfaced seven meaningful corrections to my initial plan — folded in below. The single biggest change: the executor ABC should be `run(config, toolset, observer)` with one method, not the `run_worker`/`run_manager` pair I originally proposed. Manager vs worker becomes toolset construction (a scheduler concern), not a per-vendor concern.
+This unlocks structural changes the earlier draft deferred:
+- **Delete `runtime/` as a top-level axis.** Today's `runtime/executor.py` is simultaneously vendor adapter, prompt builder, DB mutator, and log writer ([executor.py:13,72,101,125](/Users/sour4bh/dev/swarm/swarm/runtime/executor.py)). Split along concerns, not along "runtime stuff goes here."
+- **Batch vs live are sibling packages.** SQLite, DAG scheduling, merge, and log files are batch-only. Pipeline/handoff and in-memory coordination are live-only. Forcing both through one "runtime" layer is what makes the current code cramped.
+- **Adapters as subpackages.** Each vendor (Claude, OpenAI, mock) owns its own executor + tool wrapper + capability map + code-tool implementations. Flat `adapters/claude.py` would re-create today's `tools/factory.py` cramping problem.
+- **Merge `Toolset`/`RoleTemplate` → `AgentProfile`.** A role is conceptually a named toolset + system prompt + model defaults. Two dataclasses for one idea is duplication.
+- **Replace `AgentConfig` with `ResolvedAgent` + `RunContext`.** Today `AgentConfig` leaks workspace, env, parent lineage, and shared context into every layer ([executor.py:37](/Users/sour4bh/dev/swarm/swarm/runtime/executor.py)). A resolved-agent value (immutable, from plan spec) plus a run context (mutable, per-execution services) is the clean shape.
+- **`Workspace` ADT up front.** One-agent-per-worktree is baked into config, scheduler, DB schema, and merge cleanup. Use `Workspace = GitWorktree | Cwd | TempDir` now, and in batch store `workspace_id` (not raw `worktree` on the agent row).
+- **`CoordinationBackend` protocol, not just a message bus.** `request_clarification` polls SQLite for replies ([tools/worker.py:20](/Users/sour4bh/dev/swarm/swarm/tools/worker.py)); `spawn_worker` inserts child agents directly ([tools/manager.py:38](/Users/sour4bh/dev/swarm/swarm/tools/manager.py)). That's more than pub/sub — it's supervisor ops plus request/reply. Abstract it. Batch implements it via SQLite; live implements it via asyncio queues.
+- **Split the batch schema into `nodes`, `attempts`, `workspaces`.** The current `agents` row mixes immutable config (prompt, deps, check, model) with mutable runtime state (status, iteration, cost, session_id), which is why retry currently mutates the same row in place ([scheduler.py:305](/Users/sour4bh/dev/swarm/swarm/runtime/scheduler.py)). Split to unblock retry history and shared-workspace patterns.
+- **Delete `session_id` entirely.** It's captured transiently in `run_worker` ([executor.py:145,283](/Users/sour4bh/dev/swarm/swarm/runtime/executor.py)) but never persisted back or used for orchestration. Pure dead state.
+- **Delete all migration code.** Pre-production, fresh schemas only. Fail fast if a legacy DB is detected; tell the user to `swarm clean --all`.
+- **Event stream, not `Observer` protocol.** One `emit(SwarmEvent)` sink. Batch writes events to SQLite/log files; live prints or forwards them. Fat observer protocols accrete adapter-specific hooks.
+- **Delete `run_worker_mock`, replace with `MockExecutor` adapter.** Batch and live both use the same execution surface.
+- **Delete `gitops/merge.py:spawn_resolver` entirely (confirmed).** It imports `run_worker` directly and hardcodes `Path.cwd()` — exactly the shape we're removing. Dropped from the `auto` conflict resolution strategy for this PR; `merge --strategy auto` falls back to `manual` when a conflict needs an agent, with a clear error message. Re-added in a follow-up PR once a stable scheduler API for one-off sub-plans exists.
+
+### What the restructure unlocks
+
+The user's `~/.claude/skills/` directory (notably `debt`, `audit-fix-loop`, `swarm-audit`, `evolve`) already encodes cross-vendor workflows that orchestrate Claude + Codex/GPT-5 interactively inside Claude Code sessions. Today they can't run as batch swarm plans because swarm has no OpenAI runtime. After this restructure:
+
+- A YAML plan can mix `runtime: claude` and `runtime: openai` agents with dependencies between them.
+- A Python script can `from swarm.live import pipeline` and run a Claude→OpenAI handoff in 20 lines, no YAML.
+- Role = profile, so a `reviewer` profile is read-only on both vendors via one declaration.
+- Retry history is queryable (previous attempts persist as rows in `attempts`), unblocking audit/optimization reports.
+- Shared workspaces (N reviewers reading one worktree) are possible because workspace is its own entity, not baked into the agent row.
+
+### Scope envelope
+
+**In scope for this atomic change:**
+- Full package restructure (new module tree below)
+- `AgentProfile` / `ResolvedAgent` / `RunContext` / `ExecutionResult` / `CoordinationBackend` / `Workspace` / event stream primitives
+- Claude adapter ported to the new shape
+- OpenAI adapter added (new optional dep)
+- Mock adapter extracted
+- Batch mode backed by SQLite (`nodes` / `attempts` / `workspaces` tables) and the `SqliteCoordinationBackend`
+- Live mode backed by the `InMemoryCoordinationBackend`, two examples: `cross_check.py`, `debt.py`
+- CLI commands updated to the new paths (no new commands in this cut, but `swarm run`/`status`/`logs`/`merge`/`resume`/`clean`/`dashboard`/`db`/`roles` all work)
+- Tests updated (nothing preserved from back-compat; everything rewritten to the new shape)
+
+**Out of scope for this atomic change (deferred to follow-ups):**
+- Cross-vendor OTel tracing unification — nice to have, not load-bearing
+- `swarm report <run_id>` — the optimization report from the `swarm-audit` skill
+- MCP bridge (shared tool pool exposed as in-process MCP to Claude and stdio MCP to OpenAI)
+- Skill → plan YAML converter
+- Durable pause/resume with external hooks (`createHook`-style)
+- Manager-in-live-mode (the in-memory backend simply doesn't support `CoordOp.SPAWN` for now; add later)
+
+**Note on file location**: this plan is written to `~/.claude/plans/gleaming-cuddling-pike.md` to satisfy plan mode. Canonical home after plan mode exits is `~/dev/swarm/.claude/plans/gleaming-cuddling-pike.md`. Sync after approval.
+
+---
 
 ## Target architecture
 
 ```
 swarm/
-  runtime/
-    executors/
-      __init__.py       # registry: {runtime: Executor}
-      base.py           # Executor ABC + Observer protocol + StepResult
-      claude.py         # ClaudeExecutor (current logic, reshaped)
-      openai.py         # OpenAIExecutor (Phase 2)
-    executor.py         # thin dispatcher — preserves public fn signatures
-    scheduler.py        # unchanged except _spawn_agent picks runtime
-    live.py             # Phase 3: pipeline/handoff primitives
-  tools/
-    worker.py           # vendor-neutral, returns str/ToolResult (refactored)
-    manager.py          # vendor-neutral, returns str/ToolResult (refactored)
-    factory.py          # Claude @tool wrapping (existing, signatures change)
-    factory_openai.py   # Phase 2: @function_tool wrapping
-    openai_code.py      # Phase 2: read/edit/shell/grep/glob as @function_tool
-    toolset.py          # Phase 1: Toolset dataclass (coord, code, write_allowed)
-  models/
-    specs.py            # + runtime, + output_schema, loosen model
-    state.py            # unchanged
-  storage/
-    db.py               # schema migration: + runtime, + cost_source, rename session_id
-  roles.py              # + tools field, + read_only
+  cli.py                       Click entrypoint; dispatches to batch/live
   core/
-    errors.py           # Phase 1: SwarmExecutorError
-    budget.py           # Phase 4: shared budget + cost table
-    tracing.py          # Phase 4: OTel unification
-  bridge/
-    as_tool.py          # Phase 3: agent-as-tool wrappers
-    mcp.py              # Phase 4 (deferred): shared MCP tool pool
-  cli.py                # Phase 4: swarm report <run_id>
+    agent.py                   AgentRequest (YAML-facing), ResolvedAgent, Limits
+    profiles.py                AgentProfile, PROFILE_REGISTRY, builtin profiles
+    capabilities.py            Capability enum, CANONICAL_CAPABILITY_ORDER
+    execution.py               Executor ABC, RunContext, ExecutionResult, AdapterRegistry
+    coordination.py            CoordOp enum, CoordinationBackend Protocol, CoordResult
+    events.py                  SwarmEvent ADT, EventSink Protocol, event types
+    workspace.py               Workspace ADT, WorkspaceProvider Protocol
+    errors.py                  SwarmError hierarchy
+  adapters/
+    claude/
+      __init__.py              registers ClaudeExecutor
+      executor.py              ClaudeExecutor(Executor)
+      tools.py                 Claude @tool wrappers around CoordOps
+      builtins.py              CLAUDE_CAPABILITY_MAP, _expand_tools()
+    openai/
+      __init__.py              registers OpenAIExecutor (conditional on import)
+      executor.py              OpenAIExecutor(Executor)
+      tools.py                 OpenAI @function_tool wrappers around CoordOps
+      code_tools.py            read_file/edit_file/run_shell/grep/glob @function_tools
+    mock/
+      __init__.py              registers MockExecutor
+      executor.py              MockExecutor(Executor) — replaces run_worker_mock
+  batch/
+    plan.py                    PlanSpec, PlanDefaults, resolution rules
+    input.py                   YAML parse, inline-plan builder, validation
+    dag.py                     Dependency graph, topological sort, cycle detection
+    scheduler.py               Parallel execution, circuit breaker, stuck detection
+    sqlite.py                  SqliteCoordinationBackend + batch persistence + schema
+    logs.py                    Per-agent log file management
+    merge.py                   Branch consolidation, conflict resolution (sans spawn_resolver)
+  live/
+    pipeline.py                pipeline(), handoff()
+    bridge.py                  as_claude_tool(), as_openai_tool() — split bridge helpers
+    in_memory.py               InMemoryCoordinationBackend (asyncio queues)
+  workspaces/
+    git.py                     GitWorktree provider
+    cwd.py                     Cwd provider
+    temp.py                    TempDir provider
   examples/
-    cross_check.py      # Phase 3: generator-reviewer hello world
-    debt.py             # Phase 3: debt skill port
+    cross_check.py             Claude generator → OpenAI reviewer (hello world)
+    debt.py                    Port of the `debt` skill as a live pipeline
 ```
 
-## Phase 1 — Executor ABC + Observer + Toolset refactor
+**Gone from the tree:**
+- `swarm/runtime/` — split into `adapters/`, `batch/`, `core/execution.py`
+- `swarm/tools/` — split into `adapters/<vendor>/tools.py` (vendor wrappers) and `core/coordination.py` (backend protocol)
+- `swarm/models/` — `specs.py` moves to `core/agent.py` + `batch/plan.py`; `state.py` is deleted (unused)
+- `swarm/storage/` — `db.py` moves to `batch/sqlite.py`; `logs.py` moves to `batch/logs.py`; `paths.py` absorbed into `batch/sqlite.py`
+- `swarm/gitops/` — `worktrees.py` moves to `workspaces/git.py`; `merge.py` moves to `batch/merge.py`
+- `swarm/io/` — `parser.py` / `plan_builder.py` / `validation.py` collapse into `batch/input.py`
+- `swarm/roles.py` — becomes `core/profiles.py`
 
-**Goal:** One internal reshape that unblocks everything else. No new deps. No user-visible behavior change. All tests green.
+---
 
-### Changes
+## Core primitives
 
-1. **`swarm/runtime/executors/base.py` (new)** — define:
-   - `Observer` protocol: `on_start(config)`, `on_iteration(iteration)`, `on_event(event_type, data)`, `on_cost(usd)`, `on_complete(status, error=None)`. All no-ops by default.
-   - `DBObserver(run_id)` — writes to SQLite via existing `storage/db.py` helpers (`update_agent_status`, `insert_event`, `update_agent_iteration`, `update_agent_cost`). This is the batch-mode observer.
-   - `NullObserver` — in-memory only. Used by live mode (Phase 3) and tests.
-   - `StepResult` dataclass: `final_text: str`, `cost_usd: float`, `vendor_session_id: str | None`, `structured_output: Any = None`, `files_modified: list[str] | None = None`, `error: str | None = None`, `status: Literal["completed","failed","timeout","cancelled","cost_exceeded"]`.
-   - `Executor` ABC:
-     ```python
-     class Executor(ABC):
-         runtime: ClassVar[str]
-         @abstractmethod
-         async def run(
-             self,
-             config: AgentConfig,
-             toolset: Toolset,
-             observer: Observer,
-         ) -> StepResult: ...
-     ```
-   - `EXECUTOR_REGISTRY: dict[str, Executor]` and `register(executor)` / `get_executor(runtime)`.
+Designing these right is the load-bearing work of this refactor. Everything else is mechanical file moves.
 
-2. **`swarm/tools/toolset.py` (new)** — `Toolset` dataclass:
-   ```python
-   @dataclass
-   class Toolset:
-       coord: list[str]          # e.g. ["mark_complete", "report_progress"]
-       code: list[str]           # e.g. ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
-       write_allowed: bool = True
-       system_prompt: str = ""
-       role: str | None = None
-   ```
-   Construction lives in `scheduler.py` (batch) or in live-mode helpers (Phase 3). Manager vs worker is a toolset difference, not an executor difference.
+### `core/agent.py`
 
-3. **`swarm/tools/worker.py` + `swarm/tools/manager.py` (refactor return type)** — change every coordination function to return `str` (or a small `ToolResult(text: str, success: bool = True)` dataclass — pick the simpler path, which is plain `str`). The Claude content-block wrapping happens *only* in `tools/factory.py` at the boundary. Rationale from the critique: OpenAI `@function_tool` serializes dict returns to JSON and the LLM has to unwrap `content[0].text` on every call — token waste and confusion. Keeping the content-block shape in worker/manager also locks us into Claude semantics. This is the most important change in Phase 1.
+```python
+from dataclasses import dataclass, field
+from typing import Any, Literal
+from swarm.core.capabilities import Capability
+from swarm.core.profiles import AgentProfile
 
-4. **`swarm/tools/worker.py:89` + `manager.py` env leak fix** — `tools/worker.py` currently reads `SWARM_PARENT_AGENT` / `SWARM_TREE_PATH` from `os.environ`. Today this works because in-process MCP runs in the parent Python process; once OpenAI agents run concurrently in the same process, `os.environ` will leak between them. Thread `parent` and `tree_path` through the tool closure in `factory.py` (and `factory_openai.py` in Phase 2) instead. Latent bug fix that unblocks concurrent multi-runtime execution.
+@dataclass
+class Limits:
+    """Hard caps on an agent run. Resolved once from plan defaults + agent overrides."""
+    max_iterations: int = 30
+    max_cost_usd: float = 5.0
 
-5. **`swarm/runtime/executors/claude.py` (new)** — move existing `run_worker`/`run_manager` bodies here, collapse into a single `ClaudeExecutor.run(config, toolset, observer)`. Inside: build `ClaudeAgentOptions` from `toolset.code + ["mcp__swarm__" + t for t in toolset.coord]`, set `permission_mode="plan"` when `toolset.write_allowed=False`, pass `toolset.system_prompt`. Emit observer callbacks on each `AssistantMessage` / `ResultMessage`. Return `StepResult` instead of a loose dict.
+@dataclass(frozen=True)
+class AgentRequest:
+    """YAML-facing authoring shape. Produced by batch/input.py or by hand in live mode."""
+    name: str
+    prompt: str
+    profile: str | None = None              # references PROFILE_REGISTRY
+    runtime: Literal["claude","openai","mock"] | None = None
+    model: str | None = None
+    capabilities: frozenset[Capability] | None = None   # override profile capabilities
+    limits: Limits | None = None
+    check: str | None = None
+    depends_on: list[str] = field(default_factory=list)
+    env: dict[str, str] = field(default_factory=dict)
+    output_schema: dict | None = None       # for OpenAI structured output
+    parent: str | None = None               # set by scheduler for child agents
 
-6. **`swarm/runtime/executor.py` (thin dispatcher)** — keep the public functions `spawn_worker(config, use_mock)` and `spawn_manager(config)` so `scheduler.py` doesn't change. Internally they now:
-   - Build a `Toolset` for the worker/manager shape
-   - Look up `get_executor(config.runtime)` from the registry
-   - Create a `DBObserver(config.run_id)`
-   - Call `executor.run(config, toolset, observer)`
-   - Wrap in `asyncio.create_task` (preserving the current scheduler contract)
+@dataclass(frozen=True)
+class ResolvedAgent:
+    """Fully resolved, immutable snapshot handed to an Executor. No defaults fall-through."""
+    name: str
+    prompt: str
+    runtime: str
+    model: str
+    profile: AgentProfile
+    capabilities: frozenset[Capability]
+    limits: Limits
+    check: str
+    env: dict[str, str]
+    output_schema: dict | None
+    parent: str | None
+    tree_path: str                          # "root.mgr.worker-1"
+```
 
-7. **`swarm/models/specs.py`** — add `runtime: Literal["claude","openai"] = "claude"` to both `Defaults` and `AgentSpec`. Loosen `model` from `Literal["sonnet","opus","haiku"]` to `str | None`. Add `output_schema: dict | None = None` to `AgentSpec` (maps to OpenAI `output_type` in Phase 2; documented as ignored by Claude executor for now). Add `tools: list[str] | None = None` to `AgentSpec` (role override).
+### `core/profiles.py`
 
-8. **`swarm/models/specs.py` — default_model_for helper**:
-   ```python
-   def default_model_for(runtime: str) -> str:
-       return {"claude": "sonnet", "openai": "gpt-5"}.get(runtime, "sonnet")
-   ```
-   Used by `tools/manager.py:spawn_worker` (currently hardcodes `"sonnet"`) and `scheduler.py:216` (same).
+```python
+from dataclasses import dataclass, field
+from swarm.core.capabilities import Capability, DEFAULT_CODING_CAPS, READONLY_CAPS
 
-9. **`swarm/roles.py`** — add `tools: list[str] | None = None` and `read_only: bool = False` fields to `RoleTemplate`. Set `reviewer` role's `read_only=True` (maps to `["Read","Grep","Glob"]` code tools, `write_allowed=False` in Toolset). Defer filling in other roles until Phase 2.
+@dataclass(frozen=True)
+class AgentProfile:
+    name: str
+    description: str
+    prompt_preamble: str
+    capabilities: frozenset[Capability] = field(default_factory=frozenset)
+    coord_ops: frozenset[str] = field(default_factory=frozenset)   # which CoordOps this profile can call
+    default_model: str | None = None
+    default_check: str | None = None
+    read_only: bool = False
 
-10. **`swarm/storage/db.py` schema migration** — add three columns to `agents` table:
-    - `runtime TEXT NOT NULL DEFAULT 'claude'`
-    - `cost_source TEXT NOT NULL DEFAULT 'sdk'` — `"sdk"` for Claude (authoritative), `"estimated"` for OpenAI (computed from tokens in Phase 2). Avoids a later bug report.
-    - Rename `session_id` → `vendor_session_id`. **Don't migrate twice.** Update `insert_agent`, `get_agent`, and callers.
-    
-    Use an idempotent ALTER + `PRAGMA table_info` check so existing `.swarm/runs/*/swarm.db` files keep working.
+PROFILE_REGISTRY: dict[str, AgentProfile] = {}
 
-11. **`swarm/core/errors.py` (new)** — `SwarmExecutorError(message: str, retryable: bool = False, cost_so_far: float = 0.0)`. Normalize at the executor boundary so scheduler retry logic doesn't special-case vendor exception types.
+def register_profile(p: AgentProfile) -> None:
+    PROFILE_REGISTRY[p.name] = p
 
-12. **`swarm/runtime/scheduler.py:_spawn_agent()`** — read `runtime` from agent row, pass into `AgentConfig`. Use `default_model_for(runtime)` instead of hardcoded `"sonnet"` on line 216.
+def get_profile(name: str) -> AgentProfile:
+    return PROFILE_REGISTRY[name]
 
-13. **`swarm/runtime/executor.py:AgentConfig`** — add `runtime: str = "claude"` field.
+# Builtin profiles — the 7 roles collapse to profiles with explicit capabilities and coord_ops.
+# Reviewer becomes read-only-plus-shell (caps = FILE_READ | GLOB | GREP | SHELL, read_only=True)
+# so it can still run tests/linters. Manager becomes an `orchestrator` profile with
+# coord_ops = {spawn, status, respond, cancel, complete, pending_clarifications, mark_plan_complete}.
+# `implementer` is the default profile when an agent doesn't pick one.
+```
 
-### Critical files to read before editing
+The 7 existing role names (`architect`, `implementer`, `tester`, `reviewer`, `debugger`, `refactorer`, `documenter`) all port to profiles. `implementer` gets the default coding caps. Manager-style work is a new `orchestrator` profile with `coord_ops={"spawn","status","respond","complete"}` and full coding caps. The old `type: manager` field goes away.
 
-- `/Users/sour4bh/dev/swarm/swarm/runtime/executor.py` — source of `run_worker`/`run_manager` duplication that collapses into one method
-- `/Users/sour4bh/dev/swarm/swarm/runtime/scheduler.py` — lines 162–227 (`_spawn_agent`) and line 216 (hardcoded model default)
-- `/Users/sour4bh/dev/swarm/swarm/tools/worker.py` — return shape refactor + line 89 env leak
-- `/Users/sour4bh/dev/swarm/swarm/tools/manager.py` — return shape refactor + model default on line 25
-- `/Users/sour4bh/dev/swarm/swarm/tools/factory.py` — wrapping boundary for Claude content-block format
-- `/Users/sour4bh/dev/swarm/swarm/storage/db.py` — `insert_agent`, `update_agent_*` helpers; schema around lines 27–55
-- `/Users/sour4bh/dev/swarm/swarm/models/specs.py` — lines 22, 96 for model Literal; field additions
-- `/Users/sour4bh/dev/swarm/swarm/roles.py` — `RoleTemplate` around lines 6–14
-- `/Users/sour4bh/dev/swarm/tests/test_executor.py` — line 151 default assertion (`config.model == "sonnet"`)
-- `/Users/sour4bh/dev/swarm/tests/test_roles.py` — lines 27, 42 role-model assertions
+**Reviewer profile — confirmed read-only-plus-shell.** `reviewer` gets `read_only=True` and `capabilities = {FILE_READ, GLOB, GREP, SHELL}`. No `FILE_WRITE`, no `FILE_EDIT`. The `SHELL` capability is retained so a reviewer can run `pytest`, `ruff check`, `tsc --noEmit`, etc., to verify the code it's reviewing — that's the whole point of review, not just eyeballing diffs. `READONLY_CAPS` in `core/capabilities.py` is therefore `{FILE_READ, GLOB, GREP, SHELL}`, not `{FILE_READ, GLOB, GREP}`. If anyone wants a truly no-side-effect reviewer, they override `capabilities:` explicitly in the plan. This is the one intentional behavior change; today's reviewer has full coding caps.
 
-### Reused utilities
+### `core/execution.py`
 
-- `storage/db.py` helpers: `insert_event`, `update_agent_status`, `update_agent_iteration`, `update_agent_cost`, `insert_agent`, `get_agent` — all reused by `DBObserver`, no rewrites
-- `gitops/worktrees.py` — untouched in Phase 1; reused by Phase 3 live mode
-- `core/deps.py` — untouched; vendor-neutral
-- `io/parser.py`, `io/validation.py`, `io/plan_builder.py` — untouched; Pydantic auto-accepts new `runtime`/`output_schema`/`tools` fields
-- `tools/worker.py` and `tools/manager.py` function bodies — **logic** unchanged, only return types refactored
+```python
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Any, ClassVar, Literal
+from swarm.core.agent import ResolvedAgent
+from swarm.core.coordination import CoordinationBackend
+from swarm.core.events import EventSink
+from swarm.core.workspace import Workspace
 
-### Verification
+@dataclass
+class RunContext:
+    """Per-execution services handed to an adapter. Not stored; constructed fresh per run."""
+    run_id: str
+    workspace: Workspace
+    coord: CoordinationBackend
+    events: EventSink
+    cwd: str                    # resolved from workspace
 
-1. `pytest tests/` — all existing tests pass (the two brittle assertions at `test_executor.py:151` and `test_roles.py:27,42` continue to hold because defaults don't change)
-2. New test `tests/test_executor_registry.py`: construct `AgentConfig(runtime="claude", ...)`, call dispatch, assert the `ClaudeExecutor` instance was returned. Also test `runtime="openai"` raises `KeyError` (no OpenAI executor registered yet) — this is the contract gate for Phase 2.
-3. New test `tests/test_toolset.py`: assert `Toolset(write_allowed=False)` produces a code-tool list without `Write`/`Edit`/`Bash`, and that the Claude executor would set `permission_mode="plan"` for it (test via a mock observer, don't spawn a real client).
-4. Run existing `tests/sdklive/` smoke test against a real Claude API to confirm end-to-end batch execution still works. This is the gate before calling Phase 1 done.
-5. Run `swarm run -f tests/fixtures/simple-plan.yaml --mock` to confirm the CLI path still works.
+@dataclass
+class ExecutionResult:
+    status: Literal["completed","failed","timeout","cancelled","cost_exceeded"]
+    final_text: str
+    cost_usd: float
+    cost_source: Literal["sdk","estimated"]
+    vendor_session_id: str | None = None
+    structured_output: Any = None
+    files_modified: list[str] | None = None
+    error: str | None = None
 
-### Exit criteria
+class Executor(ABC):
+    runtime: ClassVar[str]
+    @abstractmethod
+    async def run(self, agent: ResolvedAgent, ctx: RunContext) -> ExecutionResult: ...
 
-- All existing unit tests green
-- New registry + toolset tests green
-- sdklive smoke test green with real Claude API
-- `--mock` CLI path works end-to-end
-- No new deps added
-- `git diff --stat` touches only the files listed in "Changes" above
+EXECUTOR_REGISTRY: dict[str, Executor] = {}
 
-## Phase 2 — OpenAI executor + code tool pack
+def register(executor: Executor) -> None:
+    EXECUTOR_REGISTRY[executor.runtime] = executor
 
-**Goal:** Second runtime shipped. Batch plans can mix `runtime: claude` and `runtime: openai` agents with dependencies between them.
+def get_executor(runtime: str) -> Executor:
+    if runtime not in EXECUTOR_REGISTRY:
+        raise KeyError(f"No executor registered for runtime={runtime}. Registered: {list(EXECUTOR_REGISTRY)}")
+    return EXECUTOR_REGISTRY[runtime]
+```
 
-### Changes (summary, details deferred to Phase 2 planning session)
+Two things to notice vs the earlier draft:
+- Executor takes `(agent, ctx)`, not `(config, toolset, observer)`. The agent is immutable and self-contained. The ctx carries everything mutable.
+- Manager vs worker vanishes as a distinction. An orchestrator profile that has `coord_ops={"spawn",...}` gets different coord tools wired up by the adapter, but it's still one `Executor.run` call.
 
-- New optional extra: `pip install -e ".[openai]"` → adds `openai-agents` + `openai`
-- `runtime/executors/openai.py` — wraps `Agent`/`Runner`. Budget enforcement: poll `RunResult.usage` after each turn, abort when exceeded. Cost = token count × price table (from `core/budget.py` — promoted in Phase 4, inlined here). `cost_source="estimated"`.
-- `tools/factory_openai.py` — wraps the same `tools/worker.py` / `tools/manager.py` functions with `@function_tool` instead of `@tool`. Thread `parent` / `tree_path` through closures (Phase 1 fix makes this clean).
-- `tools/openai_code.py` — `@function_tool` parity with Claude's built-ins: `read_file`, `edit_file`, `run_shell` (with sandbox-aware timeout), `grep`, `glob`. Respects `toolset.write_allowed=False` by skipping write/shell tools at construction time.
-- `roles.py` — fill in `read_only`/`tools` for the other 6 roles (explorer = read-only, implementer = full, etc.)
-- `core/errors.py` — catch `openai_agents.AgentError` / Runner exceptions, normalize to `SwarmExecutorError`
-- New `tests/sdklive/test_sdk_openai.py` — smoke test with real OpenAI key
-- New `tests/test_mixed_runtime_plan.py` — a plan with one claude agent and one openai agent, `depends_on: [claude_one]`, `--mock` for CI + live under `sdklive/`
-- Cancellation test: spawn OpenAI worker, cancel mid-flight, verify no leaked tasks
+### `core/coordination.py`
 
-### Phase 2 exit criteria
+```python
+from enum import Enum
+from typing import Any, Protocol
+from dataclasses import dataclass
 
-- `examples/plans/debt.yaml`, `examples/plans/review-3x.yaml`, `examples/plans/evolve.yaml` (the three mixed-vendor plans identified from user skills) all run to completion in mock + live modes
+class CoordOp(str, Enum):
+    # Worker-initiated
+    MARK_COMPLETE = "mark_complete"
+    REPORT_PROGRESS = "report_progress"
+    REPORT_BLOCKER = "report_blocker"
+    REQUEST_CLARIFICATION = "request_clarification"
+    # Orchestrator-initiated
+    SPAWN = "spawn"
+    STATUS = "status"
+    RESPOND = "respond"
+    CANCEL = "cancel"
+    PENDING_CLARIFICATIONS = "pending_clarifications"
+    MARK_PLAN_COMPLETE = "mark_plan_complete"
 
-## Phase 3 — Live mode
+@dataclass
+class CoordResult:
+    text: str
+    success: bool = True
+    data: dict | None = None
 
-**Goal:** `async def pipeline(steps)` and `async def handoff(a, b)` primitives that execute without YAML, scheduler, or SQLite ceremony — but *do* use worktrees (reused from `gitops/worktrees.py`).
+class CoordinationBackend(Protocol):
+    async def mark_complete(self, run_id: str, agent: str, summary: str) -> CoordResult: ...
+    async def report_progress(self, run_id: str, agent: str, status: str, milestone: str | None) -> CoordResult: ...
+    async def report_blocker(self, run_id: str, agent: str, issue: str, timeout: int) -> CoordResult: ...
+    async def request_clarification(self, run_id: str, agent: str, question: str, escalate_to: str, timeout: int) -> CoordResult: ...
+    async def spawn(self, run_id: str, parent: str, request: "AgentRequest") -> CoordResult: ...
+    async def status(self, run_id: str, parent: str, name: str | None) -> CoordResult: ...
+    async def respond(self, run_id: str, parent: str, clarification_id: str, response: str) -> CoordResult: ...
+    async def cancel(self, run_id: str, parent: str, name: str) -> CoordResult: ...
+    async def pending_clarifications(self, run_id: str, parent: str) -> CoordResult: ...
+    async def mark_plan_complete(self, run_id: str, agent: str, summary: str) -> CoordResult: ...
+    def supports(self, op: CoordOp) -> bool: ...
 
-### Changes (summary)
+    # Capability gate — live mode's InMemoryBackend returns False for SPAWN in v1.
+```
 
-- `runtime/live.py`:
+Two backends:
+- `batch/sqlite.py:SqliteCoordinationBackend` — writes to the new `nodes`/`attempts`/event tables.
+- `live/in_memory.py:InMemoryCoordinationBackend` — asyncio queues for request/reply; raises `NotSupportedError` on `spawn()` in v1.
+
+Coord tools in `adapters/claude/tools.py` and `adapters/openai/tools.py` are thin Claude/OpenAI SDK wrappers around `ctx.coord.<op>(...)`. The wrapper handles the SDK's content-block / function_tool conventions; the actual logic lives on the backend.
+
+### `core/events.py`
+
+```python
+from dataclasses import dataclass
+from typing import Literal, Protocol, Union
+
+@dataclass
+class AgentStarted:
+    run_id: str; agent: str; runtime: str
+
+@dataclass
+class IterationTick:
+    run_id: str; agent: str; iteration: int
+
+@dataclass
+class LogText:
+    run_id: str; agent: str; text: str
+
+@dataclass
+class CostUpdate:
+    run_id: str; agent: str; cost_usd: float; source: Literal["sdk","estimated"]
+
+@dataclass
+class CoordCall:
+    run_id: str; agent: str; op: str; payload: dict
+
+@dataclass
+class AgentCompleted:
+    run_id: str; agent: str; status: str; error: str | None
+
+SwarmEvent = Union[AgentStarted, IterationTick, LogText, CostUpdate, CoordCall, AgentCompleted]
+
+class EventSink(Protocol):
+    def emit(self, event: SwarmEvent) -> None: ...
+
+class NullSink:
+    def emit(self, event): pass
+
+class SqliteSink:
+    """Batch sink. Writes events to the events table AND forwards LogText to per-agent log files."""
+    def __init__(self, run_id: str, db_path: str, logs_dir: str): ...
+    def emit(self, event): ...
+
+class StdoutSink:
+    """Live sink. Prints events to stdout (or a user-provided writer)."""
+    def emit(self, event): ...
+```
+
+### `core/workspace.py`
+
+```python
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Protocol, Union
+
+@dataclass(frozen=True)
+class GitWorktree:
+    path: Path
+    branch: str
+    base_branch: str
+    workspace_id: str  # "wt-<uuid>"
+
+@dataclass(frozen=True)
+class Cwd:
+    path: Path
+    workspace_id: str  # "cwd"
+
+@dataclass(frozen=True)
+class TempDir:
+    path: Path
+    workspace_id: str  # "tmp-<uuid>"
+    # Cleanup handled by context manager
+
+Workspace = Union[GitWorktree, Cwd, TempDir]
+
+class WorkspaceProvider(Protocol):
+    async def allocate(self, run_id: str, agent_name: str) -> Workspace: ...
+    async def release(self, workspace: Workspace, keep: bool = False) -> None: ...
+```
+
+Three providers in `workspaces/`:
+- `workspaces/git.py:GitWorktreeProvider` — uses the existing `gitops/worktrees.py` logic, relocated.
+- `workspaces/cwd.py:CwdProvider` — returns `Cwd(Path.cwd(), "cwd")`. Zero isolation.
+- `workspaces/temp.py:TempDirProvider` — `tempfile.TemporaryDirectory()` wrapping.
+
+### `core/errors.py`
+
+```python
+class SwarmError(Exception): ...
+
+class SwarmExecutorError(SwarmError):
+    def __init__(self, message: str, retryable: bool = False, cost_so_far: float = 0.0):
+        super().__init__(message)
+        self.retryable = retryable
+        self.cost_so_far = cost_so_far
+
+class CoordinationNotSupported(SwarmError):
+    """Raised when a backend doesn't support a coord op (e.g., live mode + spawn)."""
+    def __init__(self, backend: str, op: str):
+        super().__init__(f"{backend} does not support {op}")
+        self.backend = backend
+        self.op = op
+
+class PlanValidationError(SwarmError): ...
+
+class WorkspaceError(SwarmError): ...
+```
+
+---
+
+## Batch schema (new shape)
+
+The old `agents` table mixed immutable config and mutable state. Split:
+
+```sql
+-- Immutable per-node config, one row per agent in the plan
+CREATE TABLE nodes (
+    run_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    plan_name TEXT NOT NULL,
+    runtime TEXT NOT NULL,          -- "claude" | "openai" | "mock"
+    profile TEXT NOT NULL,          -- references PROFILE_REGISTRY
+    model TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    check_command TEXT NOT NULL,
+    depends_on TEXT NOT NULL,       -- JSON list
+    max_iterations INTEGER NOT NULL,
+    max_cost_usd REAL NOT NULL,
+    parent TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (run_id, name)
+);
+
+-- Mutable execution state, one row per attempt (so retries preserve history)
+CREATE TABLE attempts (
+    attempt_id TEXT PRIMARY KEY,    -- uuid
+    run_id TEXT NOT NULL,
+    node_name TEXT NOT NULL,
+    attempt_number INTEGER NOT NULL,
+    status TEXT NOT NULL,           -- "pending" | "running" | "completed" | "failed" | "timeout" | "cancelled" | "cost_exceeded"
+    iteration INTEGER NOT NULL DEFAULT 0,
+    cost_usd REAL NOT NULL DEFAULT 0,
+    cost_source TEXT NOT NULL DEFAULT 'sdk',
+    vendor_session_id TEXT,
+    workspace_id TEXT,              -- FK to workspaces
+    error TEXT,
+    started_at TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (run_id, node_name) REFERENCES nodes(run_id, name)
+);
+
+-- Workspaces as their own entity (unblocks shared-workspace patterns)
+CREATE TABLE workspaces (
+    workspace_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    kind TEXT NOT NULL,             -- "worktree" | "cwd" | "tempdir"
+    path TEXT NOT NULL,
+    branch TEXT,                    -- null for cwd/tempdir
+    base_branch TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Event log for the EventSink
+CREATE TABLE events (
+    event_id TEXT PRIMARY KEY,      -- uuid
+    run_id TEXT NOT NULL,
+    agent TEXT,                     -- null for run-level events
+    event_type TEXT NOT NULL,
+    data TEXT NOT NULL,             -- JSON
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Coordination responses (replaces the clarification response table)
+CREATE TABLE coord_responses (
+    response_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    request_event_id TEXT NOT NULL,
+    response_text TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (request_event_id) REFERENCES events(event_id)
+);
+
+PRAGMA user_version = 1;
+```
+
+No migration path. `batch/sqlite.py` creates fresh schemas; if it detects an existing table structure at `user_version=0` (the old shape), it raises `SwarmError("Legacy run database detected. Run `swarm clean --all` first.")`. Pre-production; users have nothing to lose.
+
+---
+
+## Execution shape: one PR, seven commits
+
+One PR, a dependency-ordered stack of 7 commits, each a coherent boundary. **Commit discipline (confirmed): final commit only.** Intermediate commits are pure logical checkpoints — they may not even `python -c "import swarm"` cleanly, because the file moves and the call-site rewrites that chase them are deliberately split across commits to keep the diff reviewable. The final commit is the single all-green gate: `python -c "import swarm"` succeeds, `pytest tests/` is clean, the CLI smoke tests pass. Reviewers should read the PR top-to-bottom, not try to bisect mid-stack.
+
+This also resolves the commit-3 / commit-4 ordering nit from the earlier draft: commit 3 ships `batch/scheduler.py` with no real adapter registered yet and its tests would fail at that point; commit 4 lands `adapters/claude/` and re-enables them; commit 5 lands the mock adapter; everything turns green at commit 7.
+
+### Commit 1 — Package skeleton + `core/`
+
+Create the new directory tree. Create all `__init__.py` files. Create `core/` modules with the primitive definitions:
+- `core/agent.py` (`AgentRequest`, `ResolvedAgent`, `Limits`)
+- `core/profiles.py` (`AgentProfile`, `PROFILE_REGISTRY`, `register_profile`, `get_profile`, + 7 builtin profiles ported from `roles.py`)
+- `core/capabilities.py` (`Capability`, `CANONICAL_CAPABILITY_ORDER`, `DEFAULT_CODING_CAPS`, `READONLY_CAPS`)
+- `core/execution.py` (`Executor`, `RunContext`, `ExecutionResult`, `EXECUTOR_REGISTRY`, `register`, `get_executor`)
+- `core/coordination.py` (`CoordOp`, `CoordinationBackend`, `CoordResult`)
+- `core/events.py` (event ADT + `EventSink` + `NullSink`)
+- `core/workspace.py` (`Workspace`, `GitWorktree`, `Cwd`, `TempDir`, `WorkspaceProvider`)
+- `core/errors.py` (`SwarmError` hierarchy)
+
+`core/profiles.py` builtin profiles: `implementer` (default; full coding caps), `reviewer` (read-only-plus-shell: `{FILE_READ, GLOB, GREP, SHELL}`, `read_only=True`), `tester`, `architect`, `debugger`, `refactorer`, `documenter`, and a new `orchestrator` profile (full coding caps + `coord_ops={spawn, status, respond, cancel, pending_clarifications, mark_plan_complete, mark_complete}`).
+
+Commit 1 may not import cleanly on its own — `core/profiles.py` references `core/capabilities.py`, and the rest of the package still imports old paths. That's fine under the "final commit only" discipline.
+
+### Commit 2 — `workspaces/` + `batch/sqlite.py` schema
+
+Move the existing `gitops/worktrees.py` into `workspaces/git.py` as a `GitWorktreeProvider` wrapping the current logic. Add `workspaces/cwd.py` and `workspaces/temp.py`. Delete `swarm/gitops/worktrees.py`.
+
+Create `batch/sqlite.py` with the new 5-table schema (`nodes`, `attempts`, `workspaces`, `events`, `coord_responses`), path helpers (`get_run_dir`, `get_db_path`, `get_logs_dir`), and the `SqliteSink` event implementation. Delete `swarm/storage/db.py`, `swarm/storage/paths.py`.
+
+Create `batch/logs.py` with the per-agent log file helpers (ported from `storage/logs.py`, minus the unused `log_to_agent_file`).
+
+Create `batch/sqlite.py:SqliteCoordinationBackend` implementing the full `CoordinationBackend` protocol against the new tables. Ports the logic from `tools/worker.py` and `tools/manager.py` but writes to `nodes`/`attempts`/`events`/`coord_responses` instead of the old `agents` table.
+
+Tests: `tests/test_batch_sqlite.py` — schema smoke, each coord op round-trips.
+
+### Commit 3 — `batch/plan.py`, `batch/input.py`, `batch/dag.py`, `batch/scheduler.py`
+
+Move plan authoring + resolution + scheduling into `batch/`.
+- `batch/plan.py` — `PlanSpec`, `PlanDefaults`, and the resolution function that turns an `AgentRequest` + plan defaults into a `ResolvedAgent`.
+- `batch/input.py` — YAML parser, inline plan builder, validation (absorbs `io/parser.py`, `io/plan_builder.py`, `io/validation.py`).
+- `batch/dag.py` — dependency graph + topological sort (moves from `core/deps.py` — yes, core is too deep; it's a batch-only concern).
+- `batch/scheduler.py` — the poll loop, circuit breaker, stuck detection. Rewritten to use `get_executor(agent.runtime).run(agent, ctx)`, where `ctx.coord` is a `SqliteCoordinationBackend` and `ctx.events` is a `SqliteSink`. `_init_db` creates fresh nodes/workspaces rows from the resolved agents.
+
+Delete `swarm/runtime/scheduler.py`, `swarm/io/`, `swarm/core/deps.py`.
+
+Tests: `tests/test_batch_plan.py`, `tests/test_batch_input.py`, `tests/test_batch_dag.py`, `tests/test_batch_scheduler.py` (with a stub executor — no SDK deps).
+
+### Commit 4 — `adapters/claude/` (port existing Claude logic to new shape)
+
+- `adapters/claude/executor.py` — `ClaudeExecutor(Executor)` that takes `(agent, ctx)`, builds `ClaudeAgentOptions` from `agent.capabilities` (expanded via `adapters/claude/builtins.py`) and the coord wrappers from `adapters/claude/tools.py`, invokes `ClaudeSDKClient`, emits events to `ctx.events`, returns `ExecutionResult`.
+- `adapters/claude/builtins.py` — `CLAUDE_CAPABILITY_MAP` (the `FILE_READ → ["Read"]` / `FILE_WRITE → ["Write","Edit"]` / ... map) and `_expand_tools(caps)` using `CANONICAL_CAPABILITY_ORDER`.
+- `adapters/claude/tools.py` — `build_coord_server(ctx, coord_ops)` that builds an MCP server with `@tool`-wrapped closures around `ctx.coord.<op>(...)`. Handles the Claude content-block return format.
+- `adapters/claude/__init__.py` — `from . import executor; register(executor.ClaudeExecutor())`.
+
+Delete `swarm/runtime/executor.py`, `swarm/tools/worker.py`, `swarm/tools/manager.py`, `swarm/tools/factory.py`. Delete `swarm/runtime/` entirely.
+
+Note: `batch/merge.py` isn't touched yet in commit 4; it lands in commit 5. The `spawn_resolver` call site in the old `gitops/merge.py` is simply part of the code being deleted, not something commit 4 needs to preserve.
+
+Tests: `tests/adapters/test_claude_executor.py` with a mocked `ClaudeSDKClient`. `tests/sdklive/test_claude_integration.py` for a real API run through the full dispatcher.
+
+### Commit 5 — `adapters/openai/` + `adapters/mock/` + `batch/merge.py`
+
+- `adapters/openai/executor.py` — `OpenAIExecutor(Executor)` wrapping `agents.Agent` / `agents.Runner`. Budget enforcement as soft cap (poll `RunResult.usage` after each turn, compute cost from inline price table, `cost_source="estimated"`).
+- `adapters/openai/tools.py` — `build_coord_tools(ctx, coord_ops)` returning `@function_tool`-decorated closures around `ctx.coord.<op>(...)`.
+- `adapters/openai/code_tools.py` — `@function_tool` parity for `read_file`, `edit_file`, `run_shell`, `grep`, `glob`. Filters by the agent's capability set.
+- `adapters/openai/__init__.py` — `try: from . import executor; register(executor.OpenAIExecutor()); except ImportError: pass` so the base install works without the `openai-agents` extra.
+- `adapters/mock/executor.py` — `MockExecutor(Executor)` that just runs the `check` command in the workspace and reports success/failure. Replaces `run_worker_mock`.
+- `adapters/mock/__init__.py` — registers `MockExecutor`.
+
+`batch/merge.py` — moved from `gitops/merge.py`. `spawn_resolver` and its call sites are **deleted outright**. The `auto` merge strategy no longer attempts agent-driven conflict resolution; on conflict it raises `MergeConflictError` with a clear message instructing the user to run `swarm merge --strategy manual` and resolve by hand. Re-added as a follow-up PR once the scheduler exposes a stable "run a one-off sub-plan and wait" API. Update `--strategy` help text and the CLI error output to reflect this.
+
+Delete `swarm/gitops/` entirely after moving anything remaining into `batch/merge.py`.
+
+`pyproject.toml` — add `openai-agents` and `openai` to the `[project.optional-dependencies]` under a new `openai` extra.
+
+Tests: `tests/adapters/test_openai_executor.py` with mocked `Runner`. `tests/adapters/test_mock_executor.py`. `tests/sdklive/test_openai_integration.py` with a real API key. `tests/sdklive/test_mixed_runtime_plan.py` — one Claude + one OpenAI agent with `depends_on`.
+
+### Commit 6 — `live/` + `examples/`
+
+- `live/in_memory.py` — `InMemoryCoordinationBackend` using asyncio queues. `supports(CoordOp.SPAWN)` returns False; `spawn()` raises `CoordinationNotSupported`. Everything else (request/reply for `request_clarification`, etc.) works.
+- `live/pipeline.py`:
   ```python
   async def pipeline(
-      steps: list[AgentConfig],
-      workspace: Literal["worktree", "cwd", "tempdir"] = "worktree",
-      keep: bool = False,
-  ) -> list[StepResult]: ...
-  async def handoff(from_step: AgentConfig, to_step: AgentConfig, **kwargs) -> StepResult: ...
+      steps: list[AgentRequest],
+      workspace: Literal["cwd","worktree","tempdir"] = "cwd",   # default cwd — matches how skills and scripts run today
+      keep: bool = False,                                       # only meaningful for worktree/tempdir
+      event_sink: EventSink | None = None,                      # defaults to StdoutSink
+  ) -> list[ExecutionResult]: ...
+  async def handoff(a: AgentRequest, b: AgentRequest, **kwargs) -> ExecutionResult: ...
   ```
-  - `workspace="worktree"` (default) allocates under `.swarm/live/<uuid>/` via existing `gitops/worktrees.py`; cleaned up unless `keep=True`
-  - `workspace="cwd"` runs in `Path.cwd()` — fast, no isolation
-  - `workspace="tempdir"` uses `tempfile.TemporaryDirectory()` — ephemeral, no git history
-  - Live mode uses `NullObserver` — no SQLite
-  - Coordination tools that depend on SQLite (`request_clarification`, `report_blocker`) are gated out of live-mode toolsets. They're batch-only. Document this and raise if a live-mode agent tries to use them (toolset construction raises `ValueError("tool X requires batch mode")`).
-  - Managers (agents that spawn workers) are forbidden in live mode for Phase 3. Raise `NotImplementedError` + point to batch mode. Revisit in Phase 4+ with a live micro-scheduler.
-- `bridge/as_tool.py`:
+- `live/bridge.py` — two explicit helpers, no auto-detection:
   ```python
-  def as_claude_tool(agent: AgentConfig) -> Any: ...        # @tool
-  def as_openai_tool(agent: AgentConfig) -> Any: ...        # @function_tool
+  def as_claude_tool(agent: AgentRequest) -> Any: ...    # returns a Claude SDK @tool-decorated closure
+  def as_openai_tool(agent: AgentRequest) -> Any: ...    # returns an OpenAI Agents SDK @function_tool-decorated closure
   ```
-  Implementation: each wrapper spawns a `pipeline([agent])` call under the covers and returns `StepResult.final_text` (or `structured_output` if schema was set).
-- `examples/cross_check.py` — generator (Claude, runtime="claude") → reviewer (OpenAI, runtime="openai", `output_schema=ReviewFindings`). The hello world.
-- `examples/debt.py` — port the `debt` skill shape:
-  1. `git diff --name-only HEAD~1` to get changed files
-  2. Parallel Claude audit workers, one per file batch (read-only toolset)
-  3. OpenAI cross-reference with `output_schema=TechnicalDebtReport` that validates findings + adds new ones
-  4. Claude fixers on high+medium severity only
-  5. Verify with `pytest` + `ruff check`
-  Runs via `runtime/live.py` with `workspace="worktree"`.
+  Each closure runs a fresh nested `pipeline([agent])` when invoked, using the outer call's run context. Callers pick the target vendor explicitly — no union return type, no import-order magic.
+- `examples/cross_check.py` — Claude generator → OpenAI reviewer with a Pydantic `ReviewFindings` output schema.
+- `examples/debt.py` — port of the `debt` skill: `git diff HEAD~1` → parallel Claude audit (reviewer profile, read-only) → OpenAI cross-reference (structured `TechnicalDebtReport`) → Claude fixers on high+medium → verify with `pytest` + `ruff check`.
 
-### Phase 3 exit criteria
+Tests: `tests/live/test_pipeline.py` (mock adapters), `tests/live/test_bridge.py` (both `as_claude_tool` and `as_openai_tool` exercised with mocked SDKs), `tests/sdklive/test_cross_check_example.py`, `tests/sdklive/test_debt_example.py`.
 
-- `python examples/cross_check.py` produces a reviewed patch
-- `python examples/debt.py` on a seeded repo with a deliberate bug produces a fix
-- No SQLite files created during live runs
-- `bridge/as_tool.py` tests: wrap an OpenAI agent as a Claude `@tool`, call it from inside a Claude executor, verify StepResult comes back
+### Commit 7 — `cli.py` rewrite + test sweep + deletion pass
 
-## Phase 4 — Unification
+- `swarm/cli.py` — update all commands to the new paths:
+  - `swarm run -f plan.yaml` → `batch.input.parse_plan_file` → `batch.plan.resolve` → `batch.scheduler.run_plan`
+  - `swarm run -p "..."` → `batch.input.build_inline_plan`
+  - `swarm status [run_id] [--json]` → reads from `nodes` + `attempts` (latest attempt per node)
+  - `swarm logs <run_id> -a <agent>` → reads from `batch/logs.py` file helper
+  - `swarm merge <run_id>` → `batch.merge.merge_run`; `--strategy auto` errors on conflict with a `Run swarm merge --strategy manual` message (spawn_resolver is gone)
+  - `swarm cancel <run_id>` → writes cancel events, scheduler picks them up
+  - `swarm dashboard <run_id>` → live tail on events table
+  - `swarm clean [run_id] [--all]` → deletes run dirs
+  - `swarm db <run_id> [query]` → queries the new schema
+  - **`swarm roles [name]` is renamed to `swarm profiles [name]` as a clean break — no alias.** `swarm roles` is removed outright; any script or skill that used it breaks and must be updated. This is a known CLI break, called out in the PR description and the README changelog.
+  - `swarm resume <run_id>` — see resume semantics below.
+  - `swarm run ... --mock` selects the `mock` runtime via plan overrides (replaces the old mock code path).
 
-**Goal:** Telemetry, reporting, and the MCP bridge. These are nice-to-haves that wait until Phase 3 proves the abstractions.
+### Default runtime resolution
 
-### Changes (summary)
+When an agent doesn't specify `runtime:`, the scheduler resolves in this order:
+1. The plan's `defaults.runtime` if set
+2. The `SWARM_DEFAULT_RUNTIME` environment variable if set (`claude` | `openai` | `mock`)
+3. Hard fallback: `claude`
 
-- `core/tracing.py` — shared `run_id` → OTel setup. Install OTel trace processor into OpenAI Agents SDK (`add_trace_processor`). Enable Claude Code OTel via `OTEL_*` env vars in `ClaudeExecutor.run`. Both vendors' spans land in one backend.
-- `core/budget.py` — promote the price table + budget enforcement out of `executors/openai.py`. Shared across executors.
-- `cli.py` — new `swarm report <run_id>` command. Emits the "swarm optimization report" format from the user's `swarm-audit` skill Phase 7: per-agent utilization table, domain balance, triage efficiency, pipeline throughput, bottleneck analysis, suggested next-run config. swarm already logs events to SQLite; this is a query + formatter.
-- `bridge/mcp.py` — shared function registry → Claude in-process MCP server (via `create_sdk_mcp_server`) + OpenAI stdio MCP server (via `MCPServerStdio`). Promote only when ≥3 shared tools exist to justify the abstraction.
+Invalid values at any layer fail loudly with `PlanValidationError`. Tests cover all three layers plus the invalid-value path.
 
-## Out of scope (flagged for later)
+### Resume semantics
 
-- **Skill → plan YAML converter**: the user's skills are already structured multi-phase workflows. A future tool could ingest `SKILL.md` files and emit `PlanSpec` YAML. Makes swarm the runtime for the skill library. Phase 5+.
-- **Durable pause/resume with external hooks** (inspired by `workflow` skill's `createHook`): evolve `request_clarification` into a durable pause-and-resume primitive. Phase 5+.
-- **Manager agents in live mode**: forbidden in Phase 3, revisit with a live micro-scheduler.
+`swarm resume <run_id>` walks `nodes` for the run, and for each node inspects the latest `attempts` row (highest `attempt_number`):
+- status in {`completed`}: skip
+- status in {`pending`, `running`, `failed`, `timeout`, `cancelled`, `cost_exceeded`}: **insert a new `attempts` row** with `attempt_number = prev + 1`, `status='pending'`, fresh `workspace_id` (from a fresh allocation), `started_at=NULL`. The scheduler then picks it up like any other pending node.
+
+This unifies resume and retry under one mechanism — every execution is an attempt, history is preserved, and the audit trail across the new `attempts` table is clean. Cost and iteration counters reset to zero for the new attempt; the previous row's counters stay frozen as history.
+- Delete `swarm/roles.py`, `swarm/runtime/`, `swarm/tools/`, `swarm/models/`, `swarm/storage/`, `swarm/gitops/`, `swarm/io/`, `swarm/core/deps.py` (the file; `core/` the package stays) — anything that wasn't already deleted in earlier commits.
+- Sweep `tests/` — delete tests that reference the old modules (`test_executor.py`, `test_tools.py`, `test_scheduler.py` old version, `test_roles.py`, `test_db.py`, `test_git.py`, `test_merge.py`, `test_deps.py`, `test_parser.py`), replace with the new tests written in commits 2–6. Keep `test_cli.py` but rewrite to hit the new CLI paths.
+- Update `CLAUDE.md`, `README.md`, `PLAN.md` to reflect the new package layout.
+- Update `pyproject.toml` `[tool.hatch.build.targets.wheel]` packages list.
+
+Tests: `pytest tests/` — all green. `pytest tests/sdklive/` — green with both API keys.
+
+---
+
+## Deletion list (for reference)
+
+Modules deleted outright:
+- `swarm/runtime/executor.py` (AgentConfig → ResolvedAgent+RunContext; run_worker/run_manager/spawn_worker/spawn_manager → Executor.run)
+- `swarm/runtime/scheduler.py` (moved to `batch/scheduler.py`, rewritten for new coord backend)
+- `swarm/runtime/` (whole directory)
+- `swarm/tools/worker.py`, `swarm/tools/manager.py`, `swarm/tools/factory.py`, `swarm/tools/__init__.py` (moved to adapter subpackages and coord backend)
+- `swarm/tools/` (whole directory)
+- `swarm/models/specs.py`, `swarm/models/state.py` (`state.py` was unused; `specs.py` split between `core/agent.py` and `batch/plan.py`)
+- `swarm/models/` (whole directory)
+- `swarm/storage/db.py`, `swarm/storage/paths.py`, `swarm/storage/logs.py` (moved to `batch/sqlite.py` and `batch/logs.py`)
+- `swarm/storage/` (whole directory)
+- `swarm/gitops/worktrees.py`, `swarm/gitops/merge.py` (moved to `workspaces/git.py` and `batch/merge.py`)
+- `swarm/gitops/` (whole directory)
+- `swarm/io/parser.py`, `swarm/io/plan_builder.py`, `swarm/io/validation.py` (collapsed into `batch/input.py`)
+- `swarm/io/` (whole directory)
+- `swarm/roles.py` (moved to `core/profiles.py`, 7 roles become profiles)
+- `swarm/core/deps.py` (moved to `batch/dag.py`)
+
+Fields / concepts deleted from the public surface:
+- `session_id` column (was never persisted back; adapters return `vendor_session_id` on `ExecutionResult` but it's not stored)
+- `AgentSpec.type: Literal["worker","manager"]` (manager is now a profile with `spawn` coord ops)
+- `Toolset.kind` (never existed; would have been introduced by the earlier draft)
+- `RunConfig`, `Milestone`, `ManagerSettings` (all defined in `models/specs.py` but unused by the runtime)
+- `event_injection` field, `on_complete` field (unused)
+- `run_worker_mock` (replaced by `MockExecutor`)
+- `gitops/merge.py:spawn_resolver` — **dropped entirely** from the `auto` merge strategy. On conflict, `swarm merge --strategy auto` raises a clean `MergeConflictError` pointing the user to `--strategy manual`. Re-added in a follow-up PR once the scheduler exposes a one-off-sub-plan API.
+- `storage/logs.py:log_to_agent_file` (unused)
+- All DB migration code — fresh schemas only; legacy DBs fail fast with a clean-up instruction
+
+---
+
+## Verification
+
+**No per-commit gate** (confirmed). Intermediate commits may not import and their tests may fail — the stack is graded as a whole.
+
+**Final PR gate** (all must be green before merge):
+
+- [ ] `pytest tests/` — all tests pass under the new layout
+- [ ] `pytest tests/sdklive/` — with `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` set
+- [ ] `swarm run -f test-plan.yaml --mock` — mock CLI path works end-to-end (uses `MockExecutor`)
+- [ ] `swarm run -p "test: true"` — inline plan, default runtime resolves to `claude` via the env-var fallback chain
+- [ ] `SWARM_DEFAULT_RUNTIME=openai swarm run -p "test: true"` — env var flips the default
+- [ ] `swarm run -p "audit: Find bugs" -p "review: ..." --sequential` — inline sequential plan works
+- [ ] `swarm status`, `swarm logs`, `swarm merge`, `swarm clean`, `swarm dashboard`, `swarm profiles` — all CLI commands work under the new paths
+- [ ] `swarm roles` — errors with "unknown command" (rename confirmed, no alias)
+- [ ] `swarm resume <run_id>` — inserts a fresh `attempts` row per incomplete node (`attempt_number = prev + 1`) and completes the run
+- [ ] `swarm merge <run_id> --strategy auto` on a conflict — raises `MergeConflictError` with the manual-resolution instruction
+- [ ] A `reviewer`-profile agent can successfully run `pytest` and `ruff check` in its workspace (shell capability retained)
+- [ ] A `reviewer`-profile agent attempting `Write` or `Edit` gets a capability-denied error
+- [ ] `live.pipeline([...])` with no `workspace=` kwarg runs against `cwd` (default)
+- [ ] `live.as_claude_tool(req)` and `live.as_openai_tool(req)` both produce wrappers that round-trip through their respective SDKs in the bridge tests
+- [ ] `python examples/cross_check.py` — produces a reviewed patch via live mode
+- [ ] `python examples/debt.py` — on a seeded repo with a deliberate bug, produces a fix
+- [ ] `pip install -e .` (without the openai extra) — base install works, `from swarm.adapters import claude` succeeds, `from swarm.adapters import openai` raises ImportError cleanly
+- [ ] `pip install -e ".[openai]"` — OpenAI adapter loads, mixed-runtime plan runs end-to-end
+- [ ] `grep -rn "from swarm.runtime\|from swarm.tools\|from swarm.models\|from swarm.storage\|from swarm.gitops\|from swarm.io\|from swarm.roles" swarm/ tests/` — zero matches (nothing left importing the old paths)
+- [ ] `grep -rn "session_id" swarm/ --include='*.py'` — zero matches (column gone)
+- [ ] `grep -rn "os.environ.get.*SWARM_PARENT\|os.environ.get.*SWARM_TREE" swarm/` — zero matches (env leak fixed by passing via `ResolvedAgent`/`RunContext`)
+- [ ] `grep -rn "AgentConfig\|run_worker\|run_manager\|spawn_worker_mock\|run_worker_mock" swarm/` — zero matches
+- [ ] A legacy `.swarm/runs/*/swarm.db` file triggers a clean `SwarmError` with instructions to `swarm clean --all`, not a cryptic SQL error
+- [ ] README tagline and `CLAUDE.md` both reflect "Claude + OpenAI"
+
+---
+
+## Out of scope (explicit deferrals)
+
+- **Cross-vendor OTel tracing unification.** Nice to have. OpenAI SDK ships with tracing by default; Claude exports OTel via env vars. Wiring a shared `run_id` across both is additive and can land in a follow-up PR without structural changes.
+- **`swarm report <run_id>` command.** The optimization report from the user's `swarm-audit` skill Phase 7 (per-agent utilization, bottlenecks, suggested next-run config). Pure query on the events table. Follow-up PR.
+- **MCP bridge** — shared function registry exposed as Claude in-process MCP and OpenAI stdio MCP. Only pays off once swarm has concrete shared tools to justify it. Follow-up PR, minimum 3 shared tools first.
+- **Skill → plan YAML converter.** Parse `~/.claude/skills/*.md` and emit a `PlanSpec` YAML. Standalone script; not blocked by this refactor.
+- **Durable pause/resume with external hooks** (Vercel `createHook`-style). Evolve `request_clarification` into a durable primitive. Non-trivial; follow-up.
+- **Manager-in-live-mode.** The in-memory backend simply doesn't implement `CoordOp.SPAWN` in v1. When someone needs it, add a micro-scheduler to `live/in_memory.py`. Not architecturally forbidden; just unimplemented.
+- **`core/budget.py` as a shared price table.** Inlined into `adapters/openai/executor.py` for now. Promote to a shared module only once Phase 1 ships and we actually need it from two places.
+- **Retry semantics rewrite.** The new `attempts` table unblocks multi-attempt history, but this PR keeps the existing retry policy (`on_failure: retry` + `retry_count`). A future PR can add richer retry strategies.
+
+---
 
 ## Naming
 
-Keep `swarm`. The name is generic enough that adding OpenAI support reinforces it (OpenAI's original multi-agent project was also called Swarm). Update the README tagline from "Multi-agent orchestration for Claude Code" to "Multi-agent orchestration for coding agents (Claude + OpenAI)". No rename, no pyproject churn, no CLI break.
+Keep `swarm`. Update README tagline from "Multi-agent orchestration for Claude Code" to "Multi-agent orchestration for coding agents (Claude + OpenAI)". No rename, no pyproject churn, no CLI break — but every CLI command that previously said "agent" may need to say "node" or vice versa as the new `nodes`/`attempts` vocabulary lands. Use "agent" for user-facing docs (`swarm run --agent foo`), "node" only in DB schema and internal code.
 
-## Execution order
+---
 
-Work branch: `feat/multi-runtime`. One PR per phase. Phase 1 is the only one where the internal plumbing changes in a way that requires care; Phases 2–4 are additive.
+## Risks
 
-Start with Phase 1. Phase 1 includes the tool-return-type refactor (critical — don't defer). Exit criteria are strict: all existing tests green + new registry/toolset tests + sdklive smoke test + `--mock` CLI path. Only then start Phase 2.
+- **Intermediate commits may not import or pass tests.** Confirmed acceptable — the stack is graded as a whole at commit 7. The PR description must call this out explicitly so reviewers don't `git checkout` a middle commit and panic.
+- **The `AgentRequest` → `ResolvedAgent` resolution is load-bearing.** If resolution fails (unknown profile, bad default runtime, capability/profile mismatch), it must fail at plan-load time with a clear `PlanValidationError`, not mid-run. Cover with tests.
+- **`swarm roles` → `swarm profiles` is a hard break.** Anything scripting the old command (user skills, CI) breaks. Mitigation: call it out prominently in README and commit 7's commit message; cheap for the user since the migration is a one-word find/replace.
+- **The `MockExecutor` replacing `run_worker_mock` needs to reproduce the current `--mock` CLI semantics exactly** (runs the `check` command, reports based on exit code, writes a fake cost of 0.0). Users rely on this for CI dry-runs.
+- **`core/` accreting too much**. The temptation is to put everything vendor-neutral in `core/`. Resist: `core/` should hold cross-mode contracts only. DB-backed things go in `batch/`, in-memory things go in `live/`.
+- **Import cycles**. `core/profiles.py` references `core/capabilities.py`. `adapters/claude/tools.py` references `core/coordination.py`. Keep the dependency graph one-way: `core → nothing; adapters → core; batch → core, workspaces; live → core, workspaces; cli → batch, live`. No back-references.
+- **Test churn is large.** Most tests in `tests/` get rewritten or replaced. Budget for it; the old tests are tightly coupled to the old module structure.
+
+---
+
+## Execution notes
+
+- Work branch: `feat/multi-runtime`. One PR with 7 commits as described above.
+- PR title: `Multi-runtime restructure: Claude + OpenAI + live mode`.
+- PR description: link this plan file (the canonical location `~/dev/swarm/.claude/plans/gleaming-cuddling-pike.md`), list the 7 commits with a one-line summary each, and document the four intentional breaks: (1) `reviewer` profile becomes read-only-plus-shell (no write/edit); (2) `swarm roles` is renamed to `swarm profiles` with no alias; (3) `swarm merge --strategy auto` no longer spawns a resolver agent on conflict and errors with a manual-resolution hint; (4) managers are forbidden in live mode v1 (in-memory backend returns False for `CoordOp.SPAWN`).
+- **Pre-execution TODO**: create the branch, sync the plan file into the repo (`cp ~/.claude/plans/gleaming-cuddling-pike.md ~/dev/swarm/.claude/plans/gleaming-cuddling-pike.md`), then start commit 1.
