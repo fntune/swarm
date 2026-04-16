@@ -20,11 +20,20 @@ coordination backend / executor):
 ```bash
 # Development
 pip install -e .
+pip install -e ".[sdk]"        # add Claude Agent SDK
 pip install -e ".[openai]"     # add OpenAI Agents SDK
+pip install -e ".[dev]"        # both SDKs + pytest + pytest-asyncio
 swarm --help
 
 # Testing
 pytest tests/
+pytest tests/test_batch_scheduler.py -xvs                     # one file
+pytest tests/test_batch_scheduler.py::test_retry -xvs         # one test
+# tests/sdklive/ are manual integration scripts (real API calls) — run
+# with `python tests/sdklive/test_sdk_live.py`, not pytest.
+
+# Type checking
+pyright swarm/
 
 # Core CLI
 swarm run -f plan.yaml                          # Execute plan spec
@@ -32,7 +41,7 @@ swarm run -p "auth: Impl auth"                  # Inline single agent
 swarm run -p "a: step1" -p "b: step2" --sequential
 swarm run --run-id <id> -p "..."                # Explicit run ID
 swarm run --resume --run-id <id>                # Resume existing run
-swarm run -p "test: noop" --mock                # Force mock runtime + cwd workspace
+swarm run -p "test: noop" --mock                # Dev-only: forces mock runtime + cwd workspace (bypasses isolation, overrides plan runtimes)
 swarm run -f plan.yaml --workspace tempdir      # Override workspace
 
 swarm resume <run_id>                           # Resume alias
@@ -84,7 +93,18 @@ swarm/
     ├── git.py              # GitWorktreeProvider + low-level git helpers
     ├── cwd.py              # CwdProvider — zero isolation
     └── temp.py             # TempDirProvider — throwaway tempdir
+
+examples/
+├── cross_check.py          # Claude generator → OpenAI reviewer pipeline
+└── debt.py                 # Minimal tech-debt audit (reviewer → cross-ref)
+
+tests/
+├── test_*.py               # Unit tests (pytest)
+└── sdklive/                # Manual integration scripts (real API calls)
 ```
+
+`WARP.md` mirrors this file for the Warp terminal's agent — keep the two
+in sync when editing project instructions.
 
 ## Key Concepts
 
