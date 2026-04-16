@@ -143,22 +143,15 @@ class OpenAIExecutor(Executor):
                 iterations=int(iterations),
             )
 
-        from swarm.batch.sqlite import get_db, latest_attempt
-
-        with get_db(ctx.run_id) as db:
-            attempt = latest_attempt(db, ctx.run_id, agent.name)
-        attempt_status = attempt["status"] if attempt else None
+        attempt_status = _read_attempt_status(ctx, agent.name)
 
         if attempt_status == "completed":
             status = "completed"
             error = None
         elif attempt_status in ("failed", "timeout", "cancelled", "cost_exceeded"):
             status = attempt_status
-            error = attempt["error"] if attempt else None
+            error = None
         else:
-            # OpenAI agents return final output without needing mark_complete,
-            # so treat a clean Runner.run as completed unless the backend says
-            # otherwise.
             status = "completed"
             error = None
 
@@ -171,3 +164,18 @@ class OpenAIExecutor(Executor):
             error=error,
             iterations=int(iterations),
         )
+
+
+def _read_attempt_status(ctx: RunContext, agent_name: str) -> str | None:
+    try:
+        from swarm.batch.sqlite import get_db, latest_attempt
+
+        with get_db(ctx.run_id) as db:
+            attempt = latest_attempt(db, ctx.run_id, agent_name)
+        return attempt["status"] if attempt else None
+    except Exception:  # noqa: BLE001
+        pass
+
+    if hasattr(ctx.coord, "get_status"):
+        return ctx.coord.get_status(ctx.run_id, agent_name)
+    return None

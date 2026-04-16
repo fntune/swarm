@@ -43,7 +43,6 @@ from swarm.batch.sqlite import (
     insert_node,
     insert_workspace,
     latest_attempt,
-    mark_attempt_started,
     open_db,
     run_exists,
     update_attempt_cost,
@@ -121,6 +120,7 @@ class Scheduler:
         self.coord = SqliteCoordinationBackend(base_path=self.base_path)
         self.events: EventSink = SqliteSink(self.run_id, self.base_path)
         self.in_flight: dict[str, _AttemptHandle] = {}
+        self._allocated_workspaces: list[Workspace] = []
         self.failure_count = 0
         self.idle_iterations = 0
         self.last_event_count = 0
@@ -208,6 +208,7 @@ class Scheduler:
 
     async def _allocate_workspace(self, agent_name: str) -> Workspace:
         workspace = await self.workspace_provider.allocate(self.run_id, agent_name)
+        self._allocated_workspaces.append(workspace)
         kind = _workspace_kind(workspace)
         branch = getattr(workspace, "branch", None)
         base_branch = getattr(workspace, "base_branch", None)
@@ -401,7 +402,6 @@ class Scheduler:
                 (workspace.workspace_id, row["attempt_id"]),
             )
             db.commit()
-            mark_attempt_started(db, row["attempt_id"])
 
         prompt = self._build_prompt(agent, row["attempt_number"])
         dispatch_agent = dataclasses.replace(agent, prompt=prompt)
@@ -689,11 +689,12 @@ class Scheduler:
     # ------------------------------------------------------------------
 
     async def _release_all_workspaces(self, keep: bool) -> None:
-        for handle in self.in_flight.values():
+        for workspace in self._allocated_workspaces:
             try:
-                await self.workspace_provider.release(handle.workspace, keep=keep)
+                await self.workspace_provider.release(workspace, keep=keep)
             except Exception:  # noqa: BLE001
                 logger.debug("workspace release failed", exc_info=True)
+        self._allocated_workspaces.clear()
 
     def _build_result(self) -> SchedulerResult:
         completed: list[str] = []

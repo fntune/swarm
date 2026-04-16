@@ -126,20 +126,18 @@ class ClaudeExecutor(Executor):
                 iterations=iteration,
             )
 
-        # The coord backend marks the attempt completed/failed via mark_complete;
-        # we surface the attempt status so the scheduler doesn't double-update.
-        from swarm.batch.sqlite import get_db, latest_attempt
-
-        with get_db(ctx.run_id) as db:
-            attempt = latest_attempt(db, ctx.run_id, agent.name)
-        attempt_status = attempt["status"] if attempt else "unknown"
+        # The coord backend marks the attempt completed/failed via mark_complete.
+        # In batch mode the attempts table is the source of truth; in live mode
+        # there's no DB, so we fall back to the InMemoryCoordinationBackend's
+        # in-process status (or a safe default).
+        attempt_status = _read_attempt_status(ctx, agent.name)
 
         if attempt_status == "completed":
             status = "completed"
             error = None
         elif attempt_status in ("failed", "timeout", "cancelled", "cost_exceeded"):
             status = attempt_status
-            error = attempt["error"] if attempt else None
+            error = None
         else:
             status = "timeout"
             error = "Max iterations without completion"
@@ -153,3 +151,22 @@ class ClaudeExecutor(Executor):
             error=error,
             iterations=iteration,
         )
+
+
+def _read_attempt_status(ctx: RunContext, agent_name: str) -> str | None:
+    """Read the attempt status from the batch DB if available.
+
+    Returns None when the DB doesn't exist or isn't initialized (live mode).
+    """
+    try:
+        from swarm.batch.sqlite import get_db, latest_attempt
+
+        with get_db(ctx.run_id) as db:
+            attempt = latest_attempt(db, ctx.run_id, agent_name)
+        return attempt["status"] if attempt else None
+    except Exception:  # noqa: BLE001
+        pass
+
+    if hasattr(ctx.coord, "get_status"):
+        return ctx.coord.get_status(ctx.run_id, agent_name)
+    return None

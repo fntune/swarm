@@ -19,6 +19,7 @@ from swarm.core.agent import AgentRequest, ResolvedAgent
 from swarm.core.events import (
     AgentCompleted,
     AgentStarted,
+    CoordCall,
     CostUpdate,
     EventSink,
     IterationTick,
@@ -50,6 +51,8 @@ class StdoutSink:
             print(
                 f"[cost]    {event.agent}  ${event.cost_usd:.4f} ({event.source})"
             )
+        elif isinstance(event, CoordCall):
+            print(f"[coord]   {event.agent}  {event.op}")
         elif isinstance(event, LogText):
             text = event.text.strip()
             if text:
