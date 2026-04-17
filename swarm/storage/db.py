@@ -48,6 +48,8 @@ CREATE TABLE IF NOT EXISTS agents (
     retry_count INTEGER DEFAULT 3,
     retry_attempt INTEGER DEFAULT 0,
     last_error TEXT,
+    env TEXT,
+    max_subagents INTEGER,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (run_id, name),
@@ -159,13 +161,16 @@ def insert_agent(
     plan_name: str | None = None,
     on_failure: str = "continue",
     retry_count: int = 3,
+    env: dict[str, str] | None = None,
+    max_subagents: int | None = None,
 ) -> None:
     """Insert an agent record."""
     db.execute(
         """INSERT INTO agents (
             run_id, name, plan_name, type, prompt, check_command, model,
-            max_iterations, max_cost_usd, depends_on, parent, on_failure, retry_count
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            max_iterations, max_cost_usd, depends_on, parent, on_failure, retry_count,
+            env, max_subagents
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             run_id,
             name,
@@ -180,6 +185,8 @@ def insert_agent(
             parent,
             on_failure,
             retry_count,
+            json.dumps(env) if env else None,
+            max_subagents,
         ),
     )
     db.commit()
@@ -451,7 +458,7 @@ def get_retryable_agents(db: sqlite3.Connection, run_id: str) -> list[sqlite3.Ro
     return db.execute(
         """SELECT * FROM agents
            WHERE run_id = ? AND status = 'failed'
-           AND on_failure = 'retry' AND retry_attempt < retry_count""",
+           AND on_failure = 'retry' AND retry_attempt <= retry_count""",
         (run_id,),
     ).fetchall()
 
@@ -477,7 +484,11 @@ def reset_failed_agents(db: sqlite3.Connection, run_id: str) -> list[str]:
     Returns list of agent names that were reset.
     """
     agents = db.execute(
-        "SELECT name FROM agents WHERE run_id = ? AND status IN ('failed', 'timeout')",
+        """SELECT name FROM agents
+           WHERE run_id = ?
+             AND status IN ('failed', 'timeout')
+             AND on_failure = 'retry'
+             AND retry_attempt <= retry_count""",
         (run_id,),
     ).fetchall()
 
@@ -487,7 +498,10 @@ def reset_failed_agents(db: sqlite3.Connection, run_id: str) -> list[str]:
         db.execute(
             """UPDATE agents SET status = 'pending', error = NULL, iteration = 0,
                updated_at = CURRENT_TIMESTAMP
-               WHERE run_id = ? AND status IN ('failed', 'timeout')""",
+               WHERE run_id = ?
+                 AND status IN ('failed', 'timeout')
+                 AND on_failure = 'retry'
+                 AND retry_attempt <= retry_count""",
             (run_id,),
         )
         db.commit()
@@ -502,4 +516,6 @@ def list_runs(base_path: Path | None = None) -> list[str]:
     runs_dir = base / ".swarm" / "runs"
     if not runs_dir.exists():
         return []
-    return sorted([d.name for d in runs_dir.iterdir() if d.is_dir()], reverse=True)
+    run_dirs = [d for d in runs_dir.iterdir() if d.is_dir()]
+    run_dirs.sort(key=lambda d: (d.stat().st_mtime, d.name), reverse=True)
+    return [d.name for d in run_dirs]

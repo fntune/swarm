@@ -310,12 +310,20 @@ def cleanup_run_worktrees(run_id: str, repo_path: Path | None = None) -> None:
     """Clean up all worktrees and branches for a run."""
     repo = repo_path or Path.cwd()
     worktrees = list_worktrees(repo)
-    expected_prefix = str(get_worktrees_dir(run_id, repo))
+    expected_root = get_worktrees_dir(run_id, repo).resolve()
 
-    # Remove worktrees
+    # Remove worktrees (match by resolved path ancestry, not substring,
+    # so run ids that share a prefix do not collide)
     for wt in worktrees:
-        if expected_prefix in wt.get("path", ""):
-            remove_worktree(Path(wt["path"]), repo)
+        raw_path = wt.get("path")
+        if not raw_path:
+            continue
+        try:
+            wt_path = Path(raw_path).resolve()
+        except OSError:
+            continue
+        if wt_path == expected_root or expected_root in wt_path.parents:
+            remove_worktree(Path(raw_path), repo)
 
     # Delete branches
     result = run_git(["branch", "--list", f"swarm/{run_id}/*"], cwd=repo, check=False)

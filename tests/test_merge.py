@@ -179,6 +179,26 @@ def test_merge_run_on_conflict_fail(temp_swarm_dir):
     assert result["resolved"] == []
 
 
+def test_merge_run_conflict_does_not_mark_agent_merged(temp_swarm_dir, monkeypatch):
+    """merge_run should treat False from merge_branch_to_current as a conflict."""
+    run_id = "test-merge-conflict"
+    db = init_db(run_id)
+    insert_plan(db, run_id, "test", "completed", "name: test")
+    insert_agent(db, run_id, "agent1", "Task 1")
+    update_agent_status(db, run_id, "agent1", "completed")
+    db.execute("UPDATE agents SET branch = ? WHERE run_id = ? AND name = ?", ("swarm/test/agent1", run_id, "agent1"))
+    db.commit()
+    db.close()
+
+    monkeypatch.setattr("swarm.gitops.merge.merge_branch_to_current", lambda branch: False)
+    monkeypatch.setattr("swarm.gitops.merge.get_conflict_files", lambda: ["conflicted.py"])
+
+    result = merge_run(run_id, cleanup=False, on_conflict="fail")
+
+    assert result["merged"] == []
+    assert result["failed"] == [{"name": "agent1", "error": "conflict", "files": ["conflicted.py"]}]
+
+
 def test_get_conflict_files_no_conflicts(git_repo, monkeypatch):
     """Test get_conflict_files when no conflicts exist."""
     from swarm.gitops.merge import get_conflict_files

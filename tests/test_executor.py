@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from swarm.storage.db import get_agent, init_db, insert_agent, open_db, update_agent_status
-from swarm.runtime.executor import AgentConfig, build_system_prompt, run_worker_mock
+from swarm.runtime.executor import AgentConfig, build_manager_system_prompt, build_system_prompt, run_worker_mock
 
 
 @pytest.fixture
@@ -35,6 +35,18 @@ def test_agent_config_tree_path():
         worktree=Path("/tmp/test"),
     )
     assert config_no_parent.tree_path() == "root"
+
+
+def test_agent_config_tree_path_does_not_duplicate_parent_prefix():
+    """Manager-spawned workers already use fully qualified names."""
+    config = AgentConfig(
+        name="manager.child",
+        run_id="run-1",
+        prompt="Test",
+        worktree=Path("/tmp/test"),
+        parent="manager",
+    )
+    assert config.tree_path() == "manager.child"
 
 
 def test_build_system_prompt():
@@ -68,6 +80,22 @@ def test_build_system_prompt_no_shared_context():
 
     assert "Do something" in prompt
     assert "true" in prompt  # default check command
+
+
+def test_build_manager_system_prompt_includes_shared_context():
+    """Manager prompts should receive shared context too."""
+    config = AgentConfig(
+        name="manager",
+        run_id="run-1",
+        prompt="Coordinate work",
+        worktree=Path("/tmp/test"),
+        shared_context="Shared design notes.",
+    )
+
+    prompt = build_manager_system_prompt(config)
+
+    assert "Coordinate work" in prompt
+    assert "Shared design notes." in prompt
 
 
 @pytest.mark.asyncio

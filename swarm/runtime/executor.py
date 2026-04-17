@@ -51,7 +51,7 @@ class AgentConfig:
 
     def tree_path(self) -> str:
         """Get full hierarchy path."""
-        if self.parent:
+        if self.parent and not self.name.startswith(f"{self.parent}."):
             return f"{self.parent}.{self.name}"
         return self.name
 
@@ -86,6 +86,26 @@ Important:
 - Focus only on the assigned task
 - Commit your changes frequently
 - If you encounter a blocker, describe it clearly
+
+{config.shared_context}
+"""
+
+
+def build_manager_system_prompt(config: AgentConfig) -> str:
+    """Build system prompt for manager agent."""
+    return f"""You are a manager agent coordinating worker agents.
+
+Task: {config.prompt}
+
+Your tools:
+- spawn_worker: Create new workers to handle subtasks
+- get_worker_status: Check worker progress
+- get_pending_clarifications: See worker questions
+- respond_to_clarification: Answer worker questions
+- cancel_worker: Stop a worker
+- mark_plan_complete: Signal when done (all workers must be complete first)
+
+Orchestrate the work, respond to clarifications, and call mark_plan_complete when finished.
 
 {config.shared_context}
 """
@@ -243,20 +263,7 @@ async def run_manager(config: AgentConfig) -> dict:
             model=config.model,
             max_turns=config.max_iterations,
             permission_mode="bypassPermissions",
-            system_prompt=f"""You are a manager agent coordinating worker agents.
-
-Task: {config.prompt}
-
-Your tools:
-- spawn_worker: Create new workers to handle subtasks
-- get_worker_status: Check worker progress
-- get_pending_clarifications: See worker questions
-- respond_to_clarification: Answer worker questions
-- cancel_worker: Stop a worker
-- mark_plan_complete: Signal when done (all workers must be complete first)
-
-Orchestrate the work, respond to clarifications, and call mark_plan_complete when finished.
-""",
+            system_prompt=build_manager_system_prompt(config),
         )
 
         logger.info(f"Starting manager {config.name} in {config.worktree}")

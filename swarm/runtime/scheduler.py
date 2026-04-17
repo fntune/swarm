@@ -30,6 +30,7 @@ from swarm.storage.db import (
     update_plan_status,
 )
 from swarm.runtime.executor import AgentConfig, spawn_manager, spawn_worker
+from swarm.runtime import task_registry
 from swarm.gitops.worktrees import create_worktree, setup_worktree_with_deps
 from swarm.models.specs import PlanSpec
 from swarm.io.plan_builder import load_shared_context
@@ -94,6 +95,7 @@ class Scheduler:
         for name, task in self.tasks.items():
             if not task.done():
                 task.cancel()
+                task_registry.unregister(self.run_id, name)
                 update_agent_status(self.db, self.run_id, name, status, message)
 
         if include_pending:
@@ -141,6 +143,12 @@ class Scheduler:
                 prompt = apply_role(agent.prompt, agent.use_role)
                 role_defaults = get_role_defaults(agent.use_role)
 
+            manager_cap = (
+                agent.manager.max_subagents
+                if agent.type == "manager" and agent.manager is not None
+                else None
+            )
+
             insert_agent(
                 self.db,
                 self.run_id,
@@ -155,6 +163,8 @@ class Scheduler:
                 plan_name=self.plan.name,
                 on_failure=agent.on_failure or defaults.on_failure,
                 retry_count=agent.retry_count or defaults.retry_count,
+                env=agent.env or None,
+                max_subagents=manager_cap,
             )
 
         logger.info(f"Initialized run {self.run_id} with {len(self.plan.agents)} agents")
@@ -184,6 +194,8 @@ class Scheduler:
                 depends_on,
                 worktree_path,
                 mode=dep_context.mode if dep_context else "full",
+                include_paths=dep_context.include_paths if dep_context else None,
+                exclude_paths=dep_context.exclude_paths if dep_context else None,
             )
 
         # Update DB with worktree info
@@ -206,6 +218,15 @@ class Scheduler:
         if error_context:
             prompt = f"{prompt}\n\n{error_context}"
 
+        # Load env declared on the agent spec (may be None for rows persisted
+        # before this column existed, or for dynamically spawned workers).
+        env_raw = None
+        try:
+            env_raw = agent_row["env"]
+        except (IndexError, KeyError):
+            env_raw = None
+        agent_env = json.loads(env_raw) if env_raw else None
+
         # Build config
         config = AgentConfig(
             name=name,
@@ -217,6 +238,7 @@ class Scheduler:
             max_iterations=agent_row["max_iterations"] or 30,
             max_cost_usd=agent_row["max_cost_usd"] or 5.0,
             parent=agent_row["parent"],
+            env=agent_env,
             shared_context=shared_context,
         )
 
@@ -306,15 +328,15 @@ class Scheduler:
             retry_count = agent["retry_count"] or 3
             attempt = increment_retry_attempt(self.db, self.run_id, name, error)
 
-            if attempt < retry_count:
-                logger.info(f"Retrying agent {name} (attempt {attempt + 1}/{retry_count})")
+            if attempt <= retry_count:
+                logger.info(f"Retrying agent {name} (retry {attempt}/{retry_count})")
                 reset_agent_for_retry(self.db, self.run_id, name)
                 insert_event(
                     self.db,
                     self.run_id,
                     name,
                     "progress",
-                    {"status": f"Retry attempt {attempt + 1}/{retry_count}", "last_error": error[:200]},
+                    {"status": f"Retry attempt {attempt}/{retry_count}", "last_error": error[:200]},
                 )
             else:
                 logger.warning(f"Agent {name} exhausted retries ({retry_count})")
@@ -334,7 +356,7 @@ class Scheduler:
         return f"""
 ## Previous Attempt Failed
 
-This is retry attempt {retry_attempt + 1}. The previous attempt failed with:
+This is retry attempt {retry_attempt}. The previous attempt failed with:
 
 ```
 {last_error[:500]}
@@ -459,6 +481,7 @@ Please address this error and continue with the task.
                     for name, task in self.tasks.items():
                         if not task.done():
                             task.cancel()
+                            task_registry.unregister(self.run_id, name)
                             update_agent_status(self.db, self.run_id, name, "cancelled")
                     break
 
@@ -489,6 +512,7 @@ Please address this error and continue with the task.
                     if row["name"] not in self.tasks:
                         task = await self._spawn_agent(row)
                         self.tasks[row["name"]] = task
+                        task_registry.register(self.run_id, row["name"], task)
                         logger.info(f"Spawned agent {row['name']}")
 
                 # Clean up completed tasks and handle failures
@@ -513,6 +537,7 @@ Please address this error and continue with the task.
                             should_stop = await self._handle_agent_failure(name, str(e))
 
                         del self.tasks[name]
+                        task_registry.unregister(self.run_id, name)
 
                         if should_stop:
                             break
@@ -544,6 +569,7 @@ Please address this error and continue with the task.
             return self._build_result()
 
         finally:
+            task_registry.clear_run(self.run_id)
             if self.db:
                 self.db.close()
 

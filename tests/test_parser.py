@@ -1,6 +1,7 @@
 """Tests for YAML parsing."""
 
 import pytest
+from pydantic import ValidationError
 
 from swarm.models.specs import AgentSpec, Defaults, PlanSpec
 from swarm.io.parser import parse_plan_yaml
@@ -37,6 +38,18 @@ agents:
     plan = parse_plan_yaml(yaml_content)
     assert len(plan.agents) == 2
     assert plan.agents[1].depends_on == ["first"]
+
+
+def test_parse_plan_yaml_rejects_invalid_agent_name():
+    """Agent names should fail validation before runtime git operations."""
+    yaml_content = """
+name: bad-plan
+agents:
+  - name: "bad name"
+    prompt: Do something
+"""
+    with pytest.raises(ValidationError):
+        parse_plan_yaml(yaml_content)
 
 
 def test_validate_plan_unknown_dep():
@@ -99,6 +112,14 @@ def test_parse_inline_agents():
     assert agents[0].name == "worker"
     assert agents[0].prompt == "Do task"
     assert agents[1].prompt == "another task"
+
+
+def test_parse_inline_agents_treats_natural_language_colon_as_prompt():
+    """Natural-language prompts with colons should not become agent names."""
+    agents = parse_inline_agents(["Fix bug: handle timeout"])
+
+    assert agents[0].name == "bug"
+    assert agents[0].prompt == "Fix bug: handle timeout"
 
 
 def test_create_inline_plan_sequential():

@@ -217,7 +217,54 @@ def merge_run(
             continue
 
         try:
-            merge_branch_to_current(branch)
+            merged = merge_branch_to_current(branch)
+            if not merged:
+                conflict_files = get_conflict_files()
+                logger.warning(f"Merge conflict for {name}: {conflict_files}")
+
+                if on_conflict == "spawn_resolver":
+                    logger.info(f"Spawning resolver for {name}")
+                    if spawn_resolver(run_id, branch, conflict_files, resolver_timeout, resolver_max_cost):
+                        # Resolver succeeded, continue merge
+                        try:
+                            subprocess.run(["git", "add", "."], check=True, capture_output=True)
+                            subprocess.run(
+                                ["git", "commit", "-m", f"Resolve conflicts from {branch}"],
+                                check=True,
+                                capture_output=True,
+                            )
+                            results["resolved"].append(name)
+                            logger.info(f"Resolved and merged {name}")
+
+                            if cleanup:
+                                worktree = agent["worktree"]
+                                if worktree:
+                                    try:
+                                        remove_worktree(Path(worktree))
+                                    except Exception as cleanup_err:
+                                        logger.warning(f"Failed to remove worktree {worktree}: {cleanup_err}")
+                            continue
+                        except subprocess.CalledProcessError as commit_err:
+                            logger.error(f"Failed to commit resolved conflicts: {commit_err}")
+                            subprocess.run(["git", "merge", "--abort"], capture_output=True)
+                            results["failed"].append({"name": name, "error": "commit_failed", "files": conflict_files})
+                            continue
+
+                    subprocess.run(["git", "merge", "--abort"], capture_output=True)
+                    results["failed"].append({"name": name, "error": "resolver_failed", "files": conflict_files})
+                    continue
+
+                if on_conflict == "fail":
+                    subprocess.run(["git", "merge", "--abort"], capture_output=True)
+                    results["failed"].append({"name": name, "error": "conflict", "files": conflict_files})
+                    logger.error(f"Merge conflict for {name}, aborting (on_conflict=fail)")
+                    continue
+
+                results["failed"].append({"name": name, "error": "conflict_manual", "files": conflict_files})
+                logger.warning(f"Merge conflict for {name}, leaving for manual resolution")
+                # Don't abort - leave in conflict state for manual resolution
+                break
+
             results["merged"].append(name)
             logger.info(f"Merged {name} ({branch})")
 

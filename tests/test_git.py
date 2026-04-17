@@ -127,3 +127,24 @@ def test_run_git_command(git_repo):
     result = run_git(["status"], cwd=git_repo)
     assert result.returncode == 0
     assert "nothing to commit" in result.stdout or "clean" in result.stdout
+
+
+def test_cleanup_run_worktrees_does_not_touch_prefix_sibling(git_repo, monkeypatch):
+    """cleanup_run_worktrees must not remove worktrees from a run whose id
+    merely shares a prefix with the target run."""
+    from swarm.gitops.worktrees import cleanup_run_worktrees
+
+    monkeypatch.chdir(git_repo)
+
+    # Two runs where one id is a prefix of the other.
+    target_wt = create_worktree("abc", "agent", git_repo)
+    sibling_wt = create_worktree("abc-other", "agent", git_repo)
+
+    assert target_wt.exists()
+    assert sibling_wt.exists()
+
+    cleanup_run_worktrees("abc", git_repo)
+
+    # Target run's worktree is gone, sibling's is untouched.
+    assert not target_wt.exists()
+    assert sibling_wt.exists()

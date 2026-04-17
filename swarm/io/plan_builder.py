@@ -10,6 +10,7 @@ from swarm.models.specs import AgentSpec, Defaults, PlanSpec
 logger = logging.getLogger("swarm.plan_builder")
 
 MAX_HIERARCHY_DEPTH = 10
+EXPLICIT_AGENT_PATTERN = re.compile(r"^(?P<name>[A-Za-z0-9_.-]+)\s*:\s*(?P<prompt>.+)$")
 
 
 def infer_agent_name(prompt: str) -> str:
@@ -52,11 +53,11 @@ def parse_inline_agents(prompts: list[str]) -> list[AgentSpec]:
     agents = []
 
     for prompt in prompts:
-        if ":" in prompt and not prompt.startswith("http"):
+        match = EXPLICIT_AGENT_PATTERN.match(prompt)
+        if match and not prompt.startswith("http"):
             # "name: prompt" format
-            name, rest = prompt.split(":", 1)
-            name = name.strip()
-            prompt_text = rest.strip()
+            name = match.group("name")
+            prompt_text = match.group("prompt").strip()
         else:
             # Infer name from prompt
             name = infer_agent_name(prompt)

@@ -1,5 +1,6 @@
 """Tests for CLI module."""
 
+import os
 from pathlib import Path
 
 import pytest
@@ -84,8 +85,68 @@ def test_status_json_output(runner, temp_swarm_dir):
 def test_status_nonexistent_run(runner, temp_swarm_dir):
     """Test status command with nonexistent run."""
     result = runner.invoke(main, ["status", "nonexistent"])
-    # Note: open_db creates the file but tables don't exist, causes OperationalError
     assert result.exit_code != 0
+    assert "Run not found: nonexistent" in result.output
+
+
+def test_status_without_run_id_uses_latest_valid_run(runner, temp_swarm_dir):
+    """Latest run selection should follow filesystem mtime, not name sorting."""
+    older = "zzz-older"
+    db = init_db(older)
+    insert_plan(db, older, "older-plan", "name: older")
+    db.close()
+    os.utime(temp_swarm_dir / ".swarm" / "runs" / older, (1, 1))
+
+    newer = "aaa-newer"
+    db = init_db(newer)
+    insert_plan(db, newer, "newer-plan", "name: newer")
+    db.close()
+    os.utime(temp_swarm_dir / ".swarm" / "runs" / newer, (2, 2))
+
+    result = runner.invoke(main, ["status"])
+    assert result.exit_code == 0
+    assert "Run: aaa-newer" in result.output
+    assert "Plan: newer-plan" in result.output
+
+
+def test_status_without_run_id_skips_invalid_runs(runner, temp_swarm_dir):
+    """Broken run directories should not crash the implicit latest-run path."""
+    bad_dir = temp_swarm_dir / ".swarm" / "runs" / "zzz-bad"
+    bad_dir.mkdir(parents=True)
+    (bad_dir / "swarm.db").write_text("")
+    os.utime(bad_dir, (2, 2))
+
+    good = "aaa-good"
+    db = init_db(good)
+    insert_plan(db, good, "good-plan", "name: good")
+    db.close()
+    os.utime(temp_swarm_dir / ".swarm" / "runs" / good, (1, 1))
+
+    result = runner.invoke(main, ["status"])
+    assert result.exit_code == 0
+    assert "Run: aaa-good" in result.output
+
+
+def test_resume_command_rejects_stale_run_db(runner, temp_swarm_dir):
+    """resume should fail cleanly for empty or stale DB files."""
+    stale_dir = temp_swarm_dir / ".swarm" / "runs" / "stale-run"
+    stale_dir.mkdir(parents=True)
+    (stale_dir / "swarm.db").write_text("")
+
+    result = runner.invoke(main, ["resume", "stale-run"])
+    assert result.exit_code != 0
+    assert "Run not found: stale-run" in result.output
+
+
+def test_run_resume_rejects_stale_run_db(runner, temp_swarm_dir):
+    """run --resume should use the same stale-run guard as resume."""
+    stale_dir = temp_swarm_dir / ".swarm" / "runs" / "stale-run"
+    stale_dir.mkdir(parents=True)
+    (stale_dir / "swarm.db").write_text("")
+
+    result = runner.invoke(main, ["run", "--resume", "--run-id", "stale-run"])
+    assert result.exit_code != 0
+    assert "Run not found: stale-run" in result.output
 
 
 def test_cancel_command(runner, temp_swarm_dir):
@@ -106,8 +167,8 @@ def test_cancel_command(runner, temp_swarm_dir):
 def test_cancel_nonexistent_run(runner, temp_swarm_dir):
     """Test cancel command with nonexistent run."""
     result = runner.invoke(main, ["cancel", "nonexistent"])
-    # Note: open_db creates the file but tables don't exist, causes OperationalError
     assert result.exit_code != 0
+    assert "Run not found: nonexistent" in result.output
 
 
 def test_logs_list(runner, temp_swarm_dir):
@@ -237,3 +298,37 @@ def test_merge_dry_run(runner, temp_swarm_dir):
     assert result.exit_code == 0
     assert "Merge order" in result.output
     assert "dry run" in result.output
+
+
+def test_merge_conflict_does_not_report_success(runner, temp_swarm_dir, monkeypatch):
+    """Test merge command stops on merge conflicts instead of reporting success."""
+    run_id = "test-merge-conflict"
+    db = init_db(run_id)
+    insert_plan(db, run_id, "test-plan", "completed", "name: test")
+    insert_agent(db, run_id, "agent1", "Test prompt")
+    update_agent_status(db, run_id, "agent1", "completed")
+    db.execute("UPDATE agents SET branch = ? WHERE run_id = ? AND name = ?", ("swarm/test/agent1", run_id, "agent1"))
+    db.commit()
+    db.close()
+
+    monkeypatch.setattr("swarm.cli.merge_branch_to_current", lambda branch: False)
+
+    result = runner.invoke(main, ["merge", run_id])
+    assert result.exit_code != 0
+    assert "Merge conflict detected" in result.output
+    assert "Merged successfully" not in result.output
+
+
+def test_clean_removes_git_worktrees_before_deleting_run(runner, temp_swarm_dir, monkeypatch):
+    """Test clean command unregisters git worktrees before deleting artifacts."""
+    run_id = "test-clean-git"
+    run_dir = temp_swarm_dir / ".swarm" / "runs" / run_id
+    run_dir.mkdir(parents=True)
+    (run_dir / "swarm.db").write_text("test")
+
+    cleaned: list[str] = []
+    monkeypatch.setattr("swarm.cli.cleanup_run_worktrees", lambda rid: cleaned.append(rid))
+
+    result = runner.invoke(main, ["clean", run_id])
+    assert result.exit_code == 0
+    assert cleaned == [run_id]

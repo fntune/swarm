@@ -47,6 +47,12 @@ async def mark_complete(run_id: str, agent_name: str, summary: str) -> dict:
         if not agent:
             return {"content": [{"type": "text", "text": f"ERROR: Agent {agent_name} not found"}]}
 
+        if agent["status"] in ("cancelled", "failed", "timeout", "cost_exceeded"):
+            logger.warning(
+                f"Refusing mark_complete for {agent_name}: agent is in terminal state {agent['status']}"
+            )
+            return {"content": [{"type": "text", "text": f"ERROR: Agent is in terminal state '{agent['status']}'. mark_complete ignored."}]}
+
         check_cmd = agent["check_command"] or "true"
         worktree = agent["worktree"]
         logger.info(f"Running check command: {check_cmd}")

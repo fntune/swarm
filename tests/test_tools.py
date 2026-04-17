@@ -9,6 +9,7 @@ from swarm.storage.db import (
     get_response,
     init_db,
     insert_agent,
+    insert_event,
     insert_plan,
     update_agent_status,
 )
@@ -134,23 +135,100 @@ def test_spawn_worker_already_exists(temp_swarm_dir):
     assert "already exists" in result["content"][0]["text"]
 
 
+def test_spawn_worker_rejects_invalid_name(temp_swarm_dir):
+    """Worker names should be validated before touching DB state."""
+    run_id = "test-spawn-invalid"
+    db = init_db(run_id)
+    insert_plan(db, run_id, "test", "name: test", 25.0)
+    insert_agent(db, run_id, "manager", "Manage workers", agent_type="manager")
+    db.close()
+
+    result = asyncio.run(spawn_worker(run_id, "manager", "../oops", "Do something"))
+
+    assert "Invalid worker name" in result["content"][0]["text"]
+
+    db = init_db(run_id)
+    agent = get_agent(db, run_id, "manager.../oops")
+    db.close()
+    assert agent is None
+
+
+def test_cancel_worker_cannot_cancel_unowned_agent(temp_swarm_dir):
+    """Managers should only be able to cancel their own workers."""
+    from swarm.tools.manager import cancel_worker
+
+    run_id = "test-cancel-scope"
+    db = init_db(run_id)
+    insert_plan(db, run_id, "test", "name: test", 25.0)
+    insert_agent(db, run_id, "manager", "Manage workers", agent_type="manager")
+    insert_agent(db, run_id, "victim", "Running task")
+    update_agent_status(db, run_id, "victim", "running")
+    db.close()
+
+    result = asyncio.run(cancel_worker(run_id, "manager", "victim"))
+
+    assert "Worker not found" in result["content"][0]["text"]
+
+    db = init_db(run_id)
+    agent = get_agent(db, run_id, "victim")
+    db.close()
+    assert agent["status"] == "running"
+
+
+def test_get_worker_status_cannot_read_unowned_agent(temp_swarm_dir):
+    """Managers should not inspect unrelated agents."""
+    from swarm.tools.manager import get_worker_status
+
+    run_id = "test-status-scope"
+    db = init_db(run_id)
+    insert_plan(db, run_id, "test", "name: test", 25.0)
+    insert_agent(db, run_id, "manager", "Manage workers", agent_type="manager")
+    insert_agent(db, run_id, "victim", "Task")
+    db.close()
+
+    result = asyncio.run(get_worker_status(run_id, "manager", "victim"))
+    assert "Worker not found" in result["content"][0]["text"]
+
+
 def test_respond_to_clarification(temp_swarm_dir):
     """Test respond_to_clarification creates response."""
     run_id = "test-respond-1"
     db = init_db(run_id)
     insert_plan(db, run_id, "test", "name: test", 25.0)
     insert_agent(db, run_id, "manager", "Manage workers")
+    insert_agent(db, run_id, "manager.task1", "Worker task", parent="manager")
+    clarification_id = insert_event(db, run_id, "manager.task1", "clarification", {"question": "Use JWT?"})
     db.close()
 
-    result = asyncio.run(respond_to_clarification(run_id, "manager", "clar123", "Use JWT"))
+    result = asyncio.run(respond_to_clarification(run_id, "manager", clarification_id, "Use JWT"))
 
     assert "Response sent" in result["content"][0]["text"]
 
     db = init_db(run_id)
-    response = get_response(db, run_id, "clar123")
+    response = get_response(db, run_id, clarification_id)
     db.close()
     assert response is not None
     assert response["response"] == "Use JWT"
+
+
+def test_respond_to_clarification_rejects_unowned_request(temp_swarm_dir):
+    """Managers should not respond to other managers' clarifications."""
+    run_id = "test-respond-scope"
+    db = init_db(run_id)
+    insert_plan(db, run_id, "test", "name: test", 25.0)
+    insert_agent(db, run_id, "manager", "Manage workers")
+    insert_agent(db, run_id, "other.task1", "Worker task", parent="other")
+    clarification_id = insert_event(db, run_id, "other.task1", "clarification", {"question": "Need input"})
+    db.close()
+
+    result = asyncio.run(respond_to_clarification(run_id, "manager", clarification_id, "No"))
+
+    assert "Clarification not found" in result["content"][0]["text"]
+
+    db = init_db(run_id)
+    response = get_response(db, run_id, clarification_id)
+    db.close()
+    assert response is None
 
 
 def test_mark_plan_complete_workers_pending(temp_swarm_dir):
@@ -187,3 +265,107 @@ def test_mark_plan_complete_success(temp_swarm_dir):
     agent = get_agent(db, run_id, "manager")
     db.close()
     assert agent["status"] == "completed"
+
+
+def test_cancel_worker_cancels_live_task(temp_swarm_dir):
+    """cancel_worker should cancel the registered asyncio task, not just flip status."""
+    from swarm.tools.manager import cancel_worker
+    from swarm.runtime import task_registry
+
+    run_id = "test-cancel-live"
+    db = init_db(run_id)
+    insert_plan(db, run_id, "test", "name: test", 25.0)
+    insert_agent(db, run_id, "manager", "Manage", agent_type="manager")
+    insert_agent(db, run_id, "manager.victim", "work", parent="manager")
+    update_agent_status(db, run_id, "manager.victim", "running")
+    db.close()
+
+    async def _run():
+        async def long_running():
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                raise
+
+        task = asyncio.create_task(long_running())
+        task_registry.register(run_id, "manager.victim", task)
+        try:
+            result = await cancel_worker(run_id, "manager", "victim")
+            await asyncio.sleep(0)  # let cancellation propagate
+            return result, task
+        finally:
+            task_registry.unregister(run_id, "manager.victim")
+
+    result, task = asyncio.run(_run())
+
+    assert "Cancelled worker" in result["content"][0]["text"]
+    assert task.cancelled() or task.done()
+
+    db = init_db(run_id)
+    agent = get_agent(db, run_id, "manager.victim")
+    db.close()
+    assert agent["status"] == "cancelled"
+
+
+def test_mark_complete_refuses_cancelled_agent(temp_swarm_dir):
+    """A cancelled agent must not be able to flip itself back to completed."""
+    from swarm.tools.worker import mark_complete as worker_mark_complete
+
+    run_id = "test-cancelled-mark-complete"
+    db = init_db(run_id)
+    insert_plan(db, run_id, "test", "name: test", 25.0)
+    insert_agent(db, run_id, "worker1", "Test task", check_command="true")
+    worktree = temp_swarm_dir / ".swarm" / "runs" / run_id / "worktrees" / "worker1"
+    worktree.mkdir(parents=True)
+    db.execute(
+        "UPDATE agents SET worktree = ? WHERE run_id = ? AND name = ?",
+        (str(worktree), run_id, "worker1"),
+    )
+    db.commit()
+    update_agent_status(db, run_id, "worker1", "cancelled", "cancelled by manager")
+    db.close()
+
+    result = asyncio.run(worker_mark_complete(run_id, "worker1", "Task done"))
+
+    text = result["content"][0]["text"]
+    assert "ERROR" in text
+    assert "terminal state" in text
+
+    db = init_db(run_id)
+    agent = get_agent(db, run_id, "worker1")
+    db.close()
+    assert agent["status"] == "cancelled"
+
+
+def test_spawn_worker_enforces_max_subagents(temp_swarm_dir):
+    """spawn_worker must reject further spawns once max_subagents is reached."""
+    run_id = "test-max-subagents"
+    db = init_db(run_id)
+    insert_plan(db, run_id, "test", "name: test", 25.0)
+    insert_agent(db, run_id, "manager", "Manage", agent_type="manager", max_subagents=2)
+    insert_agent(db, run_id, "manager.w1", "first", parent="manager")
+    insert_agent(db, run_id, "manager.w2", "second", parent="manager")
+    db.close()
+
+    result = asyncio.run(spawn_worker(run_id, "manager", "w3", "third"))
+
+    text = result["content"][0]["text"]
+    assert "max_subagents" in text
+
+    db = init_db(run_id)
+    rejected = get_agent(db, run_id, "manager.w3")
+    db.close()
+    assert rejected is None
+
+
+def test_spawn_worker_allows_under_max_subagents(temp_swarm_dir):
+    """spawn_worker still succeeds while under max_subagents."""
+    run_id = "test-max-subagents-ok"
+    db = init_db(run_id)
+    insert_plan(db, run_id, "test", "name: test", 25.0)
+    insert_agent(db, run_id, "manager", "Manage", agent_type="manager", max_subagents=3)
+    insert_agent(db, run_id, "manager.w1", "first", parent="manager")
+    db.close()
+
+    result = asyncio.run(spawn_worker(run_id, "manager", "w2", "second"))
+    assert "Spawned worker: manager.w2" in result["content"][0]["text"]

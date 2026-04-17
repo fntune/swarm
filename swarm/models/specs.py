@@ -4,6 +4,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+AGENT_NAME_PATTERN = r"^[A-Za-z0-9_.-]+$"
+
 
 class RunConfig(BaseModel):
     """Run identity and resumption settings."""
@@ -85,7 +87,7 @@ class ManagerSettings(BaseModel):
 class AgentSpec(BaseModel):
     """Agent specification in a plan."""
 
-    name: str
+    name: str = Field(pattern=AGENT_NAME_PATTERN)
     type: Literal["worker", "manager"] = "worker"
     use_role: str | None = None
     prompt: str
@@ -113,4 +115,3 @@ class PlanSpec(BaseModel):
     orchestration: Orchestration | None = None
     agents: list[AgentSpec] = Field(default_factory=list)
     on_complete: Literal["merge", "none", "notify"] = "none"
-
