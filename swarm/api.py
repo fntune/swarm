@@ -24,13 +24,14 @@ def agent(
     *,
     depends_on: list[str] | None = None,
     check: str | None = None,
-    model: Literal["sonnet", "opus", "haiku"] | None = None,
+    model: str | None = None,
     type: Literal["worker", "manager"] = "worker",
     use_role: str | None = None,
     max_iterations: int | None = None,
     max_cost_usd: float | None = None,
     on_failure: Literal["continue", "stop", "retry"] | None = None,
     retry_count: int | None = None,
+    runtime: Literal["claude", "openai"] | None = None,
     env: dict[str, str] | None = None,
 ) -> AgentSpec:
     """Build an ``AgentSpec`` with Python-friendly keyword arguments.
@@ -54,6 +55,8 @@ def agent(
         kwargs["on_failure"] = on_failure
     if retry_count is not None:
         kwargs["retry_count"] = retry_count
+    if runtime is not None:
+        kwargs["runtime"] = runtime
     if env is not None:
         kwargs["env"] = dict(env)
     return AgentSpec(**kwargs)

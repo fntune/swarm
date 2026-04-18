@@ -21,8 +21,9 @@ class Defaults(BaseModel):
     check: str | None = "true"
     on_failure: Literal["continue", "stop", "retry"] = "continue"
     retry_count: int = 3
-    model: Literal["sonnet", "opus", "haiku"] = "sonnet"
+    model: str = "sonnet"
     max_cost_usd: float = 5.0
+    runtime: Literal["claude", "openai"] = "claude"
 
 
 class CostBudget(BaseModel):
@@ -95,8 +96,9 @@ class AgentSpec(BaseModel):
     check: str | None = None
     on_failure: Literal["continue", "stop", "retry"] | None = None
     retry_count: int | None = None
-    model: Literal["sonnet", "opus", "haiku"] | None = None
+    model: str | None = None
     max_cost_usd: float | None = None
+    runtime: Literal["claude", "openai"] | None = None
     depends_on: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)
     milestones: list[Milestone] = Field(default_factory=list)

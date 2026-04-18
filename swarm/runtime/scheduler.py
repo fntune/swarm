@@ -154,6 +154,7 @@ class Scheduler:
                 else None
             )
 
+            runtime = agent.runtime or defaults.runtime
             insert_agent(
                 self.db,
                 self.run_id,
@@ -170,6 +171,8 @@ class Scheduler:
                 retry_count=agent.retry_count or defaults.retry_count,
                 env=agent.env or None,
                 max_subagents=manager_cap,
+                runtime=runtime,
+                cost_source="estimated" if runtime == "openai" else "sdk",
             )
 
         logger.info(f"Initialized run {self.run_id} with {len(self.plan.agents)} agents")
@@ -232,6 +235,12 @@ class Scheduler:
             env_raw = None
         agent_env = json.loads(env_raw) if env_raw else None
 
+        # Read runtime; default to "claude" for DB rows from before the column existed.
+        try:
+            agent_runtime = agent_row["runtime"] or "claude"
+        except (IndexError, KeyError):
+            agent_runtime = "claude"
+
         # Build config
         config = AgentConfig(
             name=name,
@@ -245,6 +254,7 @@ class Scheduler:
             parent=agent_row["parent"],
             env=agent_env,
             shared_context=shared_context,
+            runtime=agent_runtime,
         )
 
         # Spawn based on type

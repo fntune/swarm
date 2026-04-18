@@ -48,6 +48,7 @@ class AgentConfig:
     parent: str | None = None
     env: dict | None = None
     shared_context: str = ""
+    runtime: str = "claude"
 
     def tree_path(self) -> str:
         """Get full hierarchy path."""

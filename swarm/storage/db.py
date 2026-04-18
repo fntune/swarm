@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS agents (
     plan_name TEXT,
     status TEXT NOT NULL DEFAULT 'pending',
     type TEXT DEFAULT 'worker',
+    runtime TEXT NOT NULL DEFAULT 'claude',
     iteration INTEGER DEFAULT 0,
     max_iterations INTEGER DEFAULT 30,
     worktree TEXT,
@@ -38,9 +39,10 @@ CREATE TABLE IF NOT EXISTS agents (
     check_command TEXT,
     model TEXT DEFAULT 'sonnet',
     parent TEXT,
-    session_id TEXT,
+    vendor_session_id TEXT,
     pid INTEGER,
     cost_usd REAL DEFAULT 0.0,
+    cost_source TEXT NOT NULL DEFAULT 'sdk',
     max_cost_usd REAL DEFAULT 5.0,
     error TEXT,
     depends_on TEXT,
@@ -123,12 +125,30 @@ def get_db(run_id: str, base_path: Path | None = None) -> Generator[sqlite3.Conn
 
 
 def init_db(run_id: str, base_path: Path | None = None) -> sqlite3.Connection:
-    """Initialize database with schema."""
+    """Initialize database with schema, migrating any existing DB forward."""
     db = open_db(run_id, base_path)
     db.executescript(SCHEMA)
+    _migrate_agents(db)
     db.commit()
     logger.info(f"Initialized database at {get_db_path(run_id, base_path)}")
     return db
+
+
+def _migrate_agents(db: sqlite3.Connection) -> None:
+    """Idempotent migration for the agents table.
+
+    Adds runtime and cost_source columns and renames session_id to
+    vendor_session_id on DBs created by older releases. Safe to run on a
+    fresh DB (all checks become no-ops) or a fully-migrated DB.
+    """
+    columns = {row["name"] for row in db.execute("PRAGMA table_info(agents)")}
+
+    if "runtime" not in columns:
+        db.execute("ALTER TABLE agents ADD COLUMN runtime TEXT NOT NULL DEFAULT 'claude'")
+    if "cost_source" not in columns:
+        db.execute("ALTER TABLE agents ADD COLUMN cost_source TEXT NOT NULL DEFAULT 'sdk'")
+    if "session_id" in columns and "vendor_session_id" not in columns:
+        db.execute("ALTER TABLE agents RENAME COLUMN session_id TO vendor_session_id")
 
 
 def insert_plan(
@@ -163,14 +183,16 @@ def insert_agent(
     retry_count: int = 3,
     env: dict[str, str] | None = None,
     max_subagents: int | None = None,
+    runtime: str = "claude",
+    cost_source: str = "sdk",
 ) -> None:
     """Insert an agent record."""
     db.execute(
         """INSERT INTO agents (
             run_id, name, plan_name, type, prompt, check_command, model,
             max_iterations, max_cost_usd, depends_on, parent, on_failure, retry_count,
-            env, max_subagents
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            env, max_subagents, runtime, cost_source
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             run_id,
             name,
@@ -187,6 +209,8 @@ def insert_agent(
             retry_count,
             json.dumps(env) if env else None,
             max_subagents,
+            runtime,
+            cost_source,
         ),
     )
     db.commit()
