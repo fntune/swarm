@@ -2,159 +2,159 @@
 
 ## Project Overview
 
-**swarm** — Multi-agent orchestration for coding agents (Codex + OpenAI).
+**swarm** — Multi-agent orchestration for Claude Code.
 
-Two execution modes share one set of primitives (profile / capability /
-coordination backend / executor):
+One scheduler, one SQLite-backed state store, two frontends:
 
-- **Batch mode** persists everything in SQLite (`nodes` / `attempts` /
-  `workspaces` / `events` / `coord_responses`), runs agents in parallel
-  isolated git worktrees, supports DAG dependencies, retry-with-history,
-  resume, circuit breaker, and branch merging.
-- **Live mode** is a single-process pipeline runner: no SQLite, no DAG, no
-  worktrees by default. `from swarm.live import pipeline` runs a
-  Codex→OpenAI handoff in 20 lines.
+- **CLI** (`swarm run -f plan.yaml` or `swarm run -p "name: prompt"`) — declarative YAML plans.
+- **Python API** (`from swarm import run, pipeline, handoff, agent`) — the same scheduler, invoked as a library.
+
+Both frontends share the same machinery: DAG dependencies, parallel execution in isolated git worktrees, retry with error-context injection, circuit breaker, manager-spawn hierarchies, blocking worker↔manager coordination, and resume. Runs started from either frontend land in the same `.swarm/runs/<run_id>/` directory and are inspectable via the same CLI commands.
 
 ## Commands
 
 ```bash
 # Development
 pip install -e .
-pip install -e ".[sdk]"        # add Codex Agent SDK
-pip install -e ".[openai]"     # add OpenAI Agents SDK
-pip install -e ".[dev]"        # both SDKs + pytest + pytest-asyncio
+pip install -e ".[sdk]"        # add Claude Agent SDK
+pip install -e ".[dev]"        # SDK + pytest + pytest-asyncio
 swarm --help
 
 # Testing
-pytest tests/
-pytest tests/test_batch_scheduler.py -xvs                     # one file
-pytest tests/test_batch_scheduler.py::test_retry -xvs         # one test
-# tests/sdklive/ are manual integration scripts (real API calls) — run
-# with `python tests/sdklive/test_sdk_live.py`, not pytest.
+pytest tests/                              # unit tests
+pytest tests/test_scheduler.py -xvs        # one file
+pytest tests/test_scheduler.py::test_scheduler_init -xvs
+# tests/sdklive/ are manual integration scripts (real API calls) —
+# run with `python tests/sdklive/test_sdk_live.py`, not pytest.
 
 # Type checking
 pyright swarm/
 
-# Core CLI
-swarm run -f plan.yaml                          # Execute plan spec
-swarm run -p "auth: Impl auth"                  # Inline single agent
+# CLI
+swarm run -f plan.yaml                     # execute plan spec
+swarm run -p "auth: Impl auth"             # inline single agent
 swarm run -p "a: step1" -p "b: step2" --sequential
-swarm run --run-id <id> -p "..."                # Explicit run ID
-swarm run --resume --run-id <id>                # Resume existing run
-swarm run -p "test: noop" --mock                # Dev-only: forces mock runtime + cwd workspace (bypasses isolation, overrides plan runtimes)
-swarm run -f plan.yaml --workspace tempdir      # Override workspace
+swarm run --run-id <id> -p "..."           # explicit run ID
+swarm run --resume --run-id <id>           # resume existing run
+swarm run -p "test: noop" --mock           # dev-only: skip SDK calls
 
-swarm resume <run_id>                           # Resume alias
-swarm status [run_id] [--json]                  # View status (latest if no id)
-swarm logs <run_id> -a <agent>                  # View agent logs
-swarm logs <run_id> --all                       # View all logs
-swarm merge <run_id> [--strategy manual|fail|auto]
-swarm cancel <run_id>                           # Cancel running agents
-swarm dashboard <run_id>                        # Live status view
-swarm clean [run_id] [--all]                    # Clean up artifacts
-swarm db [run_id] [query]                       # Query SQLite database
-swarm profiles [name]                           # List/view built-in profiles
+swarm resume <run_id>                      # resume alias
+swarm status [run_id] [--json]             # view status (latest if no id)
+swarm logs <run_id> -a <agent>             # view agent logs
+swarm logs <run_id> --all                  # view all logs
+swarm merge <run_id> [--dry-run]           # merge completed branches
+swarm cancel <run_id>                      # cancel running agents
+swarm dashboard <run_id>                   # live status view
+swarm clean [run_id] [--all]               # clean up artifacts
+swarm db [run_id] [query]                  # query SQLite database
+swarm roles [name]                         # list/view built-in roles
 ```
 
-`swarm roles` is gone in this release. The renamed command is
-`swarm profiles`. There is no alias.
+## Python API
+
+The library exposes the same scheduler the CLI drives. No parallel universe — a `swarm.run()` call produces a run indistinguishable from `swarm run -f plan.yaml`.
+
+```python
+import asyncio
+from swarm import run, pipeline, handoff, agent
+
+# Single-agent run
+await run([agent("auth", "Implement auth", check="pytest")], name="auth-run")
+
+# DAG with dependencies
+await run([
+    agent("schema", "Design DB schema"),
+    agent("api",    "Implement API",   depends_on=["schema"]),
+    agent("tests",  "Write tests",     depends_on=["api"], use_role="tester"),
+])
+
+# Sequential sugar: pipeline auto-chains depends_on by list order
+await pipeline([
+    agent("generate", "Write a fibonacci function"),
+    agent("review",   "Review the function above", use_role="reviewer"),
+])
+
+# Two-step handoff sugar
+await handoff(
+    agent("impl",  "Build the cache layer"),
+    agent("audit", "Audit the implementation", use_role="reviewer"),
+)
+```
+
+The `agent()` builder is a Python-friendly constructor for `AgentSpec` — omitted kwargs fall through to plan/role/global defaults. `run()` also accepts a full `PlanSpec` directly.
 
 ## Architecture
 
 ```
 swarm/
-├── cli.py                  # Click CLI entrypoint (10 commands)
-├── core/                   # Cross-mode contracts (no SQLite, no asyncio)
-│   ├── agent.py            # AgentRequest, ResolvedAgent, Limits, OnFailure
-│   ├── profiles.py         # AgentProfile, PROFILE_REGISTRY, 8 builtins
-│   ├── capabilities.py     # Capability enum, DEFAULT_CODING_CAPS, READONLY_CAPS
-│   ├── execution.py        # Executor ABC, RunContext, ExecutionResult, registry
-│   ├── coordination.py     # CoordOp, CoordinationBackend protocol, CoordResult
-│   ├── events.py           # SwarmEvent ADT, EventSink, NullSink
-│   ├── workspace.py        # Workspace ADT, WorkspaceProvider protocol
-│   └── errors.py           # SwarmError hierarchy
-├── adapters/               # Vendor adapters (one subpackage each)
-│   ├── Codex/             # ClaudeExecutor + MCP coord server + capability map
-│   ├── openai/             # OpenAIExecutor + function_tool wrappers + code tools
-│   └── mock/               # MockExecutor — runs the check command
-├── batch/                  # SQLite-backed parallel scheduler
-│   ├── plan.py             # PlanSpec, PlanDefaults, resolve_plan, resolve_child
-│   ├── input.py            # YAML parser, inline plan builder, validation
-│   ├── dag.py              # Dependency graph + topological sort
-│   ├── scheduler.py        # Poll loop, dispatch, retry, circuit breaker
-│   ├── sqlite.py           # Schema, helpers, SqliteSink, SqliteCoordinationBackend
-│   ├── logs.py             # Per-agent log file helpers
-│   └── merge.py            # Branch consolidation (no spawn_resolver)
-├── live/                   # In-process pipelines, no SQLite
-│   ├── pipeline.py         # pipeline(), handoff(), StdoutSink
-│   ├── bridge.py           # as_claude_tool, as_openai_tool
-│   └── in_memory.py        # InMemoryCoordinationBackend
-└── workspaces/
-    ├── git.py              # GitWorktreeProvider + low-level git helpers
-    ├── cwd.py              # CwdProvider — zero isolation
-    └── temp.py             # TempDirProvider — throwaway tempdir
-
-examples/
-├── cross_check.py          # Codex generator → OpenAI reviewer pipeline
-└── debt.py                 # Minimal tech-debt audit (reviewer → cross-ref)
+├── cli.py              # Click CLI — 10 commands
+├── api.py              # Python API — run / pipeline / handoff / agent
+├── core/
+│   └── deps.py         # DependencyGraph, topological sort
+├── io/
+│   ├── parser.py       # YAML → PlanSpec, run-id generation
+│   ├── plan_builder.py # Inline plan construction, shared-context loading
+│   └── validation.py   # Plan validation (circular deps, unknown deps)
+├── models/
+│   ├── specs.py        # AgentSpec, PlanSpec, Defaults, CostBudget, ...
+│   └── state.py        # AgentState, Event, Response
+├── runtime/
+│   ├── executor.py     # AgentConfig, run_worker, run_manager, run_worker_mock
+│   ├── scheduler.py    # Scheduler poll loop, dispatch, retry, circuit breaker
+│   └── task_registry.py# run_id → asyncio.Task registry (for cancel)
+├── storage/
+│   ├── db.py           # SQLite schema + helpers (WAL mode)
+│   ├── logs.py         # Per-agent log files, tail -f support
+│   └── paths.py        # .swarm/runs/<run_id>/ path helpers
+├── tools/
+│   ├── factory.py      # @tool wrapping for Claude SDK MCP server
+│   ├── worker.py       # mark_complete, request_clarification, report_progress, report_blocker
+│   └── manager.py      # spawn_worker, respond_to_clarification, cancel_worker, get_worker_status, get_pending_clarifications, mark_plan_complete
+├── gitops/
+│   ├── worktrees.py    # create/cleanup worktrees, dep context merging
+│   └── merge.py        # Branch consolidation
+└── roles.py            # 7 built-in role templates (architect, implementer, tester, reviewer, debugger, refactorer, documenter)
 
 tests/
-├── test_*.py               # Unit tests (pytest)
-└── sdklive/                # Manual integration scripts (real API calls)
+├── test_*.py           # pytest units
+└── sdklive/            # manual integration scripts (real Claude API)
 ```
 
-`WARP.md` mirrors this file for the Warp terminal's agent — keep the two
-in sync when editing project instructions.
+`WARP.md` mirrors this file for the Warp terminal's agent — keep the two in sync when editing project instructions.
 
-## Key Concepts
+## Key Features
 
-### Profile = capabilities + coord ops + system prompt
-8 builtin profiles: `implementer` (default), `architect`, `tester`,
-`reviewer` (read-only-plus-shell — can read/glob/grep and run tests, but
-cannot write/edit files), `debugger`, `refactorer`, `documenter`,
-`orchestrator` (full coding caps + spawn/status/respond/cancel/
-mark_plan_complete coord ops).
-
-### Capability is vendor-neutral
-`Capability.{FILE_READ, FILE_WRITE, FILE_EDIT, GLOB, GREP, SHELL,
-WEB_FETCH, WEB_SEARCH}`. The Codex adapter expands these to
-`Read/Write/Edit/Glob/Grep/Bash/...` via `CLAUDE_CAPABILITY_MAP`. The
-OpenAI adapter wires them to `@function_tool`-decorated stdlib closures.
-
-### Default runtime resolution
-`PlanDefaults.runtime` → `SWARM_DEFAULT_RUNTIME` env var → hard fallback
-`Codex`. Invalid env values raise `PlanValidationError`.
+### Execution
+- **Parallel agents** in isolated git worktrees
+- **DAG dependencies** with topological ordering
+- **Sequential sugar** via `--sequential` CLI flag or `pipeline()` Python helper
+- **Resume** via `--resume --run-id` or `swarm resume` — completed agents stay completed
 
 ### Failure handling
-- **on_failure: continue** — default
-- **on_failure: stop** — cancel all agents on first failure
-- **on_failure: retry** — insert a NEW `attempts` row each retry; full
-  history preserved; resume reuses the same machinery
-- **Cascade failures** — agents with failed deps are marked failed
-- **Circuit breaker** — trip after N failures (cancel_all/pause/notify)
+- **on_failure: continue** — default; continue with other agents
+- **on_failure: stop** — cancel all on first failure
+- **on_failure: retry** — retry up to `retry_count` with error context injected into the retry prompt
+- **Cascade failures** — agents with failed deps are marked failed automatically
+- **Circuit breaker** — trip after N failures (`cancel_all`, `pause`, `notify_only`)
+- **Stuck detection** — flag runs with no event activity over N poll iterations
 
 ### Coordination
-Worker ops: `mark_complete`, `request_clarification`, `report_progress`,
-`report_blocker`.
-Orchestrator ops: `spawn`, `status`, `respond`, `cancel`,
-`pending_clarifications`, `mark_plan_complete`.
+Worker tools (via in-process MCP): `mark_complete`, `request_clarification`, `report_progress`, `report_blocker`. `request_clarification` and `report_blocker` block the worker until the manager responds.
 
-Two backends:
-- `batch/sqlite.py:SqliteCoordinationBackend` — persists via the events /
-  coord_responses tables.
-- `live/in_memory.py:InMemoryCoordinationBackend` — asyncio-friendly,
-  spawn raises `CoordinationNotSupported` in v1.
+Manager tools: `spawn_worker`, `respond_to_clarification`, `cancel_worker`, `get_worker_status`, `get_pending_clarifications`, `mark_plan_complete`.
+
+### Roles
+Seven built-in templates: `architect`, `implementer`, `tester`, `reviewer`, `debugger`, `refactorer`, `documenter`. Apply via `use_role: <name>` in YAML or `use_role="..."` in the Python API.
 
 ## Plan Spec Format
 
 ```yaml
 name: my-plan
 defaults:
-  runtime: Codex          # or openai, or mock
-  model: sonnet
   check: "pytest tests/"
   on_failure: retry
   retry_count: 3
+  model: sonnet
 orchestration:
   circuit_breaker:
     threshold: 3
@@ -162,12 +162,17 @@ orchestration:
 agents:
   - name: auth
     prompt: "Implement authentication"
-    profile: implementer
-  - name: review
-    prompt: "Review the auth implementation"
-    profile: reviewer        # read-only + shell
-    runtime: openai          # cross-vendor in one plan
+    use_role: implementer
+  - name: tests
+    prompt: "Write tests for auth"
+    use_role: tester
     depends_on: [auth]
+  - name: coordinator
+    type: manager
+    prompt: "Orchestrate follow-up work"
+    depends_on: [tests]
+    manager:
+      max_subagents: 3
 ```
 
 ## File Layout
@@ -175,66 +180,67 @@ agents:
 ```
 .swarm/
 └── runs/{run_id}/
-    ├── swarm.db                # SQLite state (5 tables, WAL mode)
-    ├── worktrees/{agent}/      # Git worktrees (when workspace=worktree)
-    └── logs/{agent}.log        # Per-agent log files
+    ├── swarm.db                # SQLite state (WAL mode)
+    ├── worktrees/{agent}/      # Git worktrees (one per agent)
+    └── logs/{agent}.log        # Per-agent log files (append-only)
 ```
 
 ## Dependencies
 
-- `pydantic>=2.0` — YAML boundary models in batch/input.py
+- `pydantic>=2.0` — YAML boundary + spec models
 - `click>=8.0` — CLI
-- `pyyaml>=6.0` — Plan spec parsing
-- `Codex-agent-sdk>=0.1.19` (optional `[sdk]` extra) — Codex runtime
-- `openai-agents>=0.0.9`, `openai>=1.50` (optional `[openai]` extra) — OpenAI runtime
+- `pyyaml>=6.0` — plan spec parsing
+- `claude-agent-sdk>=0.1.19` (optional `[sdk]` extra) — Claude runtime
 
 ## Style
 
 - Follow global AGENTS.md conventions
 - SQLite WAL mode for concurrent agent access
-- Logs stay as files (for tail -f compatibility)
-- `core/` only holds cross-mode contracts; DB-backed things live in
-  `batch/`, in-memory things in `live/`
-- Dependency graph is one-way: `core → nothing; adapters → core;
-  batch → core, workspaces; live → core, workspaces; cli → batch, live`
+- Logs stay as files (for `tail -f` compatibility)
 
 ## Code Patterns
 
 ### Database Access
+
 ```python
-from swarm.batch.sqlite import get_db, get_nodes, latest_attempt
+from swarm.storage.db import get_db, get_agents, get_plan
 
 with get_db(run_id) as db:
-    for node in get_nodes(db, run_id):
-        attempt = latest_attempt(db, run_id, node["name"])
+    for agent in get_agents(db, run_id):
+        print(agent["name"], agent["status"])
 ```
 
-### Live pipeline
-```python
-import swarm.adapters.Codex  # noqa: registers ClaudeExecutor
-import swarm.adapters.openai  # noqa: registers OpenAIExecutor
-from swarm.core.agent import AgentRequest
-from swarm.live.pipeline import pipeline
+Use `open_db()` for short-lived read-only access or `get_db()` as a context manager. Always call helpers from `swarm.storage.db` rather than raw SQL.
 
-results = await pipeline(
+### Path Helpers
+
+Centralized in `swarm/storage/paths.py`:
+
+- `get_run_dir(run_id)` — `.swarm/runs/<run_id>/`
+- `get_db_path(run_id)` — SQLite file
+- `get_worktrees_dir(run_id)` — worktree root
+- `get_logs_dir(run_id)` — logs root
+- `ensure_log_file(run_id, agent_name)` — create/open per-agent log
+
+### Coordination Tools
+
+Implementations live in `swarm/tools/worker.py` and `swarm/tools/manager.py`. They are wrapped as in-process MCP tools via `swarm/tools/factory.py` (`create_worker_tools`, `create_manager_tools`). Both worker and manager tools write directly to SQLite via `swarm.storage.db`; blocking tools (`request_clarification`, `report_blocker`) poll the `responses` table.
+
+### Programmatic Runs
+
+```python
+import asyncio
+from swarm import run, agent
+
+result = asyncio.run(run(
     [
-        AgentRequest(name="gen", profile="implementer", runtime="Codex",
-                     prompt="Write a fibonacci function"),
-        AgentRequest(name="rev", profile="reviewer", runtime="openai",
-                     prompt="Review the function above"),
+        agent("a", "first step", check="true"),
+        agent("b", "second step", check="true", depends_on=["a"]),
     ],
-    workspace="cwd",
-)
+    name="my-run",
+    use_mock=True,  # dev-only: skip SDK calls
+))
+print(result.run_id, result.success, result.completed)
 ```
 
-### Custom Executor
-```python
-from swarm.core.execution import Executor, ExecutionResult, register
-
-class MyExecutor(Executor):
-    runtime = "myruntime"
-    async def run(self, agent, ctx) -> ExecutionResult:
-        ...
-
-register(MyExecutor())
-```
+After the call, `swarm status <result.run_id>` / `swarm logs <result.run_id>` / `swarm merge <result.run_id>` all work as if the run had been started from the CLI.

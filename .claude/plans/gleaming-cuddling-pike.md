@@ -1,5 +1,11 @@
 # swarm multi-runtime refactor
 
+> **2026-04-19 update — partially superseded.**
+>
+> Phase 3 ("Live mode" as a reduced-feature runner with in-memory state, no DAG, no manager spawn) is **cancelled**. It has been replaced by a unified Python API (`swarm.run / pipeline / handoff / agent`) that always uses the same scheduler, worktrees, and SQLite state as the CLI. See `.claude/plans/lets-work-on-bringing-tender-zebra.md` for the cancellation rationale and the replacement design.
+>
+> **Phases 1, 2, and 4 remain valid** and should be reframed as "one runner with pluggable vendor executors" rather than "batch mode internals." When implementing them, build on top of `swarm/api.py` (introduced in the parity work) so both CLI and Python callers get the new runtimes for free.
+
 ## Context
 
 `~/dev/swarm` is a Python multi-agent orchestration framework. Today it runs on the Claude Agent SDK only. The user wants swarm to also run OpenAI Agents SDK workers as a first-class runtime, and to add a "live mode" for single-run agent handoffs (no YAML, no SQLite, no worktree ceremony).

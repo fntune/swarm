@@ -1,0 +1,180 @@
+"""Tests for the public Python API (swarm.api)."""
+
+import pytest
+
+from swarm import AgentSpec, PlanSpec, agent, handoff, pipeline, run
+from swarm.storage.db import get_agents, get_db, get_plan
+
+
+@pytest.fixture
+def swarm_env(tmp_path, monkeypatch):
+    """Point swarm at a fresh tmp directory and stub worktree creation."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".swarm" / "runs").mkdir(parents=True)
+
+    def fake_create_worktree(run_id, agent_name, *args, **kwargs):
+        path = tmp_path / ".swarm" / "runs" / run_id / "worktrees" / agent_name
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    monkeypatch.setattr("swarm.runtime.scheduler.create_worktree", fake_create_worktree)
+    monkeypatch.setattr(
+        "swarm.runtime.scheduler.setup_worktree_with_deps", lambda *a, **kw: None
+    )
+    return tmp_path
+
+
+def test_agent_builder_omits_none_fields():
+    """Passing None for optional kwargs should let pydantic defaults apply."""
+    spec = agent("a", "do X")
+    assert spec.name == "a"
+    assert spec.prompt == "do X"
+    assert spec.type == "worker"
+    assert spec.depends_on == []
+    assert spec.env == {}
+    assert spec.model is None  # None means "fall through to plan defaults"
+
+
+def test_agent_builder_passes_through_fields():
+    spec = agent(
+        "svc",
+        "build service",
+        depends_on=["db"],
+        check="pytest",
+        model="opus",
+        type="manager",
+        use_role="architect",
+        max_iterations=10,
+        max_cost_usd=2.5,
+        on_failure="retry",
+        retry_count=2,
+        env={"FOO": "bar"},
+    )
+    assert spec.depends_on == ["db"]
+    assert spec.check == "pytest"
+    assert spec.model == "opus"
+    assert spec.type == "manager"
+    assert spec.use_role == "architect"
+    assert spec.env == {"FOO": "bar"}
+
+
+@pytest.mark.asyncio
+async def test_run_single_agent_completes(swarm_env):
+    result = await run(
+        [agent("solo", "do the thing", check="true")],
+        name="api-single",
+        use_mock=True,
+    )
+
+    assert result.success is True
+    assert result.completed == ["solo"]
+    assert result.failed == []
+
+    with get_db(result.run_id) as db:
+        plan = get_plan(db, result.run_id)
+        assert plan is not None
+        assert plan["status"] == "completed"
+
+        agents = get_agents(db, result.run_id)
+        assert {a["name"]: a["status"] for a in agents} == {"solo": "completed"}
+
+
+@pytest.mark.asyncio
+async def test_run_with_explicit_run_id(swarm_env):
+    result = await run(
+        [agent("a", "task", check="true")],
+        run_id="explicit-run-id-001",
+        use_mock=True,
+    )
+    assert result.run_id == "explicit-run-id-001"
+    assert (swarm_env / ".swarm" / "runs" / "explicit-run-id-001" / "swarm.db").exists()
+
+
+@pytest.mark.asyncio
+async def test_run_with_dependency_runs_both(swarm_env):
+    result = await run(
+        [
+            agent("first", "step 1", check="true"),
+            agent("second", "step 2", check="true", depends_on=["first"]),
+        ],
+        name="api-deps",
+        use_mock=True,
+    )
+
+    assert result.success is True
+    assert set(result.completed) == {"first", "second"}
+
+
+@pytest.mark.asyncio
+async def test_plan_spec_input_is_accepted(swarm_env):
+    """run() should accept a PlanSpec directly, not just a list of agents."""
+    plan = PlanSpec(
+        name="direct-plan",
+        agents=[AgentSpec(name="x", prompt="task", check="true")],
+    )
+    result = await run(plan, use_mock=True)
+    assert result.success is True
+    assert result.completed == ["x"]
+
+
+@pytest.mark.asyncio
+async def test_invalid_plan_raises_value_error(swarm_env):
+    """Circular dependencies must be rejected before the scheduler runs."""
+    with pytest.raises(ValueError, match="Invalid plan"):
+        await run(
+            [
+                agent("a", "x", depends_on=["b"]),
+                agent("b", "y", depends_on=["a"]),
+            ],
+            use_mock=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_unknown_dependency_raises(swarm_env):
+    with pytest.raises(ValueError, match="Invalid plan"):
+        await run(
+            [agent("a", "x", depends_on=["nonexistent"])],
+            use_mock=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_pipeline_auto_chains_depends_on(swarm_env):
+    """pipeline() should thread depends_on by list order without mutating inputs."""
+    a = agent("a", "x", check="true")
+    b = agent("b", "y", check="true")
+    c = agent("c", "z", check="true")
+
+    result = await pipeline([a, b, c], name="api-pipeline", use_mock=True)
+
+    assert result.success is True
+    assert set(result.completed) == {"a", "b", "c"}
+
+    # Input specs must be untouched — pipeline copies, doesn't mutate.
+    assert a.depends_on == []
+    assert b.depends_on == []
+    assert c.depends_on == []
+
+
+@pytest.mark.asyncio
+async def test_pipeline_preserves_existing_depends_on(swarm_env):
+    """A step that already depends on something else keeps that edge."""
+    independent = agent("shared", "x", check="true")
+    a = agent("a", "y", check="true")
+    b = agent("b", "z", check="true", depends_on=["shared"])
+
+    result = await pipeline([independent, a, b], name="api-pipeline-mixed", use_mock=True)
+    assert result.success is True
+    assert set(result.completed) == {"shared", "a", "b"}
+
+
+@pytest.mark.asyncio
+async def test_handoff_runs_both(swarm_env):
+    result = await handoff(
+        agent("a", "first", check="true"),
+        agent("b", "second", check="true"),
+        use_mock=True,
+    )
+    assert result.success is True
+    assert set(result.completed) == {"a", "b"}

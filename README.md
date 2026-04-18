@@ -90,6 +90,38 @@ swarm run -p "find: List all deprecated API usages" \
 
 ---
 
+## Python API
+
+The same scheduler is available as a library — no YAML required. Runs started from Python are indistinguishable from CLI runs: same `.swarm/runs/<run-id>/` directory, same SQLite state, inspectable via `swarm status`, `swarm logs`, `swarm merge`, `swarm resume`.
+
+```python
+import asyncio
+from swarm import run, pipeline, handoff, agent
+
+# DAG with dependencies
+asyncio.run(run([
+    agent("design",    "Spec out JWT auth middleware",   use_role="architect"),
+    agent("implement", "Build it",                       use_role="implementer", depends_on=["design"]),
+    agent("test",      "Write tests for it",             use_role="tester",      depends_on=["implement"], check="cargo test auth"),
+], name="auth-feature"))
+
+# Sequential sugar — pipeline auto-chains depends_on by list order
+asyncio.run(pipeline([
+    agent("generate", "Write a fibonacci function"),
+    agent("review",   "Review the function above", use_role="reviewer"),
+]))
+
+# Two-step handoff
+asyncio.run(handoff(
+    agent("impl",  "Build the cache layer"),
+    agent("audit", "Audit the implementation", use_role="reviewer"),
+))
+```
+
+All scheduler features (retries, circuit breaker, manager spawn, blocking worker↔manager coordination, resume) work identically from both the CLI and the Python API.
+
+---
+
 ## Plan spec
 
 ```yaml

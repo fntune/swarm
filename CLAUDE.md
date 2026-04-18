@@ -38,6 +38,32 @@ swarm roles [name]                        # List/view available roles
 swarm run -p "test: true" --mock
 ```
 
+## Python API
+
+The same scheduler is also a library — runs started from Python land in the same `.swarm/runs/<run_id>/` and are inspectable via the CLI commands above.
+
+```python
+import asyncio
+from swarm import run, pipeline, handoff, agent
+
+# Full DAG run
+asyncio.run(run([
+    agent("a", "step 1"),
+    agent("b", "step 2", depends_on=["a"]),
+], name="my-run"))
+
+# Sequential sugar (auto-chains depends_on)
+asyncio.run(pipeline([
+    agent("gen", "generate"),
+    agent("rev", "review", use_role="reviewer"),
+]))
+
+# Two-step handoff
+asyncio.run(handoff(agent("impl", "build"), agent("audit", "review")))
+```
+
+`agent()` is a Python builder for `AgentSpec`; `run()` also accepts a full `PlanSpec` directly. All features (retries, circuit breaker, manager spawn, blocking coord, resume) work identically.
+
 ## Architecture
 
 ```
@@ -128,14 +154,14 @@ agents:
 ### Database Access
 Use `get_db()` context manager for all DB operations:
 ```python
-from swarm.db import get_db, get_agents
+from swarm.storage.db import get_db, get_agents
 
 with get_db(run_id) as db:
     agents = get_agents(db, run_id)
 ```
 
 ### Path Helpers
-Use centralized path helpers from `db.py`:
+Use centralized path helpers from `swarm.storage.paths`:
 - `get_run_dir(run_id)` - Base run directory
 - `get_db_path(run_id)` - SQLite database path
 - `get_logs_dir(run_id)` - Logs directory
@@ -143,6 +169,6 @@ Use centralized path helpers from `db.py`:
 - `ensure_log_file(run_id, agent_name)` - Create/get agent log path
 
 ### Coordination Tools
-Tool implementations live in `tools.py`, wrapped as SDK MCP tools in `executor.py`:
+Tool implementations live in `swarm/tools/worker.py` and `swarm/tools/manager.py`, wrapped as Claude SDK MCP tools via `swarm/tools/factory.py`:
 - Worker tools: `mark_complete`, `request_clarification`, `report_progress`, `report_blocker`
 - Manager tools: `spawn_worker`, `respond_to_clarification`, `cancel_worker`, etc.
