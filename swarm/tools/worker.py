@@ -1,8 +1,13 @@
-"""Worker coordination tools for claude-swarm agents."""
+"""Worker coordination tools for claude-swarm agents.
+
+Each public function returns a plain string intended for the caller agent.
+The Claude content-block wrapping (``{"content": [{"type": "text", "text": ...}]}``)
+is applied at the SDK boundary in ``swarm.tools.factory``; OpenAI
+``@function_tool`` wrappers will use the bare string unchanged.
+"""
 
 import asyncio
 import logging
-import os
 import subprocess
 
 from swarm.storage.db import (
@@ -40,18 +45,18 @@ async def _poll_for_response(
     return None
 
 
-async def mark_complete(run_id: str, agent_name: str, summary: str) -> dict:
+async def mark_complete(run_id: str, agent_name: str, summary: str) -> str:
     """Signal task completion. Runs check command automatically."""
     with get_db(run_id) as db:
         agent = get_agent(db, run_id, agent_name)
         if not agent:
-            return {"content": [{"type": "text", "text": f"ERROR: Agent {agent_name} not found"}]}
+            return f"ERROR: Agent {agent_name} not found"
 
         if agent["status"] in ("cancelled", "failed", "timeout", "cost_exceeded"):
             logger.warning(
                 f"Refusing mark_complete for {agent_name}: agent is in terminal state {agent['status']}"
             )
-            return {"content": [{"type": "text", "text": f"ERROR: Agent is in terminal state '{agent['status']}'. mark_complete ignored."}]}
+            return f"ERROR: Agent is in terminal state '{agent['status']}'. mark_complete ignored."
 
         check_cmd = agent["check_command"] or "true"
         worktree = agent["worktree"]
@@ -68,11 +73,11 @@ async def mark_complete(run_id: str, agent_name: str, summary: str) -> dict:
             update_agent_status(db, run_id, agent_name, "completed")
             insert_event(db, run_id, agent_name, "done", {"summary": summary})
             logger.info(f"Agent {agent_name} completed successfully")
-            return {"content": [{"type": "text", "text": "Task completed successfully. Check passed."}]}
+            return "Task completed successfully. Check passed."
         else:
             output = f"{result.stdout}\n{result.stderr}".strip()
             logger.warning(f"Check failed for {agent_name}: {output}")
-            return {"content": [{"type": "text", "text": f"Check failed. Fix and retry.\n\nOutput:\n{output}"}]}
+            return f"Check failed. Fix and retry.\n\nOutput:\n{output}"
 
 
 async def request_clarification(
@@ -81,7 +86,10 @@ async def request_clarification(
     question: str,
     escalate_to: str = "auto",
     timeout: int = 300,
-) -> dict:
+    *,
+    parent: str = "",
+    tree_path: str = "",
+) -> str:
     """Ask manager for guidance. BLOCKS until response received."""
     with get_db(run_id) as db:
         event_id = insert_event(
@@ -92,8 +100,8 @@ async def request_clarification(
             {
                 "question": question,
                 "escalate_to": escalate_to,
-                "parent_agent": os.environ.get("SWARM_PARENT_AGENT", ""),
-                "tree_path": os.environ.get("SWARM_TREE_PATH", ""),
+                "parent_agent": parent,
+                "tree_path": tree_path,
             },
         )
         update_agent_status(db, run_id, agent_name, "blocked")
@@ -101,16 +109,16 @@ async def request_clarification(
 
     response = await _poll_for_response(run_id, agent_name, event_id, timeout, "response")
     if response:
-        return {"content": [{"type": "text", "text": f"Manager response: {response['response']}"}]}
+        return f"Manager response: {response['response']}"
 
     with get_db(run_id) as db:
         update_agent_status(db, run_id, agent_name, "timeout", "Clarification timeout")
         insert_event(db, run_id, agent_name, "error", {"error": "Clarification timeout", "question": question})
     logger.error(f"Agent {agent_name} timed out waiting for clarification")
-    return {"content": [{"type": "text", "text": "ERROR: Clarification timeout. No response from manager."}]}
+    return "ERROR: Clarification timeout. No response from manager."
 
 
-async def report_progress(run_id: str, agent_name: str, status: str, milestone: str | None = None) -> dict:
+async def report_progress(run_id: str, agent_name: str, status: str, milestone: str | None = None) -> str:
     """Report progress update."""
     with get_db(run_id) as db:
         data = {"status": status}
@@ -119,10 +127,18 @@ async def report_progress(run_id: str, agent_name: str, status: str, milestone: 
 
         insert_event(db, run_id, agent_name, "progress", data)
         logger.info(f"Agent {agent_name} progress: {status}" + (f" (milestone: {milestone})" if milestone else ""))
-        return {"content": [{"type": "text", "text": "Progress recorded."}]}
+        return "Progress recorded."
 
 
-async def report_blocker(run_id: str, agent_name: str, issue: str, timeout: int = 300) -> dict:
+async def report_blocker(
+    run_id: str,
+    agent_name: str,
+    issue: str,
+    timeout: int = 300,
+    *,
+    parent: str = "",
+    tree_path: str = "",
+) -> str:
     """Report blocking issue. BLOCKS until manager responds."""
     with get_db(run_id) as db:
         event_id = insert_event(
@@ -133,8 +149,8 @@ async def report_blocker(run_id: str, agent_name: str, issue: str, timeout: int 
             {
                 "question": issue,
                 "escalate_to": "parent",
-                "parent_agent": os.environ.get("SWARM_PARENT_AGENT", ""),
-                "tree_path": os.environ.get("SWARM_TREE_PATH", ""),
+                "parent_agent": parent,
+                "tree_path": tree_path,
             },
         )
         update_agent_status(db, run_id, agent_name, "blocked")
@@ -142,10 +158,10 @@ async def report_blocker(run_id: str, agent_name: str, issue: str, timeout: int 
 
     response = await _poll_for_response(run_id, agent_name, event_id, timeout, "guidance")
     if response:
-        return {"content": [{"type": "text", "text": f"Manager guidance: {response['response']}"}]}
+        return f"Manager guidance: {response['response']}"
 
     with get_db(run_id) as db:
         update_agent_status(db, run_id, agent_name, "timeout", "Blocker timeout")
         insert_event(db, run_id, agent_name, "error", {"error": "Blocker timeout", "issue": issue})
     logger.error(f"Agent {agent_name} timed out waiting for blocker resolution")
-    return {"content": [{"type": "text", "text": "ERROR: Blocker timeout. No response from manager."}]}
+    return "ERROR: Blocker timeout. No response from manager."

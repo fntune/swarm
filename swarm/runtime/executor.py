@@ -121,7 +121,12 @@ async def run_worker(config: AgentConfig) -> dict:
         update_agent_status(db, config.run_id, config.name, "running")
         insert_event(db, config.run_id, config.name, "started", {"prompt": config.prompt[:200]})
 
-        worker_tools = create_worker_tools(config.run_id, config.name)
+        worker_tools = create_worker_tools(
+            config.run_id,
+            config.name,
+            parent=config.parent or "",
+            tree_path=config.tree_path(),
+        )
         server = create_sdk_mcp_server("swarm", "1.0.0", worker_tools)
 
         options = ClaudeAgentOptions(

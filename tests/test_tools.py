@@ -39,8 +39,8 @@ def test_mark_complete_agent_not_found(temp_swarm_dir):
 
     result = asyncio.run(mark_complete(run_id, "nonexistent", "Done"))
 
-    assert "ERROR" in result["content"][0]["text"]
-    assert "not found" in result["content"][0]["text"]
+    assert "ERROR" in result
+    assert "not found" in result
 
 
 def test_mark_complete_check_passes(temp_swarm_dir):
@@ -60,7 +60,7 @@ def test_mark_complete_check_passes(temp_swarm_dir):
 
     result = asyncio.run(mark_complete(run_id, "worker1", "Task completed"))
 
-    assert "completed successfully" in result["content"][0]["text"]
+    assert "completed successfully" in result
 
     db = init_db(run_id)
     agent = get_agent(db, run_id, "worker1")
@@ -85,7 +85,7 @@ def test_mark_complete_check_fails(temp_swarm_dir):
 
     result = asyncio.run(mark_complete(run_id, "worker1", "Done"))
 
-    assert "Check failed" in result["content"][0]["text"]
+    assert "Check failed" in result
 
 
 def test_report_progress(temp_swarm_dir):
@@ -98,7 +98,7 @@ def test_report_progress(temp_swarm_dir):
 
     result = asyncio.run(report_progress(run_id, "worker1", "50% complete", "halfway"))
 
-    assert "Progress recorded" in result["content"][0]["text"]
+    assert "Progress recorded" in result
 
 
 def test_spawn_worker_success(temp_swarm_dir):
@@ -111,7 +111,7 @@ def test_spawn_worker_success(temp_swarm_dir):
 
     result = asyncio.run(spawn_worker(run_id, "manager", "task1", "Do something", "pytest", "sonnet"))
 
-    assert "Spawned worker: manager.task1" in result["content"][0]["text"]
+    assert "Spawned worker: manager.task1" in result
 
     db = init_db(run_id)
     agent = get_agent(db, run_id, "manager.task1")
@@ -132,7 +132,7 @@ def test_spawn_worker_already_exists(temp_swarm_dir):
 
     result = asyncio.run(spawn_worker(run_id, "manager", "task1", "Do something"))
 
-    assert "already exists" in result["content"][0]["text"]
+    assert "already exists" in result
 
 
 def test_spawn_worker_rejects_invalid_name(temp_swarm_dir):
@@ -145,7 +145,7 @@ def test_spawn_worker_rejects_invalid_name(temp_swarm_dir):
 
     result = asyncio.run(spawn_worker(run_id, "manager", "../oops", "Do something"))
 
-    assert "Invalid worker name" in result["content"][0]["text"]
+    assert "Invalid worker name" in result
 
     db = init_db(run_id)
     agent = get_agent(db, run_id, "manager.../oops")
@@ -167,7 +167,7 @@ def test_cancel_worker_cannot_cancel_unowned_agent(temp_swarm_dir):
 
     result = asyncio.run(cancel_worker(run_id, "manager", "victim"))
 
-    assert "Worker not found" in result["content"][0]["text"]
+    assert "Worker not found" in result
 
     db = init_db(run_id)
     agent = get_agent(db, run_id, "victim")
@@ -187,7 +187,7 @@ def test_get_worker_status_cannot_read_unowned_agent(temp_swarm_dir):
     db.close()
 
     result = asyncio.run(get_worker_status(run_id, "manager", "victim"))
-    assert "Worker not found" in result["content"][0]["text"]
+    assert "Worker not found" in result
 
 
 def test_respond_to_clarification(temp_swarm_dir):
@@ -202,7 +202,7 @@ def test_respond_to_clarification(temp_swarm_dir):
 
     result = asyncio.run(respond_to_clarification(run_id, "manager", clarification_id, "Use JWT"))
 
-    assert "Response sent" in result["content"][0]["text"]
+    assert "Response sent" in result
 
     db = init_db(run_id)
     response = get_response(db, run_id, clarification_id)
@@ -223,7 +223,7 @@ def test_respond_to_clarification_rejects_unowned_request(temp_swarm_dir):
 
     result = asyncio.run(respond_to_clarification(run_id, "manager", clarification_id, "No"))
 
-    assert "Clarification not found" in result["content"][0]["text"]
+    assert "Clarification not found" in result
 
     db = init_db(run_id)
     response = get_response(db, run_id, clarification_id)
@@ -243,8 +243,8 @@ def test_mark_plan_complete_workers_pending(temp_swarm_dir):
 
     result = asyncio.run(mark_plan_complete(run_id, "manager", "All done"))
 
-    assert "Cannot complete" in result["content"][0]["text"]
-    assert "still running" in result["content"][0]["text"]
+    assert "Cannot complete" in result
+    assert "still running" in result
 
 
 def test_mark_plan_complete_success(temp_swarm_dir):
@@ -259,7 +259,7 @@ def test_mark_plan_complete_success(temp_swarm_dir):
 
     result = asyncio.run(mark_plan_complete(run_id, "manager", "All done"))
 
-    assert "Plan complete" in result["content"][0]["text"]
+    assert "Plan complete" in result
 
     db = init_db(run_id)
     agent = get_agent(db, run_id, "manager")
@@ -298,7 +298,7 @@ def test_cancel_worker_cancels_live_task(temp_swarm_dir):
 
     result, task = asyncio.run(_run())
 
-    assert "Cancelled worker" in result["content"][0]["text"]
+    assert "Cancelled worker" in result
     assert task.cancelled() or task.done()
 
     db = init_db(run_id)
@@ -321,7 +321,7 @@ def test_cancel_worker_preserves_other_terminal_states(temp_swarm_dir):
 
     result = asyncio.run(cancel_worker(run_id, "manager", "victim"))
 
-    assert "already in terminal state" in result["content"][0]["text"]
+    assert "already in terminal state" in result
 
     db = init_db(run_id)
     agent = get_agent(db, run_id, "manager.victim")
@@ -349,7 +349,7 @@ def test_mark_complete_refuses_cancelled_agent(temp_swarm_dir):
 
     result = asyncio.run(worker_mark_complete(run_id, "worker1", "Task done"))
 
-    text = result["content"][0]["text"]
+    text = result
     assert "ERROR" in text
     assert "terminal state" in text
 
@@ -371,7 +371,7 @@ def test_mark_plan_complete_accepts_cost_exceeded_workers(temp_swarm_dir):
 
     result = asyncio.run(mark_plan_complete(run_id, "manager", "All done"))
 
-    text = result["content"][0]["text"]
+    text = result
     assert "Plan complete" in text
     assert "Failed workers: ['task1']" in text
 
@@ -388,7 +388,7 @@ def test_spawn_worker_enforces_max_subagents(temp_swarm_dir):
 
     result = asyncio.run(spawn_worker(run_id, "manager", "w3", "third"))
 
-    text = result["content"][0]["text"]
+    text = result
     assert "max_subagents" in text
 
     db = init_db(run_id)
@@ -407,4 +407,4 @@ def test_spawn_worker_allows_under_max_subagents(temp_swarm_dir):
     db.close()
 
     result = asyncio.run(spawn_worker(run_id, "manager", "w2", "second"))
-    assert "Spawned worker: manager.w2" in result["content"][0]["text"]
+    assert "Spawned worker: manager.w2" in result
