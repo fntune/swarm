@@ -14,11 +14,11 @@ from swarm.runtime.executors.base import (
 )
 
 # Side-effect import: ClaudeExecutor registers itself.
-from swarm.runtime.executors import claude  # noqa: F401
+from swarm.runtime.executors import claude  # pyright: ignore[reportUnusedImport] # noqa: F401
 
 # OpenAI is optional. Skip registration if the SDK isn't installed.
 try:
-    from swarm.runtime.executors import openai  # noqa: F401
+    from swarm.runtime.executors import openai  # pyright: ignore[reportUnusedImport] # noqa: F401
 except ImportError:
     pass
 

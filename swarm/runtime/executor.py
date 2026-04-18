@@ -14,7 +14,7 @@ from pathlib import Path
 
 # Side-effect import: registers ClaudeExecutor (and OpenAIExecutor if the
 # optional extra is installed) in the executor registry.
-from swarm.runtime import executors as _executors  # noqa: F401
+from swarm.runtime import executors as _executors  # pyright: ignore[reportUnusedImport] # noqa: F401
 from swarm.runtime.executors.base import get_executor
 from swarm.storage.db import (
     insert_event,
