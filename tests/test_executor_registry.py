@@ -1,0 +1,38 @@
+"""Tests for the executor registry."""
+
+import pytest
+
+from swarm.runtime.executors import claude as _claude_executor_module  # noqa: F401
+from swarm.runtime.executors.base import (
+    EXECUTOR_REGISTRY,
+    Executor,
+    ExecutorNotFound,
+    get_executor,
+    register,
+)
+
+
+def test_claude_executor_is_registered():
+    ex = get_executor("claude")
+    assert ex.runtime == "claude"
+    assert isinstance(ex, Executor)
+
+
+def test_unknown_runtime_raises_executor_not_found():
+    with pytest.raises(ExecutorNotFound):
+        get_executor("definitely-not-a-runtime")
+
+
+def test_custom_register_roundtrip():
+    class DummyExecutor(Executor):
+        runtime = "dummy-test-runtime"
+
+        async def run(self, config, toolset):
+            return {"success": True, "status": "completed"}
+
+    dummy = DummyExecutor()
+    try:
+        register(dummy)
+        assert get_executor("dummy-test-runtime") is dummy
+    finally:
+        EXECUTOR_REGISTRY.pop("dummy-test-runtime", None)
