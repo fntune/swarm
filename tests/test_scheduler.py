@@ -214,6 +214,29 @@ def test_resume_only_resets_retryable_agents(temp_swarm_dir, monkeypatch):
     resumed.db.close()
 
 
+def test_resume_requeues_paused_agents(temp_swarm_dir, monkeypatch):
+    """Manual resume should restart agents paused by cost/circuit-breaker logic."""
+    monkeypatch.chdir(temp_swarm_dir)
+
+    agents = [AgentSpec(name="paused_worker", prompt="Resume me")]
+    plan = create_test_plan(agents)
+
+    scheduler = Scheduler(plan, run_id="test-run-paused-resume", use_mock=True)
+    scheduler._init_db()
+    update_plan_status(scheduler.db, "test-run-paused-resume", "paused")
+    update_agent_status(scheduler.db, "test-run-paused-resume", "paused_worker", "paused", "Paused by budget")
+    scheduler.db.close()
+
+    resumed = Scheduler(plan, run_id="test-run-paused-resume", use_mock=True, resume=True)
+    resumed._init_db()
+
+    paused_worker = get_agent(resumed.db, "test-run-paused-resume", "paused_worker")
+    assert paused_worker["status"] == "pending"
+    assert paused_worker["error"] is None
+
+    resumed.db.close()
+
+
 @pytest.mark.asyncio
 async def test_spawn_agent_propagates_agentspec_env(temp_swarm_dir, monkeypatch):
     """AgentSpec.env should survive persist-then-rehydrate into AgentConfig."""
@@ -459,3 +482,47 @@ def test_check_circuit_breaker_below_threshold(temp_swarm_dir, monkeypatch):
     assert should_stop is False
 
     scheduler.db.close()
+
+
+@pytest.mark.asyncio
+async def test_cost_exceeded_is_terminal_and_not_retried(temp_swarm_dir, monkeypatch):
+    """Per-agent max cost should be terminal, not retried via on_failure=retry."""
+    monkeypatch.chdir(temp_swarm_dir)
+
+    agents = [AgentSpec(name="a", prompt="Task A", on_failure="retry", retry_count=2)]
+    plan = create_test_plan(agents)
+    scheduler = Scheduler(plan, run_id="test-run-cost-terminal", use_mock=True)
+
+    spawn_count = 0
+
+    async def fake_spawn_agent(self, agent_row):
+        async def finish():
+            update_agent_status(
+                self.db,
+                self.run_id,
+                agent_row["name"],
+                "cost_exceeded",
+                "Cost exceeded: $9.0000",
+            )
+            return {"success": False, "status": "cost_exceeded", "error": "cost_exceeded"}
+
+        nonlocal spawn_count
+        spawn_count += 1
+        return asyncio.create_task(finish())
+
+    monkeypatch.setattr(Scheduler, "_spawn_agent", fake_spawn_agent)
+
+    result = await scheduler.run()
+
+    db = open_db("test-run-cost-terminal")
+    agent_row = db.execute(
+        "SELECT status, retry_attempt FROM agents WHERE run_id = ? AND name = ?",
+        ("test-run-cost-terminal", "a"),
+    ).fetchone()
+    db.close()
+
+    assert spawn_count == 1
+    assert result.success is False
+    assert result.failed == ["a"]
+    assert agent_row["status"] == "cost_exceeded"
+    assert agent_row["retry_attempt"] == 0

@@ -56,3 +56,30 @@ Runtime: ~20m
   - implementation follow-up ts: none yet for `swarm`
 
 Runtime: ~15m
+
+## 2026-04-18 09:10:36 IST
+
+- Repo: `/Users/sour4bh/dev/swarm`
+- Prior clarification check:
+  - Re-read the prior `#scanner` thread for `swarm` (`1776397463.433029`) and confirmed there was still no reply from `<@U0A60F61XLH>` to act on.
+- Patched this run:
+  - `swarm/storage/db.py` + `swarm/runtime/scheduler.py` now reset `paused` agents back to `pending` on `resume`, so manual resume after cost/circuit-breaker pauses actually restarts runnable work.
+  - `swarm/cli.py` + `swarm/runtime/scheduler.py` now mark pending/blocked work cancelled too, so cancelled runs no longer leave non-terminal agent rows behind.
+  - `swarm/runtime/executor.py` + `swarm/runtime/scheduler.py` now record per-agent budget overruns as `cost_exceeded` instead of generic `failed`, so retry policy no longer retries budget exhaustion and final status reporting stays accurate.
+  - `swarm/tools/manager.py` now treats `cost_exceeded` / `timeout` as terminal in cancel/complete flows instead of overwriting or blocking on them.
+  - `swarm/cli.py` dashboard terminal-state handling now exits cleanly for `paused`, `timeout`, and `cost_exceeded`.
+  - Confirmed the older `AgentSpec.env` gap is no longer open: `insert_agent(... env=...)` persists it and scheduler `_spawn_agent()` hydrates it into `AgentConfig`; the regression is covered by `tests/test_scheduler.py::test_spawn_agent_propagates_agentspec_env`.
+- Validation:
+  - `pytest tests -q --ignore=tests/sdklive` (`125 passed`)
+  - `pytest tests/test_scheduler.py::test_resume_requeues_paused_agents tests/test_scheduler.py::test_cost_exceeded_is_terminal_and_not_retried tests/test_cli.py::test_cancel_command_marks_pending_and_blocked_agents_cancelled tests/test_tools.py::test_cancel_worker_preserves_other_terminal_states tests/test_tools.py::test_mark_plan_complete_accepts_cost_exceeded_workers -q` (`5 passed`)
+  - Repro: `python -m swarm.cli profiles` still fails with `No such command 'profiles'`.
+  - Repro: parsing a YAML plan with `profile` / `runtime` silently drops those keys from the resulting `PlanSpec`.
+- Remaining NEEDS_DECISION items:
+  - `ManagerSettings` still exposes `event_poll_interval` and `guidance_enabled`, but the runtime never reads them.
+  - `AGENTS.md` still advertises `profiles` + `runtime`, while the shipped CLI/parser still expose `roles` only and silently ignore `profile` / `runtime`.
+- Slack report posted to `#scanner` (`C0ATV9HBN9F`):
+  - parent message ts: `1776483636.162459`
+  - decision thread reply ts: `1776483653.874899`
+  - implementation follow-up ts: `1776483655.699259`
+
+Runtime: 2026-04-18 09:10:36 IST

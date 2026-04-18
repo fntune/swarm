@@ -307,6 +307,28 @@ def test_cancel_worker_cancels_live_task(temp_swarm_dir):
     assert agent["status"] == "cancelled"
 
 
+def test_cancel_worker_preserves_other_terminal_states(temp_swarm_dir):
+    """cancel_worker must not overwrite timeout/cost terminal reasons."""
+    from swarm.tools.manager import cancel_worker
+
+    run_id = "test-cancel-terminal-state"
+    db = init_db(run_id)
+    insert_plan(db, run_id, "test", "name: test", 25.0)
+    insert_agent(db, run_id, "manager", "Manage", agent_type="manager")
+    insert_agent(db, run_id, "manager.victim", "work", parent="manager")
+    update_agent_status(db, run_id, "manager.victim", "cost_exceeded", "budget")
+    db.close()
+
+    result = asyncio.run(cancel_worker(run_id, "manager", "victim"))
+
+    assert "already in terminal state" in result["content"][0]["text"]
+
+    db = init_db(run_id)
+    agent = get_agent(db, run_id, "manager.victim")
+    db.close()
+    assert agent["status"] == "cost_exceeded"
+
+
 def test_mark_complete_refuses_cancelled_agent(temp_swarm_dir):
     """A cancelled agent must not be able to flip itself back to completed."""
     from swarm.tools.worker import mark_complete as worker_mark_complete
@@ -335,6 +357,23 @@ def test_mark_complete_refuses_cancelled_agent(temp_swarm_dir):
     agent = get_agent(db, run_id, "worker1")
     db.close()
     assert agent["status"] == "cancelled"
+
+
+def test_mark_plan_complete_accepts_cost_exceeded_workers(temp_swarm_dir):
+    """Managers should be able to finish when only terminal cost failures remain."""
+    run_id = "test-plan-complete-cost-terminal"
+    db = init_db(run_id)
+    insert_plan(db, run_id, "test", "name: test", 25.0)
+    insert_agent(db, run_id, "manager", "Manage workers", agent_type="manager")
+    insert_agent(db, run_id, "manager.task1", "Task 1", parent="manager")
+    update_agent_status(db, run_id, "manager.task1", "cost_exceeded", "budget")
+    db.close()
+
+    result = asyncio.run(mark_plan_complete(run_id, "manager", "All done"))
+
+    text = result["content"][0]["text"]
+    assert "Plan complete" in text
+    assert "Failed workers: ['task1']" in text
 
 
 def test_spawn_worker_enforces_max_subagents(temp_swarm_dir):

@@ -170,9 +170,9 @@ async def run_worker(config: AgentConfig) -> dict:
 
         if total_cost > config.max_cost_usd:
             logger.warning(f"Worker {config.name} exceeded cost budget (${total_cost:.4f} > ${config.max_cost_usd:.2f})")
-            update_agent_status(db, config.run_id, config.name, "failed", f"Cost exceeded: ${total_cost:.4f}")
+            update_agent_status(db, config.run_id, config.name, "cost_exceeded", f"Cost exceeded: ${total_cost:.4f}")
             insert_event(db, config.run_id, config.name, "error", {"error": "cost_exceeded", "cost": total_cost, "budget": config.max_cost_usd})
-            return {"success": False, "status": "failed", "cost": total_cost, "error": "cost_exceeded"}
+            return {"success": False, "status": "cost_exceeded", "cost": total_cost, "error": "cost_exceeded"}
 
         agent = get_agent(db, config.run_id, config.name)
         final_status = agent["status"] if agent else "unknown"
@@ -180,7 +180,7 @@ async def run_worker(config: AgentConfig) -> dict:
         if final_status == "completed":
             logger.info(f"Worker {config.name} completed (cost: ${total_cost:.4f})")
             return {"success": True, "status": "completed", "cost": total_cost, "session_id": session_id}
-        elif final_status in ("failed", "timeout", "cancelled"):
+        elif final_status in ("failed", "timeout", "cancelled", "cost_exceeded"):
             logger.warning(f"Worker {config.name} ended with status: {final_status}")
             return {"success": False, "status": final_status, "cost": total_cost}
         else:
@@ -295,9 +295,9 @@ async def run_manager(config: AgentConfig) -> dict:
 
         if total_cost > config.max_cost_usd:
             logger.warning(f"Manager {config.name} exceeded cost budget (${total_cost:.4f} > ${config.max_cost_usd:.2f})")
-            update_agent_status(db, config.run_id, config.name, "failed", f"Cost exceeded: ${total_cost:.4f}")
+            update_agent_status(db, config.run_id, config.name, "cost_exceeded", f"Cost exceeded: ${total_cost:.4f}")
             insert_event(db, config.run_id, config.name, "error", {"error": "cost_exceeded", "cost": total_cost, "budget": config.max_cost_usd})
-            return {"success": False, "status": "failed", "cost": total_cost, "error": "cost_exceeded"}
+            return {"success": False, "status": "cost_exceeded", "cost": total_cost, "error": "cost_exceeded"}
 
         agent = get_agent(db, config.run_id, config.name)
         final_status = agent["status"] if agent else "unknown"
@@ -306,7 +306,7 @@ async def run_manager(config: AgentConfig) -> dict:
             logger.info(f"Manager {config.name} completed (cost: ${total_cost:.4f})")
             return {"success": True, "status": "completed", "cost": total_cost, "session_id": session_id}
         else:
-            if final_status not in ("failed", "timeout", "cancelled"):
+            if final_status not in ("failed", "timeout", "cancelled", "cost_exceeded"):
                 update_agent_status(db, config.run_id, config.name, "timeout", "Max iterations")
             return {"success": False, "status": final_status, "cost": total_cost}
 

@@ -164,6 +164,36 @@ def test_cancel_command(runner, temp_swarm_dir):
     assert "Agents cancelled: 1" in result.output
 
 
+def test_cancel_command_marks_pending_and_blocked_agents_cancelled(runner, temp_swarm_dir):
+    """Cancelling a run should not leave pending/blocked agents behind."""
+    run_id = "test-cancel-pending"
+    db = init_db(run_id)
+    insert_plan(db, run_id, "test-plan", "running", "name: test")
+    insert_agent(db, run_id, "running_agent", "Run now")
+    insert_agent(db, run_id, "pending_agent", "Queued")
+    insert_agent(db, run_id, "blocked_agent", "Waiting")
+    update_agent_status(db, run_id, "running_agent", "running")
+    update_agent_status(db, run_id, "blocked_agent", "blocked")
+    db.close()
+
+    result = runner.invoke(main, ["cancel", run_id])
+    assert result.exit_code == 0
+    assert "Agents cancelled: 3" in result.output
+
+    db = init_db(run_id)
+    statuses = {
+        row["name"]: row["status"]
+        for row in db.execute("SELECT name, status FROM agents WHERE run_id = ?", (run_id,)).fetchall()
+    }
+    db.close()
+
+    assert statuses == {
+        "running_agent": "cancelled",
+        "pending_agent": "cancelled",
+        "blocked_agent": "cancelled",
+    }
+
+
 def test_cancel_nonexistent_run(runner, temp_swarm_dir):
     """Test cancel command with nonexistent run."""
     result = runner.invoke(main, ["cancel", "nonexistent"])

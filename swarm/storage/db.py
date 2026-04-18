@@ -510,6 +510,31 @@ def reset_failed_agents(db: sqlite3.Connection, run_id: str) -> list[str]:
     return names
 
 
+def reset_paused_agents(db: sqlite3.Connection, run_id: str) -> list[str]:
+    """Reset paused agents to pending so a paused run can resume."""
+    agents = db.execute(
+        """SELECT name FROM agents
+           WHERE run_id = ?
+             AND status = 'paused'""",
+        (run_id,),
+    ).fetchall()
+
+    names = [a["name"] for a in agents]
+
+    if names:
+        db.execute(
+            """UPDATE agents SET status = 'pending', error = NULL, iteration = 0,
+               updated_at = CURRENT_TIMESTAMP
+               WHERE run_id = ?
+                 AND status = 'paused'""",
+            (run_id,),
+        )
+        db.commit()
+        logger.info(f"Reset {len(names)} paused agents for resume: {names}")
+
+    return names
+
+
 def list_runs(base_path: Path | None = None) -> list[str]:
     """List all run IDs."""
     base = base_path or Path.cwd()

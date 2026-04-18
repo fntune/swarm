@@ -244,11 +244,12 @@ def cancel(run_id: str) -> None:
         # Update plan status
         update_plan_status(db, run_id, "cancelled")
 
-        # Cancel running agents
+        # Mark every non-terminal agent as cancelled so the DB reflects the
+        # whole run state even if no scheduler process is currently active.
         agents = get_agents(db, run_id)
         cancelled = 0
         for agent in agents:
-            if agent["status"] == "running":
+            if agent["status"] not in ("completed", "failed", "timeout", "cancelled", "cost_exceeded"):
                 update_agent_status(db, run_id, agent["name"], "cancelled")
                 cancelled += 1
 
@@ -350,11 +351,16 @@ def dashboard(run_id: str) -> None:
                     "failed": "❌",
                     "cancelled": "🚫",
                     "paused": "⏸️",
+                    "timeout": "⌛",
+                    "cost_exceeded": "💸",
                 }.get(agent["status"], "?")
                 click.echo(f"{icon} {agent['name']}: {agent['status']}")
 
             # Check if done
-            all_done = all(a["status"] in ("completed", "failed", "cancelled") for a in agents)
+            all_done = all(
+                a["status"] in ("completed", "failed", "timeout", "cancelled", "cost_exceeded", "paused")
+                for a in agents
+            )
             if all_done:
                 click.echo("\nAll agents finished.")
                 break

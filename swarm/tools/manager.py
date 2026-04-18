@@ -124,7 +124,7 @@ async def cancel_worker(run_id: str, manager_name: str, name: str) -> dict:
             return {"content": [{"type": "text", "text": f"Worker not found: {name}"}]}
 
         worker_name = agent["name"]
-        if agent["status"] in ("completed", "failed", "cancelled"):
+        if agent["status"] in ("completed", "failed", "timeout", "cancelled", "cost_exceeded"):
             return {"content": [{"type": "text", "text": f"Worker {worker_name} already in terminal state: {agent['status']}"}]}
 
         # Flip status first so a racing mark_complete on the worker refuses
@@ -202,7 +202,7 @@ async def mark_plan_complete(run_id: str, manager_name: str, summary: str) -> di
         all_agents = get_agents(db, run_id)
         workers = [a for a in all_agents if a["parent"] == manager_name]
 
-        pending = [w for w in workers if w["status"] not in ("completed", "failed", "cancelled", "timeout")]
+        pending = [w for w in workers if w["status"] not in ("completed", "failed", "cancelled", "timeout", "cost_exceeded")]
         if pending:
             names = [w["name"].split(".")[-1] for w in pending]
             return {"content": [{"type": "text", "text": f"Cannot complete: workers still running: {names}"}]}
@@ -210,7 +210,11 @@ async def mark_plan_complete(run_id: str, manager_name: str, summary: str) -> di
         update_agent_status(db, run_id, manager_name, "completed")
         insert_event(db, run_id, manager_name, "done", {"summary": summary})
 
-        failed_workers = [w["name"].split(".")[-1] for w in workers if w["status"] == "failed"]
+        failed_workers = [
+            w["name"].split(".")[-1]
+            for w in workers
+            if w["status"] in ("failed", "timeout", "cost_exceeded")
+        ]
         completed_workers = [w["name"].split(".")[-1] for w in workers if w["status"] == "completed"]
 
         result = f"Plan complete. Completed workers: {completed_workers}"

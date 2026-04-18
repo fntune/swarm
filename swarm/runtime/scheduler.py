@@ -24,6 +24,7 @@ from swarm.storage.db import (
     open_db,
     reset_agent_for_retry,
     reset_failed_agents,
+    reset_paused_agents,
     run_exists,
     update_agent_status,
     update_agent_worktree,
@@ -114,6 +115,10 @@ class Scheduler:
             reset_names = reset_failed_agents(self.db, self.run_id)
             if reset_names:
                 logger.info(f"Reset agents for retry: {reset_names}")
+
+            resumed_names = reset_paused_agents(self.db, self.run_id)
+            if resumed_names:
+                logger.info(f"Reset paused agents for resume: {resumed_names}")
 
             agents = get_agents(self.db, self.run_id)
             completed = [a["name"] for a in agents if a["status"] == "completed"]
@@ -438,7 +443,7 @@ Please address this error and continue with the task.
         agents = get_agents(self.db, self.run_id)
 
         completed = [a["name"] for a in agents if a["status"] == "completed"]
-        failed = [a["name"] for a in agents if a["status"] in ("failed", "timeout", "cancelled")]
+        failed = [a["name"] for a in agents if a["status"] in ("failed", "timeout", "cancelled", "cost_exceeded")]
         total_cost = get_total_cost(self.db, self.run_id)
 
         success = len(failed) == 0 and len(completed) == len(agents)
@@ -477,12 +482,7 @@ Please address this error and continue with the task.
                 plan = get_plan(self.db, self.run_id)
                 if plan and plan["status"] == "cancelled":
                     logger.info("Run cancelled externally")
-                    # Cancel all running tasks
-                    for name, task in self.tasks.items():
-                        if not task.done():
-                            task.cancel()
-                            task_registry.unregister(self.run_id, name)
-                            update_agent_status(self.db, self.run_id, name, "cancelled")
+                    self._cancel_all_tasks("cancelled", "Run cancelled externally", include_pending=True)
                     break
 
                 # Find ready agents
