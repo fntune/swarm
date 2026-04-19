@@ -4,8 +4,8 @@ import pytest
 from pydantic import ValidationError
 
 from swarm.models.specs import AgentSpec, Defaults, PlanSpec
-from swarm.io.parser import parse_plan_yaml
-from swarm.io.plan_builder import create_inline_plan, infer_agent_name, parse_inline_agents
+from swarm.io.parser import parse_plan_file, parse_plan_yaml
+from swarm.io.plan_builder import create_inline_plan, infer_agent_name, load_shared_context, parse_inline_agents
 from swarm.io.validation import has_circular_deps, validate_plan
 
 
@@ -50,6 +50,32 @@ agents:
 """
     with pytest.raises(ValidationError):
         parse_plan_yaml(yaml_content)
+
+
+def test_parse_plan_file_resolves_shared_context_relative_to_plan(tmp_path, monkeypatch):
+    """shared_context entries should resolve relative to the plan file, not cwd."""
+    plan_dir = tmp_path / "plans"
+    plan_dir.mkdir()
+    context = plan_dir / "ctx.txt"
+    context.write_text("hello context")
+    plan_file = plan_dir / "plan.yaml"
+    plan_file.write_text(
+        """
+name: shared-context
+shared_context:
+  - ctx.txt
+agents:
+  - name: worker1
+    prompt: Do something
+"""
+    )
+
+    monkeypatch.chdir(tmp_path)
+
+    plan = parse_plan_file(plan_file)
+
+    assert plan.shared_context == [str(context.resolve())]
+    assert "hello context" in load_shared_context(plan.shared_context)
 
 
 def test_validate_plan_unknown_dep():

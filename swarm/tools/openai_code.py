@@ -28,11 +28,19 @@ except ImportError as err:  # pragma: no cover
     ) from err
 
 
-def build_code_tools(cwd: Path, *, write_allowed: bool = True) -> list[Any]:
+def build_code_tools(
+    cwd: Path,
+    *,
+    write_allowed: bool = True,
+    env: dict[str, str] | None = None,
+) -> list[Any]:
     """Return the list of code tools an OpenAI agent should have.
 
     Closes over ``cwd`` so each agent stays inside its own worktree.
     """
+    shell_env = os.environ.copy()
+    if env:
+        shell_env.update(env)
 
     @function_tool(name_override="Read")
     def read_file(path: str) -> str:
@@ -99,6 +107,7 @@ def build_code_tools(cwd: Path, *, write_allowed: bool = True) -> list[Any]:
                 shell=True,
                 cwd=str(cwd),
                 capture_output=True,
+                env=shell_env,
                 text=True,
                 timeout=timeout_seconds,
             )

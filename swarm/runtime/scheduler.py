@@ -83,7 +83,7 @@ class Scheduler:
         self.db: sqlite3.Connection = None  # type: ignore[assignment]  # Set in run()
         self.failure_count = 0
         self.idle_iterations = 0
-        self.last_event_count = 0
+        self.last_event_marker: str | None = None
 
     def _cancel_all_tasks(self, status: str, message: str = "", include_pending: bool = False) -> None:
         """Cancel all running tasks and update their status.
@@ -419,16 +419,18 @@ Please address this error and continue with the task.
 
         Returns True if run appears stuck.
         """
-        # Get current event count
+        # Use the newest recent event as the progress marker. A raw count is
+        # not stable enough because get_recent_events() is capped and active
+        # runs can sit at the same count while still making progress.
         events = get_recent_events(self.db, self.run_id, since_seconds=60)
-        current_count = len(events)
+        current_marker = events[0]["id"] if events else None
 
-        if current_count == self.last_event_count and self.tasks:
+        if current_marker == self.last_event_marker and self.tasks:
             self.idle_iterations += 1
         else:
             self.idle_iterations = 0
 
-        self.last_event_count = current_count
+        self.last_event_marker = current_marker
 
         # Default stuck threshold: N iterations of no progress
         stuck_threshold = STUCK_THRESHOLD_ITERATIONS

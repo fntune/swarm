@@ -7,6 +7,7 @@ The Claude content-block wrapping is applied at the SDK boundary in
 
 import logging
 import re
+import sqlite3
 
 from swarm.runtime import task_registry
 from swarm.storage.db import (
@@ -24,7 +25,7 @@ logger = logging.getLogger("swarm.tools.manager")
 VALID_WORKER_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
-def _get_owned_worker(db, run_id: str, manager_name: str, name: str):
+def _get_owned_worker(db: sqlite3.Connection, run_id: str, manager_name: str, name: str):
     """Resolve a worker only if it belongs to the manager."""
     worker_name = name if "." in name else f"{manager_name}.{name}"
     agent = get_agent(db, run_id, worker_name)
@@ -54,6 +55,19 @@ async def spawn_worker(
 
         manager = get_agent(db, run_id, manager_name)
         default_check = manager["check_command"] if manager else "true"
+        worker_runtime = "claude"
+        worker_cost_source = "sdk"
+        if manager is not None:
+            try:
+                worker_runtime = manager["runtime"] or "claude"
+            except (IndexError, KeyError):
+                worker_runtime = "claude"
+            try:
+                worker_cost_source = manager["cost_source"] or (
+                    "estimated" if worker_runtime == "openai" else "sdk"
+                )
+            except (IndexError, KeyError):
+                worker_cost_source = "estimated" if worker_runtime == "openai" else "sdk"
 
         # Enforce manager's max_subagents cap before any worktree/DB side effects.
         max_subagents = None
@@ -92,6 +106,8 @@ async def spawn_worker(
             check_command=check or default_check,
             model=model,
             parent=manager_name,
+            runtime=worker_runtime,
+            cost_source=worker_cost_source,
         )
 
         insert_event(db, run_id, manager_name, "progress", {

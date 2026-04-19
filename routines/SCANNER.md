@@ -83,3 +83,33 @@ Runtime: ~15m
   - implementation follow-up ts: `1776483655.699259`
 
 Runtime: 2026-04-18 09:10:36 IST
+
+## 2026-04-19 09:16:51 IST
+
+- Repo: `/Users/sour4bh/dev/swarm`
+- Commit scanned: `54e012f`
+- Prior clarification check:
+  - Re-read the prior `#scanner` thread for `swarm` (`1776483636.162459`) and confirmed there was still no reply from `<@U0A60F61XLH>` to act on.
+- Patched this run:
+  - `swarm/tools/manager.py` now makes manager-spawned workers inherit the parent manager runtime/cost source, so OpenAI managers no longer silently spawn Claude workers.
+  - `swarm/gitops/worktrees.py` now imports dependency deletions/renames correctly in `diff_only` and `paths` modes, so dependent worktrees stop keeping stale files that the dependency branch removed.
+  - `swarm/runtime/executors/openai.py` + `swarm/tools/openai_code.py` now pass agent `env` plus `SWARM_*` runtime vars into OpenAI Bash tools, restoring cross-runtime env parity.
+  - `swarm/io/parser.py` now resolves `shared_context` entries relative to the plan file directory instead of the shell cwd.
+  - `swarm/runtime/scheduler.py` + `swarm/storage/db.py` now use the newest event id for stuck detection, avoiding false stuck warnings when the recent-event window stays capped at 50 rows.
+- Validation:
+  - `pytest tests -q --ignore=tests/sdklive` (`154 passed`)
+  - `pyright swarm` (`0 errors`)
+  - Repro: an OpenAI manager previously inserted `runtime='claude'` / `cost_source='sdk'` for spawned children; it now preserves `openai` / `estimated`.
+  - Repro: deleting a file in a dependency branch previously left the stale file in dependent `diff_only` / `paths` worktrees; the child worktree now removes it.
+  - Repro: a plan file in a subdirectory with `shared_context: [ctx.txt]` previously loaded no context from repo root; it now loads the sibling file correctly.
+  - Repro: OpenAI Bash tools previously printed `unset` for agent env vars like `MY_FLAG`; they now receive the configured env.
+- Remaining NEEDS_DECISION items:
+  - `ManagerSettings` still exposes `event_poll_interval` / `guidance_enabled`, but the runtime never reads them.
+  - `PlanSpec.on_complete` and `Orchestration.merge` are still public, but merge behavior remains manual via `swarm merge`.
+  - `--mock` still routes manager agents through the real SDK path instead of a mock/no-op manager path.
+- Slack report posted to `#scanner` (`C0ATV9HBN9F`):
+  - parent message ts: `1776570372.175849`
+  - decision thread reply ts: `1776570386.702829`
+  - implementation follow-up ts: `1776570395.372499`
+
+Runtime: ~45m

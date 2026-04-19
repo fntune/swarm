@@ -19,7 +19,19 @@ def parse_plan_file(path: Path) -> PlanSpec:
     """
     with open(path) as f:
         content = f.read()
-    return parse_plan_yaml(content)
+    plan = parse_plan_yaml(content)
+
+    if plan.shared_context:
+        resolved = []
+        for entry in plan.shared_context:
+            entry_path = Path(entry)
+            if entry_path.is_absolute():
+                resolved.append(str(entry_path))
+            else:
+                resolved.append(str((path.parent / entry_path).resolve()))
+        plan = plan.model_copy(update={"shared_context": resolved})
+
+    return plan
 
 
 def parse_plan_yaml(content: str) -> PlanSpec:
@@ -45,4 +57,3 @@ def generate_run_id(plan_name: str) -> str:
         Run ID string
     """
     return f"{plan_name}-{uuid4().hex[:8]}"
-

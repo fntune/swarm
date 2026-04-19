@@ -36,6 +36,19 @@ logger = logging.getLogger("swarm.executors.openai")
 DEFAULT_OPENAI_MODEL = "gpt-5"
 
 
+def _build_agent_env(config: AgentConfig) -> dict[str, str]:
+    """Build environment variables exposed to OpenAI code tools."""
+    env = {
+        "SWARM_RUN_ID": config.run_id,
+        "SWARM_AGENT_NAME": config.name,
+        "SWARM_PARENT_AGENT": config.parent or "",
+        "SWARM_TREE_PATH": config.tree_path(),
+    }
+    if config.env:
+        env.update(config.env)
+    return env
+
+
 class OpenAIExecutor(Executor):
     """Drive an agent via the OpenAI Agents SDK (``openai-agents``)."""
 
@@ -60,7 +73,11 @@ class OpenAIExecutor(Executor):
                     parent=config.parent or "",
                     tree_path=config.tree_path(),
                 )
-            code_tools = build_code_tools(config.worktree, write_allowed=toolset.write_allowed)
+            code_tools = build_code_tools(
+                config.worktree,
+                write_allowed=toolset.write_allowed,
+                env=_build_agent_env(config),
+            )
 
             model = config.model if config.model and config.model != "sonnet" else DEFAULT_OPENAI_MODEL
 

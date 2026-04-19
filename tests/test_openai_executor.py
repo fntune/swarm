@@ -5,16 +5,21 @@ Skipped when the openai-agents SDK isn't installed (optional [openai] extra).
 
 from __future__ import annotations
 
+import asyncio
+import json
 import pytest
 
 pytest.importorskip("agents", reason="openai-agents SDK not installed")
 
-from pathlib import Path
+from types import SimpleNamespace
 
 from swarm.core.budget import estimate_cost_usd
 from swarm.runtime.executors.base import get_executor
 from swarm.runtime.executors.openai import OpenAIExecutor
+from swarm.runtime.executor import AgentConfig
+from swarm.storage.db import get_agent, init_db, insert_agent, insert_plan
 from swarm.tools.openai_code import build_code_tools
+from swarm.tools.toolset import worker_toolset
 
 
 def test_openai_executor_registers():
@@ -49,6 +54,20 @@ def test_code_tools_read_only_strips_write_edit_bash(tmp_path):
     tools = build_code_tools(tmp_path, write_allowed=False)
     names = {t.name for t in tools}
     assert names == {"Read", "Glob", "Grep"}
+
+
+def test_code_tools_bash_receives_explicit_env(tmp_path):
+    tools = build_code_tools(tmp_path, env={"MY_FLAG": "set"})
+    bash = next(t for t in tools if t.name == "Bash")
+
+    output = asyncio.run(
+        bash.on_invoke_tool(
+            None,
+            json.dumps({"command": "printf ${MY_FLAG-unset}", "timeout_seconds": 1}),
+        )
+    )
+
+    assert output == "set"
 
 
 def test_factory_openai_builds_coord_tools():
@@ -101,3 +120,73 @@ async def test_api_accepts_openai_runtime_on_agentspec(tmp_path, monkeypatch):
         ).fetchone()
     assert row["runtime"] == "openai"
     assert row["cost_source"] == "estimated"
+
+
+@pytest.mark.asyncio
+async def test_openai_executor_passes_agent_env_to_bash(tmp_path, monkeypatch):
+    """OpenAI runtime Bash tool should see the same agent env as Claude runtime."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".swarm" / "runs").mkdir(parents=True)
+
+    run_id = "openai-env"
+    db = init_db(run_id)
+    insert_plan(db, run_id, "test", "name: test", 25.0)
+    insert_agent(
+        db,
+        run_id,
+        "worker",
+        "task",
+        check_command="true",
+        runtime="openai",
+        cost_source="estimated",
+        env={"MY_FLAG": "set"},
+    )
+    worktree = tmp_path / ".swarm" / "runs" / run_id / "worktrees" / "worker"
+    worktree.mkdir(parents=True)
+    db.execute(
+        "UPDATE agents SET worktree = ? WHERE run_id = ? AND name = ?",
+        (str(worktree), run_id, "worker"),
+    )
+    db.commit()
+    db.close()
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    captured: dict[str, str] = {}
+
+    async def fake_run(agent, prompt, max_turns):
+        bash = next(t for t in agent.tools if t.name == "Bash")
+        output = await bash.on_invoke_tool(
+            None,
+            json.dumps({"command": "printf ${MY_FLAG-unset}", "timeout_seconds": 1}),
+        )
+        captured["bash_output"] = output
+        mark_complete = next(t for t in agent.tools if t.name == "mark_complete")
+        await mark_complete.on_invoke_tool(None, json.dumps({"summary": "done"}))
+        return SimpleNamespace(raw_responses=[], final_output=output)
+
+    monkeypatch.setattr("swarm.runtime.executors.openai.Agent", FakeAgent)
+    monkeypatch.setattr("swarm.runtime.executors.openai.Runner.run", fake_run)
+
+    executor = OpenAIExecutor()
+    result = await executor.run(
+        AgentConfig(
+            name="worker",
+            run_id=run_id,
+            prompt="task",
+            worktree=worktree,
+            check_command="true",
+            env={"MY_FLAG": "set"},
+            runtime="openai",
+        ),
+        worker_toolset(system_prompt="sys"),
+    )
+
+    assert result["success"] is True
+    assert captured["bash_output"] == "set"
+    db = init_db(run_id)
+    agent = get_agent(db, run_id, "worker")
+    db.close()
+    assert agent["status"] == "completed"

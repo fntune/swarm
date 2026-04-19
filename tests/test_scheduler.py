@@ -484,6 +484,31 @@ def test_check_circuit_breaker_below_threshold(temp_swarm_dir, monkeypatch):
     scheduler.db.close()
 
 
+def test_check_stuck_uses_latest_event_identity_not_capped_count(temp_swarm_dir, monkeypatch):
+    """Fresh events with a stable capped count should not look stuck."""
+    monkeypatch.chdir(temp_swarm_dir)
+
+    agents = [AgentSpec(name="a", prompt="Task A")]
+    plan = create_test_plan(agents)
+    scheduler = Scheduler(plan, run_id="test-run-stuck-marker", use_mock=True)
+    scheduler._init_db()
+    scheduler.tasks = {"a": object()}  # any truthy live-task sentinel is enough
+
+    first = [{"id": f"a{i}", "agent": "a", "event_type": "progress", "data": "{}", "ts": "t"} for i in range(50)]
+    second = [{"id": f"b{i}", "agent": "a", "event_type": "progress", "data": "{}", "ts": "t"} for i in range(50)]
+    events = iter([first, second])
+
+    monkeypatch.setattr("swarm.runtime.scheduler.get_recent_events", lambda *args, **kwargs: next(events))
+
+    assert scheduler._check_stuck() is False
+    assert scheduler.idle_iterations == 0
+
+    assert scheduler._check_stuck() is False
+    assert scheduler.idle_iterations == 0
+
+    scheduler.db.close()
+
+
 @pytest.mark.asyncio
 async def test_cost_exceeded_is_terminal_and_not_retried(temp_swarm_dir, monkeypatch):
     """Per-agent max cost should be terminal, not retried via on_failure=retry."""

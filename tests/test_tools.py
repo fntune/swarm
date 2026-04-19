@@ -408,3 +408,30 @@ def test_spawn_worker_allows_under_max_subagents(temp_swarm_dir):
 
     result = asyncio.run(spawn_worker(run_id, "manager", "w2", "second"))
     assert "Spawned worker: manager.w2" in result
+
+
+def test_spawn_worker_inherits_manager_runtime_and_cost_source(temp_swarm_dir):
+    """Manager-spawned workers should stay on the manager's runtime."""
+    run_id = "test-spawn-runtime-inherit"
+    db = init_db(run_id)
+    insert_plan(db, run_id, "test", "name: test", 25.0)
+    insert_agent(
+        db,
+        run_id,
+        "manager",
+        "Manage",
+        agent_type="manager",
+        runtime="openai",
+        cost_source="estimated",
+    )
+    db.close()
+
+    result = asyncio.run(spawn_worker(run_id, "manager", "child", "Do work"))
+    assert "Spawned worker: manager.child" in result
+
+    db = init_db(run_id)
+    worker = get_agent(db, run_id, "manager.child")
+    db.close()
+
+    assert worker["runtime"] == "openai"
+    assert worker["cost_source"] == "estimated"

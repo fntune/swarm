@@ -186,9 +186,42 @@ def merge_branch_to_current(
 
 def get_changed_files(branch: str, base: str, repo_path: Path | None = None) -> list[str]:
     """Get files changed between base and branch."""
+    return [path for change in get_changed_file_changes(branch, base, repo_path) if (path := change["path"])]
+
+
+def get_changed_file_changes(
+    branch: str,
+    base: str,
+    repo_path: Path | None = None,
+) -> list[dict[str, str | None]]:
+    """Get path-level changes between base and branch.
+
+    Returns dictionaries with:
+    - ``status``: first letter of the git name-status code
+    - ``path``: current path to apply in the dependent worktree
+    - ``old_path``: previous path for renames/copies, else ``None``
+    """
     repo = repo_path or Path.cwd()
-    result = run_git(["diff", "--name-only", f"{base}...{branch}"], cwd=repo)
-    return [f for f in result.stdout.strip().split("\n") if f]
+    result = run_git(["diff", "--name-status", f"{base}...{branch}"], cwd=repo)
+    changes = []
+    for line in result.stdout.strip().split("\n"):
+        if not line:
+            continue
+        parts = line.split("\t")
+        status = parts[0][:1]
+        if status in {"R", "C"} and len(parts) >= 3:
+            changes.append({
+                "status": status,
+                "path": parts[2],
+                "old_path": parts[1],
+            })
+        elif len(parts) >= 2:
+            changes.append({
+                "status": status,
+                "path": parts[1],
+                "old_path": None,
+            })
+    return changes
 
 
 def has_conflicts(worktree_path: Path) -> bool:
@@ -211,6 +244,35 @@ def commit(worktree_path: Path, message: str) -> None:
         logger.info(f"Committed in {worktree_path}: {message}")
     else:
         logger.debug("Nothing to commit")
+
+
+def _apply_dependency_change(
+    worktree_path: Path,
+    dep_branch: str,
+    change: dict[str, str | None],
+) -> tuple[bool, str | None]:
+    """Apply one dependency diff entry into the target worktree."""
+    status = change["status"]
+    path = change["path"]
+    old_path = change["old_path"]
+    if not path:
+        return False, None
+
+    if status == "D":
+        result = run_git(["rm", "-f", "--ignore-unmatch", "--", path], cwd=worktree_path, check=False)
+        if result.returncode != 0:
+            return False, path
+        return True, None
+
+    if status == "R" and old_path and old_path != path:
+        result = run_git(["rm", "-f", "--ignore-unmatch", "--", old_path], cwd=worktree_path, check=False)
+        if result.returncode != 0:
+            return False, old_path
+
+    result = run_git(["checkout", dep_branch, "--", path], cwd=worktree_path, check=False)
+    if result.returncode != 0:
+        return False, path
+    return True, None
 
 
 def setup_worktree_with_deps(
@@ -244,23 +306,26 @@ def setup_worktree_with_deps(
 
         elif mode == "diff_only":
             base = get_default_branch(repo)
-            changed_files = get_changed_files(dep_branch, base, repo)
-            # Cherry-pick only changed files
+            changed_files = get_changed_file_changes(dep_branch, base, repo)
             checkout_failed = []
-            for file in changed_files:
-                result = run_git(["checkout", dep_branch, "--", file], cwd=worktree_path, check=False)
-                if result.returncode != 0:
-                    checkout_failed.append(file)
-                    logger.warning(f"Failed to checkout {file} from {dep_branch}: {result.stderr}")
+            applied_any = False
+            for change in changed_files:
+                applied, failed_path = _apply_dependency_change(worktree_path, dep_branch, change)
+                if applied:
+                    applied_any = True
+                    continue
+                if failed_path:
+                    checkout_failed.append(failed_path)
+                    logger.warning(f"Failed to apply {failed_path} from {dep_branch}")
             if checkout_failed:
-                logger.error(f"Failed to checkout {len(checkout_failed)} files from {dep_name}")
-            if changed_files and not all(f in checkout_failed for f in changed_files):
+                logger.error(f"Failed to apply {len(checkout_failed)} files from {dep_name}")
+            if applied_any:
                 commit(worktree_path, f"Import changes from {dep_name}")
 
         elif mode == "paths":
             # Filter by include/exclude paths - cherry-pick only matching files
             base = get_default_branch(repo)
-            changed_files = get_changed_files(dep_branch, base, repo)
+            changed_files = get_changed_file_changes(dep_branch, base, repo)
 
             def matches_path(file: str, pattern: str) -> bool:
                 """Check if file matches a path pattern (prefix or exact)."""
@@ -270,35 +335,40 @@ def setup_worktree_with_deps(
 
             # Apply include/exclude filters
             filtered_files = []
-            for file in changed_files:
+            for change in changed_files:
+                candidates = [p for p in (change["path"], change["old_path"]) if p]
                 # Check include paths (if specified, file must match at least one)
                 if include_paths:
-                    included = any(matches_path(file, p) for p in include_paths)
+                    included = any(matches_path(candidate, p) for candidate in candidates for p in include_paths)
                     if not included:
-                        logger.debug(f"Excluding {file} - not in include_paths")
+                        logger.debug(f"Excluding {change['path']} - not in include_paths")
                         continue
 
                 # Check exclude paths
                 if exclude_paths:
-                    excluded = any(matches_path(file, p) for p in exclude_paths)
+                    excluded = any(matches_path(candidate, p) for candidate in candidates for p in exclude_paths)
                     if excluded:
-                        logger.debug(f"Excluding {file} - matches exclude_paths")
+                        logger.debug(f"Excluding {change['path']} - matches exclude_paths")
                         continue
 
-                filtered_files.append(file)
+                filtered_files.append(change)
 
             # Import only filtered files
             if filtered_files:
                 logger.info(f"Importing {len(filtered_files)} filtered files from {dep_name}")
                 checkout_failed = []
-                for file in filtered_files:
-                    result = run_git(["checkout", dep_branch, "--", file], cwd=worktree_path, check=False)
-                    if result.returncode != 0:
-                        checkout_failed.append(file)
-                        logger.warning(f"Failed to checkout {file} from {dep_branch}: {result.stderr}")
+                applied_any = False
+                for change in filtered_files:
+                    applied, failed_path = _apply_dependency_change(worktree_path, dep_branch, change)
+                    if applied:
+                        applied_any = True
+                        continue
+                    if failed_path:
+                        checkout_failed.append(failed_path)
+                        logger.warning(f"Failed to apply {failed_path} from {dep_branch}")
                 if checkout_failed:
-                    logger.error(f"Failed to checkout {len(checkout_failed)} files from {dep_name}")
-                if not all(f in checkout_failed for f in filtered_files):
+                    logger.error(f"Failed to apply {len(checkout_failed)} files from {dep_name}")
+                if applied_any:
                     commit(worktree_path, f"Import filtered changes from {dep_name}")
             else:
                 logger.info(f"No files matched filters for {dep_name}")

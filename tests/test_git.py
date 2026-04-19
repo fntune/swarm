@@ -1,7 +1,6 @@
 """Tests for git module - worktree operations."""
 
 import subprocess
-from pathlib import Path
 
 import pytest
 
@@ -12,6 +11,7 @@ from swarm.gitops.worktrees import (
     merge_branch_to_current,
     remove_worktree,
     run_git,
+    setup_worktree_with_deps,
 )
 
 
@@ -148,3 +148,53 @@ def test_cleanup_run_worktrees_does_not_touch_prefix_sibling(git_repo, monkeypat
     # Target run's worktree is gone, sibling's is untouched.
     assert not target_wt.exists()
     assert sibling_wt.exists()
+
+
+def test_setup_worktree_with_deps_diff_only_propagates_deleted_files(git_repo, monkeypatch):
+    """diff_only dependency imports should stage deletions, not leave stale files behind."""
+    monkeypatch.chdir(git_repo)
+
+    (git_repo / "gone.txt").write_text("base")
+    subprocess.run(["git", "add", "gone.txt"], cwd=git_repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "Add removable file"], cwd=git_repo, check=True, capture_output=True)
+
+    dep = create_worktree("test-run", "dep", git_repo)
+    subprocess.run(["git", "rm", "gone.txt"], cwd=dep, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "Delete file"], cwd=dep, check=True, capture_output=True)
+
+    child = create_worktree("test-run", "child", git_repo)
+    assert (child / "gone.txt").exists()
+
+    setup_worktree_with_deps("test-run", "child", ["dep"], child, mode="diff_only")
+
+    assert not (child / "gone.txt").exists()
+
+
+def test_setup_worktree_with_deps_paths_propagates_deleted_files(git_repo, monkeypatch):
+    """paths dependency imports should also stage deletions within matched paths."""
+    monkeypatch.chdir(git_repo)
+
+    docs = git_repo / "docs"
+    docs.mkdir()
+    doomed = docs / "gone.txt"
+    doomed.write_text("base")
+    subprocess.run(["git", "add", "docs/gone.txt"], cwd=git_repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "Add docs file"], cwd=git_repo, check=True, capture_output=True)
+
+    dep = create_worktree("test-run-paths", "dep", git_repo)
+    subprocess.run(["git", "rm", "docs/gone.txt"], cwd=dep, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "Delete docs file"], cwd=dep, check=True, capture_output=True)
+
+    child = create_worktree("test-run-paths", "child", git_repo)
+    assert (child / "docs" / "gone.txt").exists()
+
+    setup_worktree_with_deps(
+        "test-run-paths",
+        "child",
+        ["dep"],
+        child,
+        mode="paths",
+        include_paths=["docs"],
+    )
+
+    assert not (child / "docs" / "gone.txt").exists()

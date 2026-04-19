@@ -359,7 +359,7 @@ def get_recent_events(
     """Get recent events."""
     return db.execute(
         """
-        SELECT agent, event_type, data, ts FROM events
+        SELECT id, agent, event_type, data, ts FROM events
         WHERE run_id = ? AND ts > datetime('now', ?)
         ORDER BY ts DESC LIMIT ?
         """,
