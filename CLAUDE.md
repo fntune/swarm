@@ -1,5 +1,7 @@
 # CLAUDE.md
 
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
 ## Project Overview
 
 **claude-swarm** — Multi-agent orchestration framework.
@@ -17,7 +19,11 @@ pip install -e ".[dev]"           # both SDKs + pytest
 
 # Type + tests
 pyright swarm/
-pytest tests/                     # --ignore=tests/sdklive for offline
+pytest tests/                     # unit suite; tests/sdklive/ is excluded
+pytest tests/test_scheduler.py -xvs                          # one file
+pytest tests/test_scheduler.py::test_scheduler_init -xvs     # one test
+# tests/sdklive/ are manual integration scripts (real API calls).
+# Run directly with `python tests/sdklive/<file>.py`, not via pytest.
 
 # CLI (10 commands)
 swarm run -f plan.yaml
