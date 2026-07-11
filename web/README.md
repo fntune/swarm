@@ -12,13 +12,20 @@ packages/typescript-config  shared tsconfig bases
 
 ## How the dashboard talks to spawnd
 
-The browser never calls the FastAPI service directly. The operator pastes
-`SPAWND_API_TOKEN` on `/login`; the token is validated upstream and stored in
-an httpOnly cookie. Every API call goes through Next.js route handlers
-(`/api/spawnd/[...path]`, allowlisted prefixes only), which attach the bearer
-token server-side. Live run events arrive over SSE through the same proxy.
-The only configuration is `SPAWND_API_URL` — server-side, never `NEXT_PUBLIC_`,
-and the token is never placed in compose env.
+The browser never calls the FastAPI service directly. In the default `token`
+mode, the operator pastes `SPAWND_API_TOKEN` on `/login`; the token is validated
+upstream and stored in an httpOnly cookie. Every API call goes through Next.js
+route handlers (`/api/spawnd/[...path]`, allowlisted prefixes only), which
+attach the bearer token server-side. Live run events arrive over SSE through
+the same proxy.
+
+Tailnet-only deployments can set `SPAWND_DASHBOARD_AUTH_MODE=tailscale`,
+`SPAWND_TAILSCALE_ALLOWED_USERS` to a comma-separated login allowlist, and
+`SPAWND_API_TOKEN` as a server-side credential. The dashboard then requires
+Tailscale Serve's verified `Tailscale-User-Login` header and does not expose a
+manual token prompt. Keep this mode bound to localhost and expose it only
+through Tailscale Serve; direct access to the FastAPI service remains token
+protected.
 
 ## Develop
 

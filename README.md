@@ -477,8 +477,10 @@ and production environment details.
 compose stack serves the dashboard at http://localhost:33000; sign in by
 pasting `SPAWND_API_TOKEN` (`dev-token` in compose). The browser never talks
 to the FastAPI service directly — all calls are proxied server-side with the
-token in an httpOnly cookie. The landing site is a static export deployed
-separately. See [web/README.md](web/README.md).
+token in an httpOnly cookie. Tailnet-only deployments can instead use
+Tailscale Serve identity headers with an explicit operator allowlist while
+keeping the API token server-side. The landing site is a static export
+deployed separately. See [web/README.md](web/README.md).
 
 ## Development
 

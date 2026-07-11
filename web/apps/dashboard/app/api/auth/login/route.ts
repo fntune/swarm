@@ -2,11 +2,18 @@ import { type NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 
 import { TOKEN_COOKIE } from "@/lib/auth-cookie";
+import { dashboardAuthMode } from "@/lib/server/auth";
 import { validateApiToken } from "@/lib/server/token";
 
 const LoginBody = z.object({ token: z.string().min(1) });
 
 export async function POST(request: NextRequest) {
+  if (dashboardAuthMode() === "tailscale") {
+    return NextResponse.json(
+      { error: "Token login is disabled when Tailscale authentication is enabled" },
+      { status: 409 },
+    );
+  }
   const parsed = LoginBody.safeParse(await request.json().catch(() => null));
   if (!parsed.success) {
     return NextResponse.json({ error: "API token is required" }, { status: 400 });

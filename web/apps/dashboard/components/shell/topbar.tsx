@@ -18,7 +18,7 @@ function crumbs(pathname: string): { href: string; label: string }[] {
   return result;
 }
 
-export function Topbar() {
+export function Topbar({ canLogout, identity }: { canLogout: boolean; identity?: string }) {
   const pathname = usePathname();
   const trail = crumbs(pathname);
 
@@ -44,16 +44,23 @@ export function Topbar() {
         ))}
       </nav>
       <div className="flex items-center gap-1">
+        {identity ? (
+          <span className="hidden font-mono text-xs text-muted-foreground sm:inline">
+            {identity}
+          </span>
+        ) : null}
         <ThemeToggle />
-        <Button
-          variant="ghost"
-          size="icon"
-          aria-label="Sign out"
-          className="text-muted-foreground"
-          onClick={logout}
-        >
-          <LogOutIcon className="size-4" />
-        </Button>
+        {canLogout ? (
+          <Button
+            variant="ghost"
+            size="icon"
+            aria-label="Sign out"
+            className="text-muted-foreground"
+            onClick={logout}
+          >
+            <LogOutIcon className="size-4" />
+          </Button>
+        ) : null}
       </div>
     </header>
   );
