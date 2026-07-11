@@ -27,9 +27,14 @@ class ArtifactNotFoundError(KeyError):
 
 
 class ArtifactStore(Protocol):
-    def put_text(self, key: str, text: str, *, content_type: str = 'text/plain') -> ArtifactBlob: ...
-    def get_text(self, uri: str) -> str: ...
-    def iter_bytes(self, uri: str, *, chunk_size: int = 64 * 1024) -> Iterable[bytes]: ...
+    def put_text(self, key: str, text: str, *, content_type: str = "text/plain") -> ArtifactBlob:
+        raise NotImplementedError
+
+    def get_text(self, uri: str) -> str:
+        raise NotImplementedError
+
+    def iter_bytes(self, uri: str, *, chunk_size: int = 64 * 1024) -> Iterable[bytes]:
+        raise NotImplementedError
 
 
 class S3ArtifactStore:
