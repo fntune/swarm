@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import time
 from collections import deque
+from collections.abc import AsyncGenerator, Iterator
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -33,21 +34,50 @@ class RunSubmissionJob:
 class CoordinationPlane(Protocol):
     """Queue/lease/live-update contract used by deployed workers."""
 
-    def enqueue_agent(self, run_id: str, agent: str) -> None: ...
-    def read_agent(self, worker_id: str, *, block_ms: int = 1000) -> AgentJob | None: ...
-    def ack_agent(self, job: AgentJob) -> None: ...
-    def queue_depth(self) -> int: ...
-    def enqueue_submission(self, payload: dict[str, Any]) -> None: ...
-    def read_submission(self, consumer_id: str, *, block_ms: int = 1000) -> RunSubmissionJob | None: ...
-    def ack_submission(self, job: RunSubmissionJob) -> None: ...
-    def submission_queue_depth(self) -> int: ...
-    def set_lease(self, run_id: str, agent: str, lease_token: str, ttl_seconds: int) -> None: ...
-    def renew_lease(self, run_id: str, agent: str, lease_token: str, ttl_seconds: int) -> bool: ...
-    def heartbeat(self, worker_id: str, ttl_seconds: int = 30) -> None: ...
-    def publish_event(self, run_id: str, event: dict[str, Any]) -> None: ...
-    def subscribe_events(self, run_id: str): ...
-    def publish_cancel(self, run_id: str) -> None: ...
-    def is_cancelled(self, run_id: str) -> bool: ...
+    def enqueue_agent(self, run_id: str, agent: str) -> None:
+        raise NotImplementedError
+
+    def read_agent(self, worker_id: str, *, block_ms: int = 1000) -> AgentJob | None:
+        raise NotImplementedError
+
+    def ack_agent(self, job: AgentJob) -> None:
+        raise NotImplementedError
+
+    def queue_depth(self) -> int:
+        raise NotImplementedError
+
+    def enqueue_submission(self, payload: dict[str, Any]) -> None:
+        raise NotImplementedError
+
+    def read_submission(self, consumer_id: str, *, block_ms: int = 1000) -> RunSubmissionJob | None:
+        raise NotImplementedError
+
+    def ack_submission(self, job: RunSubmissionJob) -> None:
+        raise NotImplementedError
+
+    def submission_queue_depth(self) -> int:
+        raise NotImplementedError
+
+    def set_lease(self, run_id: str, agent: str, lease_token: str, ttl_seconds: int) -> None:
+        raise NotImplementedError
+
+    def renew_lease(self, run_id: str, agent: str, lease_token: str, ttl_seconds: int) -> bool:
+        raise NotImplementedError
+
+    def heartbeat(self, worker_id: str, ttl_seconds: int = 30) -> None:
+        raise NotImplementedError
+
+    def publish_event(self, run_id: str, event: dict[str, Any]) -> None:
+        raise NotImplementedError
+
+    def subscribe_events(self, run_id: str) -> Iterator[dict[str, Any]]:
+        raise NotImplementedError
+
+    def publish_cancel(self, run_id: str) -> None:
+        raise NotImplementedError
+
+    def is_cancelled(self, run_id: str) -> bool:
+        raise NotImplementedError
 
 
 class RedisCoordinator:
@@ -129,17 +159,16 @@ class RedisCoordinator:
     def publish_event(self, run_id: str, event: dict[str, Any]) -> None:
         self.redis.publish(_event_channel(run_id), json.dumps(event, sort_keys=True))
 
-    def subscribe_events(self, run_id: str):
+    def subscribe_events(self, run_id: str) -> Iterator[dict[str, Any]]:
         pubsub = self.redis.pubsub()
-        pubsub.subscribe(_event_channel(run_id))
         try:
+            pubsub.subscribe(_event_channel(run_id))
             for message in pubsub.listen():
                 if message.get('type') != 'message':
                     continue
-                data = message.get('data')
-                if isinstance(data, bytes):
-                    data = data.decode('utf-8')
-                yield json.loads(data)
+                event = _parse_event_payload(message.get('data'))
+                if event is not None:
+                    yield event
         finally:
             pubsub.close()
 
@@ -243,7 +272,7 @@ class InMemoryCoordinator:
     def publish_event(self, run_id: str, event: dict[str, Any]) -> None:
         self.events.append((run_id, event))
 
-    def subscribe_events(self, run_id: str):
+    def subscribe_events(self, run_id: str) -> Iterator[dict[str, Any]]:
         for event_run_id, event in list(self.events):
             if event_run_id == run_id:
                 yield event
@@ -253,6 +282,52 @@ class InMemoryCoordinator:
 
     def is_cancelled(self, run_id: str) -> bool:
         return run_id in self.cancellations
+
+
+async def aiter_live_events(
+    redis_url: str,
+    run_id: str,
+    *,
+    tick_seconds: float = 2.0,
+) -> AsyncGenerator[dict[str, Any] | None, None]:
+    """Async live-event listener for SSE bridging; yields None on idle ticks.
+
+    The pub/sub channel only carries coordination notices; consumers poll
+    Postgres for the durable event log on every tick.
+    """
+
+    from redis.asyncio import Redis
+
+    client = Redis.from_url(redis_url, decode_responses=True)
+    pubsub = None
+    try:
+        pubsub = client.pubsub()
+        await pubsub.subscribe(_event_channel(run_id))
+        while True:
+            message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=tick_seconds)
+            if message is None:
+                yield None
+                continue
+            yield _parse_event_payload(message.get('data'))
+    finally:
+        if pubsub is not None:
+            await pubsub.aclose()
+        await client.aclose()
+
+
+def _parse_event_payload(data: Any) -> dict[str, Any] | None:
+    if isinstance(data, bytes):
+        try:
+            data = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    if not isinstance(data, str):
+        return None
+    try:
+        parsed = json.loads(data)
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _lease_key(run_id: str, agent: str) -> str:

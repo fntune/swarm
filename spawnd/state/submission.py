@@ -6,7 +6,7 @@ from uuid import uuid4
 
 from spawnd.coordination.redis import AgentJob, CoordinationPlane
 from spawnd.state.repository import ClaimedAgent, DeployedRepository
-from spawnd.io.parser import generate_run_id
+from spawnd.io.parser import generate_run_id, validate_run_id
 from spawnd.io.templates import render_plan_template, render_template_text
 from spawnd.io.validation import validate_plan
 from spawnd.models.specs import PlanSpec
@@ -24,7 +24,7 @@ def submit_plan(
     """Persist a run in Postgres and enqueue ready agents in Redis."""
 
     _validate_or_raise(plan)
-    actual_run_id = run_id or generate_run_id(plan.name)
+    actual_run_id = validate_run_id(run_id or generate_run_id(plan.name))
     repository.create_run(plan, actual_run_id, source_repo=source_repo, source_ref=source_ref)
     for agent_name in repository.ready_agents(actual_run_id):
         outbox_id = repository.record_queue_outbox(

@@ -1,6 +1,15 @@
 """Tests for deployed coordination and artifact helpers."""
+import pytest
+from botocore.exceptions import ClientError
+
 from spawnd.artifacts.redaction import redact_freeform_text
-from spawnd.artifacts.store import InMemoryArtifactStore, store_redacted_text_artifact
+from spawnd.artifacts.store import (
+    ArtifactNotFoundError,
+    InMemoryArtifactStore,
+    S3ArtifactStore,
+    store_redacted_text_artifact,
+)
+from spawnd.config import ArtifactStorageConfig
 from spawnd.state.submission import claim_next_agent, consume_next_submission, enqueue_newly_ready_agents, submit_plan
 from spawnd.coordination.redis import InMemoryCoordinator
 from spawnd.models.specs import AgentSpec, Orchestration, PlanSpec
@@ -133,10 +142,11 @@ def test_enqueue_newly_ready_agents_after_completion():
         ],
     )
     submit_plan(plan, repository=repo, coordinator=coordinator, run_id='run-1')
-    repo.complete_agent('run-1', 'first')
+    assert repo.complete_agent('run-1', 'first') == ['second']
     ready = enqueue_newly_ready_agents('run-1', repository=repo, coordinator=coordinator)
     assert ready == []
     assert repo.ready_agents('run-1') == ['second']
+    assert [job.agent for job in coordinator.jobs] == ['first']
 
 
 def test_store_redacted_artifact_does_not_keep_secret_value():
@@ -152,6 +162,24 @@ def test_store_redacted_artifact_does_not_keep_secret_value():
     assert 'secret-value' not in stored
     assert blob.redaction_policy == 'redacted'
     assert store.get_text(blob.uri) == stored
+
+
+def test_s3_store_maps_missing_objects_to_domain_error() -> None:
+    class MissingClient:
+        def get_object(self, **_kwargs: object) -> None:
+            raise ClientError({"Error": {"Code": "NoSuchKey", "Message": "missing"}}, "GetObject")
+
+    store = object.__new__(S3ArtifactStore)
+    store.config = ArtifactStorageConfig(
+        bucket="artifacts",
+        endpoint=None,
+        region=None,
+        prefix="",
+    )
+    store.client = MissingClient()
+
+    with pytest.raises(ArtifactNotFoundError):
+        _ = store.iter_bytes("s3://artifacts/missing.txt")
 
 
 def test_redaction_catches_bare_tokens_bearer_headers_json_and_url_credentials():

@@ -1,18 +1,26 @@
 """HTTP API for deployed spawnd."""
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
-from typing import Any, Literal
+import json
+import time
+from collections.abc import AsyncIterator
+from datetime import datetime
+from typing import Annotated, Any, Literal
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, PlainTextResponse
-from pydantic import BaseModel, ConfigDict
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field
+from starlette.concurrency import run_in_threadpool
 
 from spawnd.api import cancel as cancel_run
 from spawnd.api import resume as resume_run
+from spawnd.artifacts.store import ArtifactNotFoundError, ArtifactStore, S3ArtifactStore
 from spawnd.config import load_backend_config
-from spawnd.coordination.redis import RedisCoordinator
+from spawnd.coordination.redis import RedisCoordinator, aiter_live_events
+from spawnd.io.parser import RUN_ID_PATTERN
 from spawnd.io.validation import validate_plan
 from spawnd.models.specs import PlanSpec
 from spawnd.state.repository import DeployedRepository
@@ -20,11 +28,18 @@ from spawnd.state.submission import consume_next_submission, enqueue_submission,
 from spawnd.workers.worker import drain_queue_outbox, reconcile_ready_agents
 
 
+MAX_ARTIFACT_CONTENT_BYTES = 2_000_000
+TERMINAL_RUN_STATUSES = {'completed', 'failed', 'cancelled', 'cost_exceeded'}
+STREAM_KEEPALIVE_SECONDS = 15.0
+STREAM_TICK_SECONDS = 2.0
+PathId = Annotated[str, Field(pattern=RUN_ID_PATTERN, max_length=160)]
+
+
 class SubmitBody(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
     plan: PlanSpec | None = None
-    run_id: str | None = None
+    run_id: PathId | None = None
     source_repo: str | None = None
     source_ref: str | None = None
 
@@ -32,7 +47,7 @@ class SubmitBody(BaseModel):
 class TemplateBody(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
-    id: str
+    id: PathId
     name: str
     plan_template: str
     description: str | None = None
@@ -44,14 +59,14 @@ class TemplateRunBody(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
     parameters: dict[str, Any] = {}
-    run_id: str | None = None
+    run_id: PathId | None = None
 
 
 class ScheduleBody(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
-    id: str
-    template_id: str
+    id: PathId
+    template_id: PathId
     name: str
     interval_seconds: int
     parameters: dict[str, Any] = {}
@@ -69,11 +84,17 @@ class SubmissionBody(BaseModel):
 
     kind: str
     plan: dict[str, Any] | None = None
-    template_id: str | None = None
+    template_id: PathId | None = None
     parameters: dict[str, Any] = {}
-    run_id: str | None = None
+    run_id: PathId | None = None
     source_repo: str | None = None
     source_ref: str | None = None
+
+
+class ClarificationResponseBody(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+
+    response: str
 
 
 def _repository() -> DeployedRepository:
@@ -88,6 +109,39 @@ def _coordinator() -> RedisCoordinator:
     if not config.redis_url:
         raise HTTPException(status_code=500, detail="SPAWND_REDIS_URL is required")
     return RedisCoordinator.from_url(config.redis_url)
+
+
+def _artifact_store() -> ArtifactStore:
+    config = load_backend_config()
+    if not config.artifacts.configured:
+        raise HTTPException(status_code=500, detail="SPAWND_ARTIFACTS_BUCKET is required for artifact content")
+    return S3ArtifactStore(config.artifacts)
+
+
+def _usage_rollup(token_rows: list[dict[str, Any]], cost_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rollup: dict[str, dict[str, Any]] = {}
+
+    def bucket(agent: Any) -> dict[str, Any]:
+        key = str(agent) if agent else '_system'
+        if key not in rollup:
+            rollup[key] = {
+                'agent': key,
+                'input_tokens': 0,
+                'cached_input_tokens': 0,
+                'output_tokens': 0,
+                'total_tokens': 0,
+                'amount_usd': 0.0,
+            }
+        return rollup[key]
+
+    for row in token_rows:
+        entry = bucket(row.get('agent'))
+        for field in ('input_tokens', 'cached_input_tokens', 'output_tokens', 'total_tokens'):
+            entry[field] += int(row.get(field) or 0)
+    for row in cost_rows:
+        entry = bucket(row.get('agent'))
+        entry['amount_usd'] += float(row.get('amount_usd') or 0.0)
+    return sorted(rollup.values(), key=lambda entry: entry['agent'])
 
 
 def _run_status(repo: DeployedRepository, run_id: str) -> dict[str, Any]:
@@ -277,6 +331,10 @@ def create_app() -> FastAPI:
         )
         return {"schedule_id": body.id}
 
+    @app.get("/schedules")
+    def list_schedules(limit: int = 100) -> list[dict[str, Any]]:
+        return _repository().list_schedules(limit=limit)
+
     @app.patch("/schedules/{schedule_id}/status")
     def set_schedule_status(schedule_id: str, body: ScheduleStatusBody) -> dict[str, str]:
         try:
@@ -326,6 +384,15 @@ def create_app() -> FastAPI:
         )
         return {"run_id": run_id}
 
+    @app.get("/runs")
+    def list_runs(
+        limit: int = 50,
+        offset: int = 0,
+        status: list[str] | None = Query(default=None),
+    ) -> list[dict[str, Any]]:
+        rows = _repository().list_runs(max(1, min(limit, 200)), status=status, offset=max(0, offset))
+        return [{key: value for key, value in row.items() if key != "spec"} for row in rows]
+
     @app.get("/runs/{run_id}")
     def status(run_id: str) -> dict[str, Any]:
         return _run_status(_repository(), run_id)
@@ -333,6 +400,112 @@ def create_app() -> FastAPI:
     @app.get("/runs/{run_id}/events")
     def events(run_id: str, limit: int = 100) -> list[dict[str, Any]]:
         return _repository().get_events(run_id, limit=limit)
+
+    @app.get("/runs/{run_id}/events/stream")
+    async def stream_events(request: Request, run_id: str, replay: int = 100) -> StreamingResponse:
+        repo = _repository()
+        run_row = await run_in_threadpool(repo.get_run, run_id)
+        if run_row is None:
+            raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
+        replay_count = max(0, min(replay, 500))
+        redis_url = load_backend_config().redis_url
+
+        def encode(event_name: str, payload: dict[str, Any], event_id: str | None = None) -> str:
+            prefix = f"id: {event_id}\n" if event_id else ""
+            return f"{prefix}event: {event_name}\ndata: {json.dumps(payload, default=str, sort_keys=True)}\n\n"
+
+        async def live_ticks() -> AsyncIterator[dict[str, Any] | None]:
+            if redis_url:
+                try:
+                    async for notice in aiter_live_events(redis_url, run_id, tick_seconds=STREAM_TICK_SECONDS):
+                        yield notice
+                    return
+                except Exception:
+                    pass
+            while True:
+                await asyncio.sleep(STREAM_TICK_SECONDS)
+                yield None
+
+        async def event_stream() -> AsyncIterator[str]:
+            seen: set[str] = set()
+            cursor: datetime | None = None
+            cursor_id: str | None = None
+            last_frame = time.monotonic()
+
+            def remember(row: dict[str, Any]) -> str:
+                nonlocal cursor, cursor_id
+                event_id = str(row["id"])
+                seen.add(event_id)
+                created = row.get("created_at")
+                if created is not None and (
+                    cursor is None or (created, event_id) > (cursor, cursor_id or "")
+                ):
+                    cursor = created
+                    cursor_id = event_id
+                return event_id
+
+            async def fresh_frames() -> list[str]:
+                rows = await run_in_threadpool(
+                    lambda: repo.get_events_after(run_id, after=cursor, after_id=cursor_id)
+                )
+                frames: list[str] = []
+                for row in rows:
+                    if str(row["id"]) in seen:
+                        continue
+                    frames.append(encode("run-event", row, remember(row)))
+                return frames
+
+            last_event_id = request.headers.get("last-event-id")
+            resumed = (
+                await run_in_threadpool(repo.get_event, run_id, last_event_id)
+                if last_event_id
+                else None
+            )
+            if resumed is not None:
+                _ = remember(resumed)
+                while frames := await fresh_frames():
+                    for frame in frames:
+                        last_frame = time.monotonic()
+                        yield frame
+            else:
+                replayed = await run_in_threadpool(repo.get_events, run_id, replay_count or 1)
+                if replay_count:
+                    for row in reversed(replayed):
+                        last_frame = time.monotonic()
+                        yield encode("run-event", row, remember(row))
+                else:
+                    for row in replayed:
+                        _ = remember(row)
+
+            run_state = await run_in_threadpool(repo.get_run, run_id)
+            if run_state is not None and run_state.get("status") in TERMINAL_RUN_STATUSES:
+                yield encode("done", {"status": run_state.get("status")})
+                return
+
+            async for notice in live_ticks():
+                if await request.is_disconnected():
+                    return
+                if notice is not None:
+                    last_frame = time.monotonic()
+                    yield encode("coordination", notice)
+                for frame in await fresh_frames():
+                    last_frame = time.monotonic()
+                    yield frame
+                run_state = await run_in_threadpool(repo.get_run, run_id)
+                if run_state is None or run_state.get("status") in TERMINAL_RUN_STATUSES:
+                    for frame in await fresh_frames():
+                        yield frame
+                    yield encode("done", {"status": (run_state or {}).get("status")})
+                    return
+                if time.monotonic() - last_frame >= STREAM_KEEPALIVE_SECONDS:
+                    last_frame = time.monotonic()
+                    yield ": keepalive\n\n"
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     @app.get("/runs/{run_id}/checks")
     def checks(run_id: str, agent: str | None = None) -> list[dict[str, Any]]:
@@ -342,6 +515,48 @@ def create_app() -> FastAPI:
     def artifacts(run_id: str, agent: str | None = None) -> list[dict[str, Any]]:
         return _repository().get_artifacts(run_id, agent)
 
+    @app.get("/runs/{run_id}/artifacts/{artifact_id}/content")
+    def artifact_content(run_id: str, artifact_id: str) -> Response:
+        row = _repository().get_artifact(artifact_id)
+        if row is None or row.get("run_id") != run_id:
+            raise HTTPException(status_code=404, detail=f"Artifact not found: {artifact_id}")
+        if int(row.get("size_bytes") or 0) > MAX_ARTIFACT_CONTENT_BYTES:
+            raise HTTPException(status_code=413, detail="Artifact exceeds inline content limit")
+        try:
+            text = _artifact_store().get_text(str(row["uri"]))
+        except (ArtifactNotFoundError, ValueError) as exc:
+            raise HTTPException(status_code=404, detail=f"Artifact object missing: {artifact_id}") from exc
+        headers = {
+            "Cache-Control": "private, max-age=31536000, immutable",
+            "X-Spawnd-Redaction-Policy": str(row.get("redaction_policy") or "unknown"),
+        }
+        if row.get("sha256"):
+            headers["ETag"] = f'"{row["sha256"]}"'
+        return Response(text, media_type=str(row.get("content_type") or "text/plain"), headers=headers)
+
+    @app.get("/runs/{run_id}/artifacts/{artifact_id}/download")
+    def artifact_download(run_id: str, artifact_id: str) -> StreamingResponse:
+        row = _repository().get_artifact(artifact_id)
+        if row is None or row.get("run_id") != run_id:
+            raise HTTPException(status_code=404, detail=f"Artifact not found: {artifact_id}")
+        try:
+            chunks = _artifact_store().iter_bytes(str(row["uri"]))
+        except (ArtifactNotFoundError, ValueError) as exc:
+            raise HTTPException(status_code=404, detail=f"Artifact object missing: {artifact_id}") from exc
+        headers = {
+            "Cache-Control": "private, max-age=31536000, immutable",
+            "Content-Disposition": f'attachment; filename="{artifact_id}.txt"',
+            "Content-Length": str(int(row.get("size_bytes") or 0)),
+            "X-Spawnd-Redaction-Policy": str(row.get("redaction_policy") or "unknown"),
+        }
+        if row.get("sha256"):
+            headers["ETag"] = f'"{row["sha256"]}"'
+        return StreamingResponse(
+            chunks,
+            media_type=str(row.get("content_type") or "application/octet-stream"),
+            headers=headers,
+        )
+
     @app.get("/runs/{run_id}/traces")
     def traces(run_id: str, agent: str | None = None) -> list[dict[str, Any]]:
         return _repository().fetch_trace_spans(run_id, agent)
@@ -350,6 +565,25 @@ def create_app() -> FastAPI:
     def provenance(run_id: str, agent: str | None = None) -> list[dict[str, Any]]:
         return _repository().get_git_provenance(run_id, agent)
 
+    @app.get("/runs/{run_id}/usage")
+    def usage(run_id: str, agent: str | None = None) -> dict[str, Any]:
+        repo = _repository()
+        tokens = repo.get_token_usage(run_id, agent)
+        costs = repo.get_cost_usage(run_id, agent)
+        return {"token_usage": tokens, "cost_usage": costs, "by_agent": _usage_rollup(tokens, costs)}
+
+    @app.get("/runs/{run_id}/sessions")
+    def sessions(run_id: str, agent: str | None = None) -> list[dict[str, Any]]:
+        return _repository().get_runtime_sessions(run_id, agent)
+
+    @app.get("/runs/{run_id}/invocations")
+    def invocations(run_id: str, agent: str | None = None) -> list[dict[str, Any]]:
+        return _repository().get_runtime_invocations(run_id, agent)
+
+    @app.get("/runs/{run_id}/errors")
+    def runtime_errors(run_id: str, agent: str | None = None) -> list[dict[str, Any]]:
+        return _repository().get_runtime_errors(run_id, agent)
+
     @app.post("/runs/{run_id}/cancel")
     def cancel(run_id: str) -> dict[str, int]:
         return {"cancelled": cancel_run(run_id, repository=_repository(), coordinator=_coordinator())}
@@ -357,6 +591,25 @@ def create_app() -> FastAPI:
     @app.post("/runs/{run_id}/resume")
     def resume(run_id: str) -> list[dict[str, Any]]:
         return resume_run(run_id, repository=_repository(), coordinator=_coordinator())
+
+    @app.get("/clarifications")
+    def pending_clarifications(limit: int = 100) -> list[dict[str, Any]]:
+        return _repository().list_pending_clarifications(limit=limit)
+
+    @app.get("/runs/{run_id}/clarifications")
+    def run_clarifications(run_id: str) -> list[dict[str, Any]]:
+        return _repository().get_pending_clarifications(run_id)
+
+    @app.post("/runs/{run_id}/clarifications/{clarification_id}/response")
+    def answer_clarification(run_id: str, clarification_id: str, body: ClarificationResponseBody) -> dict[str, str]:
+        repo = _repository()
+        event = repo.get_event(run_id, clarification_id)
+        if event is None or event.get("event_type") not in {"clarification", "blocker"}:
+            raise HTTPException(status_code=404, detail=f"Clarification not found: {clarification_id}")
+        recorded = repo.record_response(run_id, clarification_id, body.response, agent="api")
+        if not recorded:
+            raise HTTPException(status_code=409, detail=f"Clarification already answered: {clarification_id}")
+        return {"clarification_id": clarification_id, "status": "answered"}
 
     @app.post("/workers/reconcile")
     def reconcile() -> list[dict[str, str]]:

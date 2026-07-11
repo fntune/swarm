@@ -7,6 +7,7 @@ import sys
 import types
 
 import pytest
+from fastmcp import Client
 
 from spawnd.io.validation import validate_plan
 from spawnd.models.specs import AgentSpec, Defaults, McpServerSpec, PlanSpec
@@ -18,6 +19,11 @@ from spawnd.runtime.executors.openai import _openai_conversation_id, _openai_mcp
 from spawnd.runtime.executor import run_worker
 from spawnd.tools.mcp import build_server
 from spawnd.tools.toolset import worker_toolset
+
+
+async def _server_tool_names() -> set[str]:
+    async with Client(build_server()) as client:
+        return {tool.name for tool in await client.list_tools()}
 
 
 def test_reviewer_role_defaults_to_readonly_and_explicit_agent_setting_wins():
@@ -137,7 +143,7 @@ async def test_spawnd_mcp_server_exposes_worker_tools(monkeypatch):
     monkeypatch.setenv('SPAWND_AGENT_NAME', 'worker')
     monkeypatch.setenv('SPAWND_AGENT_TYPE', 'worker')
 
-    assert set(await build_server().get_tools()) == {
+    assert await _server_tool_names() == {
         'mark_complete',
         'request_clarification',
         'report_progress',
@@ -151,7 +157,7 @@ async def test_spawnd_mcp_server_exposes_manager_tools(monkeypatch):
     monkeypatch.setenv('SPAWND_AGENT_NAME', 'manager')
     monkeypatch.setenv('SPAWND_AGENT_TYPE', 'manager')
 
-    assert set(await build_server().get_tools()) == {
+    assert await _server_tool_names() == {
         'spawn_worker',
         'respond_to_clarification',
         'cancel_worker',

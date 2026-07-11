@@ -100,6 +100,20 @@ services:
       - "8765:8765"
     command: spawnd serve --host 0.0.0.0 --port 8765
 
+  dashboard:
+    build:
+      context: ./web
+      dockerfile: apps/dashboard/Dockerfile
+    depends_on:
+      api:
+        condition: service_started
+    environment:
+      # Server-side only; the browser never talks to the API directly and the
+      # API token is pasted at login, never injected through compose.
+      SPAWND_API_URL: http://api:8765
+    ports:
+      - "33000:3000"
+
   worker:
     build:
       context: .

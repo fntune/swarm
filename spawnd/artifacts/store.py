@@ -1,6 +1,7 @@
 """Durable artifact storage for deployed spawnd runs."""
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Protocol
 from urllib.parse import urlparse
@@ -21,9 +22,19 @@ class ArtifactBlob:
     redaction_policy: str
 
 
+class ArtifactNotFoundError(KeyError):
+    """Raised when artifact metadata points to an object that is not present."""
+
+
 class ArtifactStore(Protocol):
-    def put_text(self, key: str, text: str, *, content_type: str = 'text/plain') -> ArtifactBlob: ...
-    def get_text(self, uri: str) -> str: ...
+    def put_text(self, key: str, text: str, *, content_type: str = "text/plain") -> ArtifactBlob:
+        raise NotImplementedError
+
+    def get_text(self, uri: str) -> str:
+        raise NotImplementedError
+
+    def iter_bytes(self, uri: str, *, chunk_size: int = 64 * 1024) -> Iterable[bytes]:
+        raise NotImplementedError
 
 
 class S3ArtifactStore:
@@ -54,12 +65,32 @@ class S3ArtifactStore:
         )
 
     def get_text(self, uri: str) -> str:
+        return b"".join(self.iter_bytes(uri)).decode("utf-8")
+
+    def iter_bytes(self, uri: str, *, chunk_size: int = 64 * 1024) -> Iterable[bytes]:
         parsed = urlparse(uri)
-        if parsed.scheme != 's3' or parsed.netloc != self.config.bucket:
-            raise ValueError(f'Artifact URI is not in configured bucket: {uri}')
-        key = parsed.path.lstrip('/')
-        response = self.client.get_object(Bucket=self.config.bucket, Key=key)
-        return response['Body'].read().decode('utf-8')
+        if parsed.scheme != "s3" or parsed.netloc != self.config.bucket:
+            raise ValueError(f"Artifact URI is not in configured bucket: {uri}")
+        key = parsed.path.lstrip("/")
+        from botocore.exceptions import ClientError
+
+        try:
+            response = self.client.get_object(Bucket=self.config.bucket, Key=key)
+        except ClientError as exc:
+            code = str(exc.response.get("Error", {}).get("Code", ""))
+            if code in {"404", "NoSuchKey", "NoSuchVersion"}:
+                raise ArtifactNotFoundError(uri) from exc
+            raise
+        body = response["Body"]
+
+        def chunks() -> Iterable[bytes]:
+            try:
+                while chunk := body.read(chunk_size):
+                    yield chunk
+            finally:
+                body.close()
+
+        return chunks()
 
 
 class InMemoryArtifactStore:
@@ -80,13 +111,20 @@ class InMemoryArtifactStore:
         )
 
     def get_text(self, uri: str) -> str:
+        return b"".join(self.iter_bytes(uri)).decode("utf-8")
+
+    def iter_bytes(self, uri: str, *, chunk_size: int = 64 * 1024) -> Iterable[bytes]:
         parsed = urlparse(uri)
-        if parsed.scheme != 'memory':
-            raise ValueError(f'Unsupported in-memory artifact URI: {uri}')
+        if parsed.scheme != "memory":
+            raise ValueError(f"Unsupported in-memory artifact URI: {uri}")
         key = parsed.netloc + parsed.path
-        if key.startswith('/'):
+        if key.startswith("/"):
             key = key[1:]
-        return self.objects[key]
+        try:
+            data = self.objects[key].encode("utf-8")
+        except KeyError as exc:
+            raise ArtifactNotFoundError(uri) from exc
+        return (data[offset:offset + chunk_size] for offset in range(0, len(data), chunk_size))
 
 
 def artifact_key(run_id: str, agent: str | None, kind: str, suffix: str = 'txt') -> str:

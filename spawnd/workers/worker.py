@@ -16,7 +16,7 @@ from typing import Iterator
 
 from spawnd.artifacts.store import ArtifactStore, store_redacted_text_artifact
 from spawnd.config import load_backend_config
-from spawnd.state.submission import claim_next_agent, enqueue_newly_ready_agents
+from spawnd.state.submission import claim_next_agent
 from spawnd.coordination.redis import CoordinationPlane
 from spawnd.state.repository import ClaimedAgent, DeployedRepository
 from spawnd.notifications.webhook import NotificationDispatcher
@@ -354,9 +354,8 @@ class DeployedWorker:
                 output_tokens=output_tokens,
                 attempt_id=claimed.attempt_id,
             )
-            for name in ready:
-                self._enqueue_agent(claimed.run_id, name)
-            enqueue_newly_ready_agents(claimed.run_id, repository=self.repository, coordinator=self.coordinator)
+            if ready:
+                drain_queue_outbox(self.repository, self.coordinator)
             self._notify_current_run(claimed.run_id, claimed.name, reason='agent_completed')
             self._cleanup_worktree_if_configured(plan, claimed, worktree, source.repo_path)
             return 'completed'

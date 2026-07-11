@@ -2,7 +2,7 @@
 import pytest
 from pydantic import ValidationError
 from spawnd.models.specs import AgentSpec, Defaults, PlanSpec
-from spawnd.io.parser import parse_plan_file, parse_plan_yaml
+from spawnd.io.parser import generate_run_id, parse_plan_file, parse_plan_yaml, validate_run_id
 from spawnd.io.plan_builder import create_inline_plan, infer_agent_name, load_shared_context, parse_inline_agents
 from spawnd.io.validation import has_circular_deps, validate_plan
 
@@ -13,6 +13,19 @@ def test_parse_plan_yaml_minimal():
     assert plan.name == 'test-plan'
     assert len(plan.agents) == 1
     assert plan.agents[0].name == 'worker1'
+
+
+def test_generate_run_id_is_a_url_safe_path_segment() -> None:
+    run_id = generate_run_id("release audit / api?#")
+
+    assert run_id.startswith("release-audit-api-")
+    assert validate_run_id(run_id) == run_id
+
+
+@pytest.mark.parametrize("run_id", ["slash/id", "query?id", "fragment#id", "space id", ""])
+def test_validate_run_id_rejects_unsafe_path_characters(run_id: str) -> None:
+    with pytest.raises(ValueError, match="URL-safe"):
+        _ = validate_run_id(run_id)
 
 def test_parse_plan_yaml_with_deps():
     """Parse plan with dependencies."""

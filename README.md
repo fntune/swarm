@@ -326,18 +326,29 @@ Endpoints:
 - `GET /readyz`
 - `GET /metrics`
 - `POST /runs`
+- `GET /runs`
 - `GET /runs/{run_id}`
 - `GET /runs/{run_id}/events`
+- `GET /runs/{run_id}/events/stream` (SSE: Postgres replay + live tail)
 - `GET /runs/{run_id}/checks`
 - `GET /runs/{run_id}/artifacts`
+- `GET /runs/{run_id}/artifacts/{artifact_id}/content`
+- `GET /runs/{run_id}/usage`
+- `GET /runs/{run_id}/sessions`
+- `GET /runs/{run_id}/invocations`
+- `GET /runs/{run_id}/errors`
 - `GET /runs/{run_id}/traces`
 - `GET /runs/{run_id}/provenance`
+- `GET /runs/{run_id}/clarifications`
+- `POST /runs/{run_id}/clarifications/{clarification_id}/response`
+- `GET /clarifications`
 - `POST /runs/{run_id}/cancel`
 - `POST /runs/{run_id}/resume`
 - `POST /templates`
 - `GET /templates`
 - `POST /templates/{template_id}/runs`
 - `POST /schedules`
+- `GET /schedules`
 - `PATCH /schedules/{schedule_id}/status`
 - `POST /schedules/run-due`
 - `POST /submissions`
@@ -458,6 +469,18 @@ and recurring schedules should be created paused until intentionally activated.
 
 See [docs/deployment.md](docs/deployment.md) for Podman, compose, migration,
 and production environment details.
+
+## Web
+
+`web/` is a pnpm + turborepo monorepo with the operator dashboard
+(`apps/dashboard`) and the spawnd.dev marketing site (`apps/landing`). The
+compose stack serves the dashboard at http://localhost:33000; sign in by
+pasting `SPAWND_API_TOKEN` (`dev-token` in compose). The browser never talks
+to the FastAPI service directly — all calls are proxied server-side with the
+token in an httpOnly cookie. Tailnet-only deployments can instead use
+Tailscale Serve identity headers with an explicit operator allowlist while
+keeping the API token server-side. The landing site is a static export
+deployed separately. See [web/README.md](web/README.md).
 
 ## Development
 
