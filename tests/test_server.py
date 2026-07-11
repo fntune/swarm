@@ -585,6 +585,8 @@ def test_http_event_stream_replays_and_completes(monkeypatch):
         json={'run_id': 'run-1', 'plan': {'name': 'plan', 'agents': [{'name': 'a', 'prompt': 'task'}]}},
     )
     assert submitted.status_code == 200
+    delivered_id = repo.append_event("run-1", "a", "delivered", {"sequence": 1})
+    missed_id = repo.append_event("run-1", "a", "missed", {"sequence": 2})
     cancelled = client.post('/runs/run-1/cancel', headers=AUTH)
     assert cancelled.status_code == 200
 
@@ -607,3 +609,15 @@ def test_http_event_stream_replays_and_completes(monkeypatch):
 
     assert 'event: run-event' not in no_replay_body
     assert 'event: done' in no_replay_body
+
+    resumed_headers = {**AUTH, "Last-Event-ID": delivered_id}
+    with client.stream(
+        "GET",
+        "/runs/run-1/events/stream?replay=1",
+        headers=resumed_headers,
+    ) as response:
+        resumed_body = "".join(response.iter_text())
+
+    assert f"id: {delivered_id}" not in resumed_body
+    assert f"id: {missed_id}" in resumed_body
+    assert '"event_type": "missed"' in resumed_body

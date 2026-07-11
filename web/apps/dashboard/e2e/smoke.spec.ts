@@ -15,6 +15,25 @@ test("rejects an invalid API token", async ({ page }) => {
   await expect(page.getByText("Invalid API token")).toBeVisible();
 });
 
+test("allows re-login after a stored token becomes invalid", async ({ context, page, baseURL }) => {
+  if (!baseURL) throw new Error("Playwright baseURL is required");
+  await context.addCookies([
+    {
+      name: "spawnd_token",
+      value: "rotated-token",
+      url: baseURL,
+      httpOnly: true,
+      sameSite: "Lax",
+    },
+  ]);
+
+  await page.goto("/login");
+
+  await expect(page.getByText("Operator login", { exact: true })).toBeVisible();
+  await expect(page.getByLabel("API token")).toBeVisible();
+  expect((await context.cookies()).some((cookie) => cookie.name === "spawnd_token")).toBe(false);
+});
+
 test("operator journey: login → submit → watch → cancel", async ({ page }) => {
   const runId = `e2e-smoke-${Date.now()}`;
 

@@ -2,7 +2,7 @@ import { type NextRequest, NextResponse } from "next/server";
 
 import { TOKEN_COOKIE } from "@/lib/auth-cookie";
 import { resolveUpstreamPath } from "@/lib/proxy-path";
-import { apiBaseUrl } from "@/lib/server/client";
+import { apiBaseUrl } from "@/lib/server/config";
 
 export const dynamic = "force-dynamic";
 

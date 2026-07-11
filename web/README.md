@@ -31,11 +31,11 @@ docker compose up -d postgres redis minio minio-init migrate api
 cd web
 corepack enable
 pnpm install
-cp .env.example apps/dashboard/.env.local   # SPAWND_API_URL=http://localhost:8765
-pnpm dev                                    # dashboard :3100, landing :3001
+cp apps/dashboard/.env.example apps/dashboard/.env.local
+pnpm dev                                    # dashboard :3000, landing :3001
 ```
 
-Sign in at http://localhost:3100/login with the compose token (`dev-token`).
+Sign in at http://localhost:3000/login with the compose token (`dev-token`).
 
 ## Quality gates
 

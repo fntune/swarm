@@ -2,7 +2,7 @@ import { type NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 
 import { TOKEN_COOKIE } from "@/lib/auth-cookie";
-import { apiBaseUrl } from "@/lib/server/client";
+import { validateApiToken } from "@/lib/server/token";
 
 const LoginBody = z.object({ token: z.string().min(1) });
 
@@ -12,23 +12,9 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "API token is required" }, { status: 400 });
   }
 
-  let upstream: Response;
-  try {
-    upstream = await fetch(`${apiBaseUrl()}/workers`, {
-      headers: { Authorization: `Bearer ${parsed.data.token}` },
-      cache: "no-store",
-    });
-  } catch {
-    return NextResponse.json({ error: "spawnd API is unreachable" }, { status: 502 });
-  }
-  if (upstream.status === 401) {
-    return NextResponse.json({ error: "Invalid API token" }, { status: 401 });
-  }
-  if (!upstream.ok) {
-    return NextResponse.json(
-      { error: `spawnd API error (status ${upstream.status})` },
-      { status: 502 },
-    );
+  const validation = await validateApiToken(parsed.data.token);
+  if (!validation.ok) {
+    return NextResponse.json({ error: validation.error }, { status: validation.status });
   }
 
   const response = NextResponse.json({ ok: true });

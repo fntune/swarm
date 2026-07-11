@@ -455,14 +455,27 @@ def create_app() -> FastAPI:
                     frames.append(encode("run-event", row, remember(row)))
                 return frames
 
-            replayed = await run_in_threadpool(repo.get_events, run_id, replay_count or 1)
-            if replay_count:
-                for row in reversed(replayed):
-                    last_frame = time.monotonic()
-                    yield encode("run-event", row, remember(row))
+            last_event_id = request.headers.get("last-event-id")
+            resumed = (
+                await run_in_threadpool(repo.get_event, run_id, last_event_id)
+                if last_event_id
+                else None
+            )
+            if resumed is not None:
+                _ = remember(resumed)
+                while frames := await fresh_frames():
+                    for frame in frames:
+                        last_frame = time.monotonic()
+                        yield frame
             else:
-                for row in replayed:
-                    _ = remember(row)
+                replayed = await run_in_threadpool(repo.get_events, run_id, replay_count or 1)
+                if replay_count:
+                    for row in reversed(replayed):
+                        last_frame = time.monotonic()
+                        yield encode("run-event", row, remember(row))
+                else:
+                    for row in replayed:
+                        _ = remember(row)
 
             run_state = await run_in_threadpool(repo.get_run, run_id)
             if run_state is not None and run_state.get("status") in TERMINAL_RUN_STATUSES:
