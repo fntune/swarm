@@ -34,21 +34,50 @@ class RunSubmissionJob:
 class CoordinationPlane(Protocol):
     """Queue/lease/live-update contract used by deployed workers."""
 
-    def enqueue_agent(self, run_id: str, agent: str) -> None: ...
-    def read_agent(self, worker_id: str, *, block_ms: int = 1000) -> AgentJob | None: ...
-    def ack_agent(self, job: AgentJob) -> None: ...
-    def queue_depth(self) -> int: ...
-    def enqueue_submission(self, payload: dict[str, Any]) -> None: ...
-    def read_submission(self, consumer_id: str, *, block_ms: int = 1000) -> RunSubmissionJob | None: ...
-    def ack_submission(self, job: RunSubmissionJob) -> None: ...
-    def submission_queue_depth(self) -> int: ...
-    def set_lease(self, run_id: str, agent: str, lease_token: str, ttl_seconds: int) -> None: ...
-    def renew_lease(self, run_id: str, agent: str, lease_token: str, ttl_seconds: int) -> bool: ...
-    def heartbeat(self, worker_id: str, ttl_seconds: int = 30) -> None: ...
-    def publish_event(self, run_id: str, event: dict[str, Any]) -> None: ...
-    def subscribe_events(self, run_id: str) -> Iterator[dict[str, Any]]: ...
-    def publish_cancel(self, run_id: str) -> None: ...
-    def is_cancelled(self, run_id: str) -> bool: ...
+    def enqueue_agent(self, run_id: str, agent: str) -> None:
+        raise NotImplementedError
+
+    def read_agent(self, worker_id: str, *, block_ms: int = 1000) -> AgentJob | None:
+        raise NotImplementedError
+
+    def ack_agent(self, job: AgentJob) -> None:
+        raise NotImplementedError
+
+    def queue_depth(self) -> int:
+        raise NotImplementedError
+
+    def enqueue_submission(self, payload: dict[str, Any]) -> None:
+        raise NotImplementedError
+
+    def read_submission(self, consumer_id: str, *, block_ms: int = 1000) -> RunSubmissionJob | None:
+        raise NotImplementedError
+
+    def ack_submission(self, job: RunSubmissionJob) -> None:
+        raise NotImplementedError
+
+    def submission_queue_depth(self) -> int:
+        raise NotImplementedError
+
+    def set_lease(self, run_id: str, agent: str, lease_token: str, ttl_seconds: int) -> None:
+        raise NotImplementedError
+
+    def renew_lease(self, run_id: str, agent: str, lease_token: str, ttl_seconds: int) -> bool:
+        raise NotImplementedError
+
+    def heartbeat(self, worker_id: str, ttl_seconds: int = 30) -> None:
+        raise NotImplementedError
+
+    def publish_event(self, run_id: str, event: dict[str, Any]) -> None:
+        raise NotImplementedError
+
+    def subscribe_events(self, run_id: str) -> Iterator[dict[str, Any]]:
+        raise NotImplementedError
+
+    def publish_cancel(self, run_id: str) -> None:
+        raise NotImplementedError
+
+    def is_cancelled(self, run_id: str) -> bool:
+        raise NotImplementedError
 
 
 class RedisCoordinator:
