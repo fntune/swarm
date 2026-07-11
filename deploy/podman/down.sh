@@ -10,6 +10,7 @@ if [[ "${1:-}" = "--volumes" ]]; then
 fi
 
 containers=(
+  spawnd_dashboard_1
   spawnd_worker_1
   spawnd_outbox_1
   spawnd_scheduler_1

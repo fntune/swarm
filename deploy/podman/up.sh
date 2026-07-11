@@ -11,6 +11,7 @@ SCRATCH_VOLUME="${PROJECT}_spawnd-scratch"
 CODEX_HOME_VOLUME="${PROJECT}_spawnd-codex-home"
 
 APP_IMAGE="${SPAWND_APP_IMAGE:-localhost/spawnd:latest}"
+DASHBOARD_IMAGE="${SPAWND_DASHBOARD_IMAGE:-localhost/spawnd-dashboard:latest}"
 ENV_FILE="${SPAWND_ENV_FILE:-$ROOT/.env}"
 
 if [[ -f "$ENV_FILE" ]]; then
@@ -124,6 +125,7 @@ build_image() {
     return
   fi
   run_podman build -t "$APP_IMAGE" -f "$ROOT/Containerfile" "$ROOT"
+  run_podman build -t "$DASHBOARD_IMAGE" -f "$ROOT/web/apps/dashboard/Dockerfile" "$ROOT/web"
 }
 
 start_infra() {
@@ -254,8 +256,18 @@ start_processes() {
     "$APP_IMAGE" spawnd worker --poll --worker-id "$WORKER_ID" >/dev/null
 
   wait_for api 60 curl -fsS http://127.0.0.1:8765/readyz
+
+  remove_container spawnd_dashboard_1
+  run_podman run -d --replace --name spawnd_dashboard_1 \
+    --network "$NETWORK" --network-alias dashboard \
+    -e "SPAWND_API_URL=http://api:8765" \
+    -p 33000:3000 \
+    "$DASHBOARD_IMAGE" >/dev/null
+
+  wait_for dashboard 60 curl -fsS http://127.0.0.1:33000/login
 }
 
+remove_container spawnd_dashboard_1
 remove_container spawnd_worker_1
 remove_container spawnd_outbox_1
 remove_container spawnd_scheduler_1

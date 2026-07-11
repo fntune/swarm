@@ -133,10 +133,11 @@ def test_enqueue_newly_ready_agents_after_completion():
         ],
     )
     submit_plan(plan, repository=repo, coordinator=coordinator, run_id='run-1')
-    repo.complete_agent('run-1', 'first')
+    assert repo.complete_agent('run-1', 'first') == ['second']
     ready = enqueue_newly_ready_agents('run-1', repository=repo, coordinator=coordinator)
     assert ready == []
     assert repo.ready_agents('run-1') == ['second']
+    assert [job.agent for job in coordinator.jobs] == ['first']
 
 
 def test_store_redacted_artifact_does_not_keep_secret_value():

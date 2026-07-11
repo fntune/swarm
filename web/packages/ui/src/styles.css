@@ -1,0 +1,112 @@
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  --background: oklch(0.995 0.002 286);
+  --foreground: oklch(0.17 0.006 285.8);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.17 0.006 285.8);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.17 0.006 285.8);
+  --primary: oklch(0.511 0.262 276.97);
+  --primary-foreground: oklch(0.985 0.005 286);
+  --secondary: oklch(0.962 0.004 286.3);
+  --secondary-foreground: oklch(0.21 0.006 285.9);
+  --muted: oklch(0.962 0.004 286.3);
+  --muted-foreground: oklch(0.531 0.013 285.9);
+  --accent: oklch(0.945 0.025 277);
+  --accent-foreground: oklch(0.36 0.14 277);
+  --destructive: oklch(0.577 0.245 27.325);
+  --destructive-foreground: oklch(0.985 0.005 286);
+  --border: oklch(0.911 0.005 286.1);
+  --input: oklch(0.911 0.005 286.1);
+  --ring: oklch(0.585 0.233 277.12);
+
+  --status-queued: oklch(0.623 0.214 259.8);
+  --status-running: oklch(0.681 0.162 75.8);
+  --status-completed: oklch(0.627 0.155 162.5);
+  --status-failed: oklch(0.591 0.236 25.8);
+  --status-paused: oklch(0.554 0.046 257.4);
+  --status-cancelled: oklch(0.552 0.016 285.9);
+
+  --radius: 0.5rem;
+}
+
+.dark {
+  --background: oklch(0.155 0.006 285.9);
+  --foreground: oklch(0.967 0.003 286.4);
+  --card: oklch(0.195 0.006 285.9);
+  --card-foreground: oklch(0.967 0.003 286.4);
+  --popover: oklch(0.195 0.006 285.9);
+  --popover-foreground: oklch(0.967 0.003 286.4);
+  --primary: oklch(0.673 0.182 276.94);
+  --primary-foreground: oklch(0.16 0.05 277);
+  --secondary: oklch(0.252 0.006 286);
+  --secondary-foreground: oklch(0.967 0.003 286.4);
+  --muted: oklch(0.252 0.006 286);
+  --muted-foreground: oklch(0.674 0.012 286.1);
+  --accent: oklch(0.27 0.045 277);
+  --accent-foreground: oklch(0.852 0.09 277);
+  --destructive: oklch(0.671 0.205 25.5);
+  --destructive-foreground: oklch(0.985 0.005 286);
+  --border: oklch(0.282 0.007 286);
+  --input: oklch(0.282 0.007 286);
+  --ring: oklch(0.585 0.233 277.12);
+
+  --status-queued: oklch(0.683 0.18 259.8);
+  --status-running: oklch(0.768 0.156 76.3);
+  --status-completed: oklch(0.722 0.152 162.5);
+  --status-failed: oklch(0.671 0.205 25.5);
+  --status-paused: oklch(0.652 0.04 257.4);
+  --status-cancelled: oklch(0.62 0.014 285.9);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  --color-status-queued: var(--status-queued);
+  --color-status-running: var(--status-running);
+  --color-status-completed: var(--status-completed);
+  --color-status-failed: var(--status-failed);
+  --color-status-paused: var(--status-paused);
+  --color-status-cancelled: var(--status-cancelled);
+
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, "SF Mono", monospace;
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+@layer base {
+  * {
+    border-color: var(--color-border);
+    outline-color: color-mix(in oklab, var(--color-ring) 50%, transparent);
+  }
+
+  body {
+    background-color: var(--color-background);
+    color: var(--color-foreground);
+  }
+}

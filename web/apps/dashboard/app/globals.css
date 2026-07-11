@@ -1,0 +1,41 @@
+@import "tailwindcss";
+@import "@spawnd/ui/styles.css";
+
+@source "../../../packages/ui/src";
+
+/* react-diff-view theming via our tokens (light + dark) */
+.diff {
+  width: 100%;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--color-foreground);
+  background: transparent;
+}
+
+.diff-gutter {
+  color: var(--color-muted-foreground);
+  background: color-mix(in oklab, var(--color-muted) 55%, transparent);
+}
+
+.diff-code {
+  background: transparent;
+}
+
+.diff-gutter-insert,
+.diff-code-insert {
+  background: color-mix(in oklab, var(--color-status-completed) 14%, transparent);
+}
+
+.diff-gutter-delete,
+.diff-code-delete {
+  background: color-mix(in oklab, var(--color-status-failed) 13%, transparent);
+}
+
+.diff-code-edit {
+  background: color-mix(in oklab, var(--color-status-running) 28%, transparent);
+}
+
+.diff-hunk-header {
+  background: color-mix(in oklab, var(--color-muted) 70%, transparent);
+  color: var(--color-muted-foreground);
+}

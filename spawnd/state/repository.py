@@ -225,13 +225,17 @@ class DeployedRepository:
             row = conn.execute(select(schema.runs).where(schema.runs.c.run_id == run_id)).mappings().first()
             return dict(row) if row else None
 
-    def list_runs(self, limit: int = 20) -> list[dict[str, Any]]:
+    def list_runs(self, limit: int = 20, *, status: str | None = None, offset: int = 0) -> list[dict[str, Any]]:
         with self.engine.connect() as conn:
-            rows = conn.execute(
+            stmt = (
                 select(schema.runs)
                 .order_by(schema.runs.c.created_at.desc())
                 .limit(limit)
-            ).mappings().all()
+                .offset(offset)
+            )
+            if status:
+                stmt = stmt.where(schema.runs.c.status == status)
+            rows = conn.execute(stmt).mappings().all()
             return [dict(row) for row in rows]
 
     def create_run_template(
@@ -314,6 +318,13 @@ class DeployedRepository:
             if result.rowcount == 0:
                 raise ValueError(f'schedule not found: {schedule_id}')
 
+    def list_schedules(self, limit: int = 100) -> list[dict[str, Any]]:
+        with self.engine.connect() as conn:
+            rows = conn.execute(
+                select(schema.schedules).order_by(schema.schedules.c.created_at.desc()).limit(limit)
+            ).mappings().all()
+            return [dict(row) for row in rows]
+
     def due_schedules(self, *, now: datetime | None = None, limit: int = 100) -> list[dict[str, Any]]:
         now = now or datetime.now(timezone.utc)
         with self.engine.connect() as conn:
@@ -357,6 +368,45 @@ class DeployedRepository:
             rows = conn.execute(
                 select(schema.events)
                 .where(schema.events.c.run_id == run_id)
+                .order_by(schema.events.c.created_at.desc())
+                .limit(limit)
+            ).mappings().all()
+            return [dict(row) for row in rows]
+
+    def get_events_after(self, run_id: str, *, after: datetime | None = None, limit: int = 500) -> list[dict[str, Any]]:
+        """Ascending event page for incremental streaming; `>=` plus caller-side id dedupe handles ties."""
+
+        with self.engine.connect() as conn:
+            stmt = select(schema.events).where(schema.events.c.run_id == run_id)
+            if after is not None:
+                stmt = stmt.where(schema.events.c.created_at >= after)
+            rows = conn.execute(stmt.order_by(schema.events.c.created_at.asc()).limit(limit)).mappings().all()
+            return [dict(row) for row in rows]
+
+    def get_event(self, run_id: str, event_id: str) -> dict[str, Any] | None:
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                select(schema.events).where(
+                    and_(schema.events.c.run_id == run_id, schema.events.c.id == event_id)
+                )
+            ).mappings().first()
+            return dict(row) if row else None
+
+    def list_pending_clarifications(self, limit: int = 100) -> list[dict[str, Any]]:
+        with self.engine.connect() as conn:
+            answered = (
+                select(schema.responses.c.id)
+                .where(
+                    and_(
+                        schema.responses.c.run_id == schema.events.c.run_id,
+                        schema.responses.c.clarification_id == schema.events.c.id,
+                    )
+                )
+                .exists()
+            )
+            rows = conn.execute(
+                select(schema.events)
+                .where(and_(schema.events.c.event_type.in_(['clarification', 'blocker']), ~answered))
                 .order_by(schema.events.c.created_at.desc())
                 .limit(limit)
             ).mappings().all()
@@ -483,6 +533,23 @@ class DeployedRepository:
         available = max(0, limit - running)
         return names[:available]
 
+    def _unhinted_claimable_agents_in_connection(self, conn: Any, run_id: str) -> list[str]:
+        claimable = self._claimable_ready_agents_in_connection(conn, run_id)
+        if not claimable:
+            return []
+        hinted = set(
+            conn.execute(
+                select(schema.queue_outbox.c.agent).where(
+                    and_(
+                        schema.queue_outbox.c.run_id == run_id,
+                        schema.queue_outbox.c.event_type == "agent_ready",
+                        schema.queue_outbox.c.agent.in_(claimable),
+                    )
+                )
+            ).scalars()
+        )
+        return [name for name in claimable if name not in hinted]
+
     def _concurrency_limit_in_connection(self, conn: Any, run_id: str) -> int | None:
         spec = conn.execute(select(schema.runs.c.spec).where(schema.runs.c.run_id == run_id)).scalar_one_or_none()
         if not isinstance(spec, dict):
@@ -518,8 +585,9 @@ class DeployedRepository:
         """Move pending agents whose dependencies completed to queued."""
 
         with self.engine.begin() as conn:
-            _ = self._mark_newly_ready_agents_in_transaction(conn, run_id)
-            return self._claimable_ready_agents_in_connection(conn, run_id)
+            newly_ready = self._mark_newly_ready_agents_in_transaction(conn, run_id)
+            claimable = set(self._claimable_ready_agents_in_connection(conn, run_id))
+            return [name for name in newly_ready if name in claimable]
 
     def claim_agent(self, run_id: str, agent_name: str, *, worker_id: str, lease_seconds: int = 300) -> ClaimedAgent | None:
         """Atomically claim a queued agent for a worker."""
@@ -650,6 +718,13 @@ class DeployedRepository:
         now = datetime.now(timezone.utc)
         ready: list[str] = []
         with self.engine.begin() as conn:
+            locked_run_id = conn.execute(
+                select(schema.runs.c.run_id)
+                .where(schema.runs.c.run_id == run_id)
+                .with_for_update()
+            ).scalar_one_or_none()
+            if locked_run_id is None:
+                return []
             attempt = self._running_attempt(conn, run_id, agent_name, attempt_id)
             update_conditions = [
                 schema.agents.c.run_id == run_id,
@@ -691,10 +766,19 @@ class DeployedRepository:
             )
             _ = self.append_event_in_transaction(conn, run_id, agent_name, 'done', {'cost_usd': cost_usd})
             _ = self._mark_newly_ready_agents_in_transaction(conn, run_id)
-            ready = self._claimable_ready_agents_in_connection(conn, run_id)
             budget_action = self._enforce_run_budget_in_transaction(conn, run_id, now)
             if budget_action in {'pause', 'cancel'}:
                 ready = []
+            else:
+                ready = self._unhinted_claimable_agents_in_connection(conn, run_id)
+                for name in ready:
+                    self._record_queue_outbox_in_transaction(
+                        conn,
+                        run_id,
+                        name,
+                        "agent_ready",
+                        {"run_id": run_id, "agent": name},
+                    )
         self.refresh_run_status(run_id)
         return ready
 
@@ -1554,18 +1638,28 @@ class DeployedRepository:
         return event_id
 
     def record_queue_outbox(self, run_id: str, agent: str | None, event_type: str, payload: dict[str, Any]) -> str:
-        outbox_id = uuid4().hex
         with self.engine.begin() as conn:
-            conn.execute(
-                insert(schema.queue_outbox).values(
-                    id=outbox_id,
-                    run_id=run_id,
-                    agent=agent,
-                    event_type=event_type,
-                    payload=redact_attributes(payload),
-                    status='pending',
-                )
+            return self._record_queue_outbox_in_transaction(conn, run_id, agent, event_type, payload)
+
+    def _record_queue_outbox_in_transaction(
+        self,
+        conn: Any,
+        run_id: str,
+        agent: str | None,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> str:
+        outbox_id = uuid4().hex
+        conn.execute(
+            insert(schema.queue_outbox).values(
+                id=outbox_id,
+                run_id=run_id,
+                agent=agent,
+                event_type=event_type,
+                payload=redact_attributes(payload),
+                status="pending",
             )
+        )
         return outbox_id
 
     def mark_outbox_published(self, outbox_id: str) -> None:
@@ -1797,6 +1891,11 @@ class DeployedRepository:
             if agent:
                 stmt = stmt.where(schema.artifacts.c.agent == agent)
             return [dict(row) for row in conn.execute(stmt).mappings().all()]
+
+    def get_artifact(self, artifact_id: str) -> dict[str, Any] | None:
+        with self.engine.connect() as conn:
+            row = conn.execute(select(schema.artifacts).where(schema.artifacts.c.id == artifact_id)).mappings().first()
+            return dict(row) if row else None
 
     def record_check(
         self,

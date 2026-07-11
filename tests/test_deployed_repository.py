@@ -1,8 +1,14 @@
 """Tests for deployed Postgres-style repository behavior."""
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from threading import Barrier
+
+from sqlalchemy import and_, select
 
 from tests.deployed_helpers import make_repo
 from spawnd.models.specs import AgentSpec, CircuitBreaker, CostBudget, Defaults, ManagerSettings, Orchestration, PlanSpec
+from spawnd.state import schema
+from spawnd.state.repository import ClaimedAgent
 
 
 def test_create_run_records_agents_without_raw_env_or_prompt_secret():
@@ -407,6 +413,86 @@ def test_complete_agent_queues_dependents_and_records_event():
     assert statuses == {'a': 'completed', 'b': 'queued'}
     events = repo.get_events('run-1')
     assert {event['event_type'] for event in events} >= {'done', 'agent_queued', 'run_created'}
+
+
+def test_concurrent_completions_queue_join_once():
+    repo = make_repo()
+    repo.create_run(
+        PlanSpec(
+            name="join",
+            agents=[
+                AgentSpec(name="a", prompt="a"),
+                AgentSpec(name="b", prompt="b"),
+                AgentSpec(name="join", prompt="join", depends_on=["a", "b"]),
+            ],
+        ),
+        "run-1",
+    )
+    a = repo.claim_agent("run-1", "a", worker_id="worker-a")
+    b = repo.claim_agent("run-1", "b", worker_id="worker-b")
+    assert a is not None
+    assert b is not None
+    barrier = Barrier(2)
+
+    def complete(claimed: ClaimedAgent) -> list[str]:
+        _ = barrier.wait()
+        return repo.complete_agent("run-1", claimed.name, attempt_id=claimed.attempt_id)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        a_result = pool.submit(complete, a)
+        b_result = pool.submit(complete, b)
+        ready = a_result.result() + b_result.result()
+
+    assert ready == ["join"]
+    join = repo.get_agent("run-1", "join")
+    assert join is not None
+    assert join["status"] == "queued"
+    with repo.engine.connect() as conn:
+        outbox_agents = conn.execute(
+            select(schema.queue_outbox.c.agent).where(
+                and_(
+                    schema.queue_outbox.c.run_id == "run-1",
+                    schema.queue_outbox.c.event_type == "agent_ready",
+                )
+            )
+        ).scalars().all()
+    assert outbox_agents == ["join"]
+
+
+def test_completion_does_not_republish_already_hinted_agent_at_concurrency_limit():
+    repo = make_repo()
+    repo.create_run(
+        PlanSpec(
+            name="limited",
+            orchestration=Orchestration(concurrency_limit=2),
+            agents=[
+                AgentSpec(name="a", prompt="a"),
+                AgentSpec(name="b", prompt="b"),
+                AgentSpec(name="c", prompt="c"),
+            ],
+        ),
+        "run-1",
+    )
+    for name in ["a", "b"]:
+        outbox_id = repo.record_queue_outbox("run-1", name, "agent_ready", {"run_id": "run-1", "agent": name})
+        repo.mark_outbox_published(outbox_id)
+    a = repo.claim_agent("run-1", "a", worker_id="worker-a")
+    assert a is not None
+
+    assert repo.complete_agent("run-1", "a", attempt_id=a.attempt_id) == ["c"]
+
+    with repo.engine.connect() as conn:
+        outbox_agents = conn.execute(
+            select(schema.queue_outbox.c.agent)
+            .where(
+                and_(
+                    schema.queue_outbox.c.run_id == "run-1",
+                    schema.queue_outbox.c.event_type == "agent_ready",
+                )
+            )
+            .order_by(schema.queue_outbox.c.created_at)
+        ).scalars().all()
+    assert outbox_agents == ["a", "b", "c"]
 
 
 def test_repository_records_trace_artifact_check_and_git_provenance():
