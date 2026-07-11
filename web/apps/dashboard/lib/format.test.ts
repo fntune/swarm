@@ -7,6 +7,7 @@ import {
   formatUsd,
   pollInterval,
   repoLabel,
+  runIsCancellable,
   shortSha,
 } from "./format";
 
@@ -50,5 +51,11 @@ describe("format helpers", () => {
   it("picks poll cadence from run activity", () => {
     expect(pollInterval(["completed", "running"])).toBe(5_000);
     expect(pollInterval(["completed", "failed"])).toBe(30_000);
+  });
+
+  it("allows operators to cancel active and paused runs", () => {
+    expect(runIsCancellable("running")).toBe(true);
+    expect(runIsCancellable("paused")).toBe(true);
+    expect(runIsCancellable("completed")).toBe(false);
   });
 });

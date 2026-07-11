@@ -28,8 +28,9 @@ import { useRouter } from "next/navigation";
 import * as React from "react";
 import { toast } from "sonner";
 
-import { ParamForm, templateParameters } from "@/components/submit/param-form";
+import { ParamForm } from "@/components/submit/param-form";
 import { browserClient, templatesQuery } from "@/lib/queries";
+import { initialParameterValues, templateParameters } from "@/lib/template-parameters";
 
 const DEFAULT_TEMPLATE = `name: {name}
 agents:
@@ -169,8 +170,10 @@ function CreateTemplateDialog() {
 function RunTemplateDialog({ template }: { template: RunTemplate }) {
   const router = useRouter();
   const [open, setOpen] = React.useState(false);
-  const [values, setValues] = React.useState<Record<string, string>>({});
   const parameters = templateParameters(template);
+  const [values, setValues] = React.useState<Record<string, string>>(() =>
+    initialParameterValues(parameters),
+  );
 
   const run = useMutation({
     mutationFn: () => browserClient().templates.run(template.id, { parameters: values }),

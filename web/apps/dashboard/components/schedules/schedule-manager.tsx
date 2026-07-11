@@ -35,9 +35,10 @@ import Link from "next/link";
 import * as React from "react";
 import { toast } from "sonner";
 
-import { ParamForm, templateParameters } from "@/components/submit/param-form";
+import { ParamForm } from "@/components/submit/param-form";
 import { formatDurationMs } from "@/lib/format";
 import { browserClient, schedulesQuery, templatesQuery } from "@/lib/queries";
+import { initialParameterValues, templateParameters } from "@/lib/template-parameters";
 
 function CreateScheduleDialog({ templates }: { templates: RunTemplate[] }) {
   const queryClient = useQueryClient();
@@ -112,7 +113,8 @@ function CreateScheduleDialog({ templates }: { templates: RunTemplate[] }) {
             value={templateId}
             onValueChange={(value) => {
               setTemplateId(value);
-              setValues({});
+              const template = templates.find((row) => row.id === value);
+              setValues(initialParameterValues(template ? templateParameters(template) : []));
             }}
           >
             <SelectTrigger className="font-mono text-xs">

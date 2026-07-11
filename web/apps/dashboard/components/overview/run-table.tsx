@@ -21,18 +21,18 @@ import { usePathname, useRouter, useSearchParams } from "next/navigation";
 
 import { durationBetween, pollInterval, repoLabel } from "@/lib/format";
 import { runsQuery } from "@/lib/queries";
-
-const FILTERS = ["all", "running", "queued", "completed", "failed", "paused", "cancelled"] as const;
+import { parseRunFilter, RUN_FILTERS, statusesForRunFilter } from "@/lib/run-filters";
 
 export function RunTable({ initialRuns }: { initialRuns: Run[] }) {
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
-  const filter = searchParams.get("status") ?? "all";
+  const filter = parseRunFilter(searchParams.get("status"));
+  const statuses = statusesForRunFilter(filter);
 
   const runs = useQuery({
-    ...runsQuery(),
-    initialData: initialRuns,
+    ...runsQuery(100, statuses),
+    initialData: filter === "all" ? initialRuns : undefined,
     refetchInterval: (query) => pollInterval((query.state.data ?? []).map((run) => run.status)),
   });
 
@@ -55,7 +55,7 @@ export function RunTable({ initialRuns }: { initialRuns: Run[] }) {
   return (
     <section className="flex flex-col gap-3">
       <div className="flex items-center gap-1.5">
-        {FILTERS.map((value) => (
+        {RUN_FILTERS.map((value) => (
           <button
             key={value}
             type="button"
@@ -95,7 +95,7 @@ export function RunTable({ initialRuns }: { initialRuns: Run[] }) {
                 <TableRow key={run.run_id} className="group">
                   <TableCell className="max-w-64">
                     <Link
-                      href={`/runs/${run.run_id}`}
+                      href={`/runs/${encodeURIComponent(run.run_id)}`}
                       className="block truncate font-medium font-mono text-foreground group-hover:text-primary"
                     >
                       {run.run_id}

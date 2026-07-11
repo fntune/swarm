@@ -7,6 +7,7 @@ import type {
   Run,
   RunDetail,
   RunEvent,
+  RunStatus,
   RunTemplate,
   RuntimeError,
   RuntimeInvocation,
@@ -23,13 +24,21 @@ export interface SpawndClientOptions {
   fetch?: typeof fetch;
 }
 
-type Query = Record<string, string | number | boolean | null | undefined>;
+type QueryValue = string | number | boolean | null | undefined;
+type Query = Record<string, QueryValue | QueryValue[]>;
+
+function path(...segments: string[]): string {
+  return segments.map(encodeURIComponent).join("/");
+}
 
 function buildUrl(baseUrl: string, path: string, query?: Query): string {
   const url = new URL(path.replace(/^\//, ""), baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`);
   for (const [key, value] of Object.entries(query ?? {})) {
-    if (value !== undefined && value !== null && value !== "") {
-      url.searchParams.set(key, String(value));
+    const values = Array.isArray(value) ? value : [value];
+    for (const item of values) {
+      if (item !== undefined && item !== null && item !== "") {
+        url.searchParams.append(key, String(item));
+      }
     }
   }
   return url.toString();
@@ -62,9 +71,9 @@ export function createSpawndClient(options: SpawndClientOptions) {
 
   return {
     runs: {
-      list: (query?: { limit?: number; offset?: number; status?: string }) =>
+      list: (query?: { limit?: number; offset?: number; status?: RunStatus | RunStatus[] }) =>
         request<Run[]>("runs", {}, query),
-      get: (runId: string) => request<RunDetail>(`runs/${runId}`),
+      get: (runId: string) => request<RunDetail>(path("runs", runId)),
       submit: (body: {
         plan: PlanSpec;
         run_id?: string;
@@ -72,41 +81,46 @@ export function createSpawndClient(options: SpawndClientOptions) {
         source_ref?: string;
       }) => request<{ run_id: string }>("runs", { method: "POST", body: JSON.stringify(body) }),
       cancel: (runId: string) =>
-        request<{ cancelled: number }>(`runs/${runId}/cancel`, { method: "POST" }),
+        request<{ cancelled: number }>(path("runs", runId, "cancel"), { method: "POST" }),
       resume: (runId: string) =>
-        request<{ run_id: string; agent: string; status: string }[]>(`runs/${runId}/resume`, {
-          method: "POST",
-        }),
+        request<{ run_id: string; agent: string; status: string }[]>(
+          path("runs", runId, "resume"),
+          {
+            method: "POST",
+          },
+        ),
       events: (runId: string, query?: { limit?: number }) =>
-        request<RunEvent[]>(`runs/${runId}/events`, {}, query),
+        request<RunEvent[]>(path("runs", runId, "events"), {}, query),
       checks: (runId: string, query?: { agent?: string }) =>
-        request<Check[]>(`runs/${runId}/checks`, {}, query),
+        request<Check[]>(path("runs", runId, "checks"), {}, query),
       artifacts: (runId: string, query?: { agent?: string }) =>
-        request<Artifact[]>(`runs/${runId}/artifacts`, {}, query),
+        request<Artifact[]>(path("runs", runId, "artifacts"), {}, query),
       artifactContent: (runId: string, artifactId: string) =>
-        raw(`runs/${runId}/artifacts/${artifactId}/content`),
+        raw(path("runs", runId, "artifacts", artifactId, "content")),
+      artifactDownload: (runId: string, artifactId: string) =>
+        raw(path("runs", runId, "artifacts", artifactId, "download")),
       traces: (runId: string, query?: { agent?: string }) =>
-        request<TraceSpan[]>(`runs/${runId}/traces`, {}, query),
+        request<TraceSpan[]>(path("runs", runId, "traces"), {}, query),
       provenance: (runId: string, query?: { agent?: string }) =>
-        request<GitProvenance[]>(`runs/${runId}/provenance`, {}, query),
+        request<GitProvenance[]>(path("runs", runId, "provenance"), {}, query),
       usage: (runId: string, query?: { agent?: string }) =>
-        request<RunUsage>(`runs/${runId}/usage`, {}, query),
+        request<RunUsage>(path("runs", runId, "usage"), {}, query),
       sessions: (runId: string, query?: { agent?: string }) =>
-        request<RuntimeSession[]>(`runs/${runId}/sessions`, {}, query),
+        request<RuntimeSession[]>(path("runs", runId, "sessions"), {}, query),
       invocations: (runId: string, query?: { agent?: string }) =>
-        request<RuntimeInvocation[]>(`runs/${runId}/invocations`, {}, query),
+        request<RuntimeInvocation[]>(path("runs", runId, "invocations"), {}, query),
       errors: (runId: string, query?: { agent?: string }) =>
-        request<RuntimeError[]>(`runs/${runId}/errors`, {}, query),
-      clarifications: (runId: string) => request<RunEvent[]>(`runs/${runId}/clarifications`),
+        request<RuntimeError[]>(path("runs", runId, "errors"), {}, query),
+      clarifications: (runId: string) => request<RunEvent[]>(path("runs", runId, "clarifications")),
       answerClarification: (runId: string, clarificationId: string, response: string) =>
         request<{ clarification_id: string; status: string }>(
-          `runs/${runId}/clarifications/${clarificationId}/response`,
+          path("runs", runId, "clarifications", clarificationId, "response"),
           { method: "POST", body: JSON.stringify({ response }) },
         ),
       /** Upstream SSE path; consumed through the dashboard proxy, not EventSource-direct. */
       eventStreamPath: (runId: string, query?: { replay?: number }) => {
         const replay = query?.replay;
-        return `runs/${runId}/events/stream${replay !== undefined ? `?replay=${replay}` : ""}`;
+        return `${path("runs", runId, "events", "stream")}${replay !== undefined ? `?replay=${replay}` : ""}`;
       },
     },
     templates: {
@@ -124,7 +138,7 @@ export function createSpawndClient(options: SpawndClientOptions) {
           body: JSON.stringify(body),
         }),
       run: (templateId: string, body: { parameters?: Record<string, unknown>; run_id?: string }) =>
-        request<{ run_id: string }>(`templates/${templateId}/runs`, {
+        request<{ run_id: string }>(path("templates", templateId, "runs"), {
           method: "POST",
           body: JSON.stringify(body),
         }),
@@ -144,7 +158,7 @@ export function createSpawndClient(options: SpawndClientOptions) {
           body: JSON.stringify(body),
         }),
       setStatus: (scheduleId: string, status: "active" | "paused") =>
-        request<{ schedule_id: string; status: string }>(`schedules/${scheduleId}/status`, {
+        request<{ schedule_id: string; status: string }>(path("schedules", scheduleId, "status"), {
           method: "PATCH",
           body: JSON.stringify({ status }),
         }),

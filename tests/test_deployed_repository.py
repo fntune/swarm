@@ -3,7 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from threading import Barrier
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, select, update
 
 from tests.deployed_helpers import make_repo
 from spawnd.models.specs import AgentSpec, CircuitBreaker, CostBudget, Defaults, ManagerSettings, Orchestration, PlanSpec
@@ -36,6 +36,28 @@ def test_create_run_records_agents_without_raw_env_or_prompt_secret():
     assert agents[0]['model'] is None
     assert 'secret-value' not in str(agents[0])
     assert agents[0]['env_metadata']['keys'] == ['PATH']
+
+
+def test_list_runs_filters_multiple_statuses_before_limiting() -> None:
+    repo = make_repo()
+    plan = PlanSpec(name='deployed', agents=[AgentSpec(name='a', prompt='task')])
+    for run_id in ("queued-run", "failed-run", "cost-run"):
+        repo.create_run(plan, run_id)
+    with repo.engine.begin() as conn:
+        conn.execute(
+            update(schema.runs)
+            .where(schema.runs.c.run_id == "failed-run")
+            .values(status="failed")
+        )
+        conn.execute(
+            update(schema.runs)
+            .where(schema.runs.c.run_id == "cost-run")
+            .values(status="cost_exceeded")
+        )
+
+    rows = repo.list_runs(limit=2, status=["failed", "cost_exceeded"])
+
+    assert {row["run_id"] for row in rows} == {"failed-run", "cost-run"}
 
 
 def test_create_run_records_reviewer_as_readonly_capability():
@@ -237,6 +259,68 @@ def test_consumed_clarification_response_does_not_make_item_pending_again():
     repo.consume_response(response['id'])
 
     assert repo.get_pending_clarifications('run-1', agent_prefix='manager.') == []
+
+
+def test_clarification_response_is_single_writer() -> None:
+    repo = make_repo()
+    repo.create_run(PlanSpec(name="deployed", agents=[AgentSpec(name="a", prompt="task")]), "run-1")
+    clarification_id = repo.append_event("run-1", "manager.worker", "clarification", {"question": "q"})
+
+    assert repo.record_response("run-1", clarification_id, "first", agent="api") is True
+    assert repo.record_response("run-1", clarification_id, "second", agent="api") is False
+
+    response = repo.get_response("run-1", clarification_id)
+    assert response is not None
+    assert response["response"] == "first"
+    events = [row for row in repo.get_events("run-1") if row["event_type"] == "clarification_response"]
+    assert len(events) == 1
+
+
+def test_concurrent_clarification_responses_accept_exactly_one_answer() -> None:
+    repo = make_repo()
+    repo.create_run(PlanSpec(name="deployed", agents=[AgentSpec(name="a", prompt="task")]), "run-1")
+    clarification_id = repo.append_event("run-1", "manager.worker", "clarification", {"question": "q"})
+    barrier = Barrier(2)
+
+    def answer(response: str) -> bool:
+        barrier.wait()
+        return repo.record_response("run-1", clarification_id, response, agent="api")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(answer, ["first", "second"]))
+
+    assert sorted(results) == [False, True]
+    events = [row for row in repo.get_events("run-1") if row["event_type"] == "clarification_response"]
+    assert len(events) == 1
+
+
+def test_event_cursor_orders_equal_timestamps_by_id() -> None:
+    repo = make_repo()
+    repo.create_run(PlanSpec(name="deployed", agents=[AgentSpec(name="a", prompt="task")]), "run-1")
+    first_id = repo.append_event("run-1", "a", "first", {})
+    second_id = repo.append_event("run-1", "a", "second", {})
+    first = repo.get_event("run-1", first_id)
+    second = repo.get_event("run-1", second_id)
+    assert first is not None and second is not None
+    with repo.engine.begin() as conn:
+        conn.execute(
+            update(schema.events)
+            .where(schema.events.c.id.in_([first_id, second_id]))
+            .values(created_at=first["created_at"])
+        )
+    first = repo.get_event("run-1", first_id)
+    second = repo.get_event("run-1", second_id)
+    assert first is not None and second is not None
+
+    before, after = sorted([first, second], key=lambda row: (row["created_at"], row["id"]))
+
+    rows = repo.get_events_after(
+        "run-1",
+        after=before["created_at"],
+        after_id=before["id"],
+    )
+    selected_ids = [row["id"] for row in rows if row["id"] in {first_id, second_id}]
+    assert selected_ids == [after["id"]]
 
 
 def test_retryable_failure_requeues_retry_agent_and_records_attempt_failure():

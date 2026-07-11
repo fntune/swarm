@@ -72,7 +72,9 @@ export function useRunStream(runId: string) {
       pollTimer = setInterval(poll, POLL_MS);
     };
 
-    const source = new EventSource(`/api/spawnd/runs/${runId}/events/stream?replay=200`);
+    const source = new EventSource(
+      `/api/spawnd/runs/${encodeURIComponent(runId)}/events/stream?replay=200`,
+    );
 
     source.addEventListener("open", () => {
       if (!disposed) setStatus("live");

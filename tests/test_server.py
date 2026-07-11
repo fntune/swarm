@@ -34,6 +34,22 @@ def test_http_api_requires_bearer_token(monkeypatch):
     assert client.get('/runs/run-1', headers={'Authorization': 'Bearer wrong'}).status_code == 401
 
 
+def test_http_api_rejects_unsafe_path_ids(monkeypatch) -> None:
+    monkeypatch.setenv('SPAWND_API_TOKEN', 'test-token')
+    client = TestClient(server.create_app())
+
+    response = client.post(
+        '/runs',
+        headers=AUTH,
+        json={
+            'run_id': 'unsafe/id',
+            'plan': {'name': 'plan', 'agents': [{'name': 'a', 'prompt': 'task'}]},
+        },
+    )
+
+    assert response.status_code == 422
+
+
 def test_http_submit_validates_plan(monkeypatch):
     repo = make_repo()
     coordinator = InMemoryCoordinator()
@@ -475,18 +491,31 @@ def test_http_artifact_content(monkeypatch):
     wrong_run = client.get(f'/runs/run-2/artifacts/{artifact_id}/content', headers=AUTH)
     assert wrong_run.status_code == 404
 
+    oversized_blob = store.put_text(
+        'runs/run-1/a/huge.txt',
+        'x' * (server.MAX_ARTIFACT_CONTENT_BYTES + 1),
+    )
     oversized_id = repo.record_artifact(
         run_id='run-1',
         agent='a',
         kind='output',
-        uri='memory://runs/run-1/a/huge.txt',
-        sha256='deadbeef',
-        size_bytes=server.MAX_ARTIFACT_CONTENT_BYTES + 1,
+        uri=oversized_blob.uri,
+        sha256=oversized_blob.sha256,
+        size_bytes=oversized_blob.size_bytes,
         redaction_policy='redacted',
         content_type='text/plain',
     )
     oversized = client.get(f'/runs/run-1/artifacts/{oversized_id}/content', headers=AUTH)
     assert oversized.status_code == 413
+
+    download = client.get(f'/runs/run-1/artifacts/{oversized_id}/download', headers=AUTH)
+    assert download.status_code == 200
+    assert len(download.content) == server.MAX_ARTIFACT_CONTENT_BYTES + 1
+    assert download.headers['content-disposition'] == f'attachment; filename="{oversized_id}.txt"'
+
+    del store.objects['runs/run-1/a/output.txt']
+    missing = client.get(f'/runs/run-1/artifacts/{artifact_id}/content', headers=AUTH)
+    assert missing.status_code == 404
 
 
 def test_http_clarification_list_and_answer(monkeypatch):
@@ -568,3 +597,13 @@ def test_http_event_stream_replays_and_completes(monkeypatch):
     assert '"event_type": "run_created"' in body
     assert 'event: done' in body
     assert '"status": "cancelled"' in body
+
+    with client.stream(
+        'GET',
+        '/runs/run-1/events/stream?replay=0',
+        headers=AUTH,
+    ) as response:
+        no_replay_body = ''.join(response.iter_text())
+
+    assert 'event: run-event' not in no_replay_body
+    assert 'event: done' in no_replay_body

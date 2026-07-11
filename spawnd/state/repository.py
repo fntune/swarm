@@ -1,12 +1,14 @@
 """Postgres-oriented repository for deployed spawnd state."""
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import Engine, and_, create_engine, func, insert, select, update
+from sqlalchemy import Engine, and_, create_engine, func, insert, or_, select, update
+from sqlalchemy.exc import IntegrityError
 
 from spawnd.artifacts.redaction import canonical_json_hash, redact_attributes, redact_env, redact_freeform_text, stable_hash
 from spawnd.models.specs import AgentSpec, PlanSpec
@@ -225,16 +227,23 @@ class DeployedRepository:
             row = conn.execute(select(schema.runs).where(schema.runs.c.run_id == run_id)).mappings().first()
             return dict(row) if row else None
 
-    def list_runs(self, limit: int = 20, *, status: str | None = None, offset: int = 0) -> list[dict[str, Any]]:
+    def list_runs(
+        self,
+        limit: int = 20,
+        *,
+        status: str | Sequence[str] | None = None,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
         with self.engine.connect() as conn:
             stmt = (
                 select(schema.runs)
-                .order_by(schema.runs.c.created_at.desc())
+                .order_by(schema.runs.c.created_at.desc(), schema.runs.c.run_id.desc())
                 .limit(limit)
                 .offset(offset)
             )
             if status:
-                stmt = stmt.where(schema.runs.c.status == status)
+                statuses = [status] if isinstance(status, str) else list(status)
+                stmt = stmt.where(schema.runs.c.status.in_(statuses))
             rows = conn.execute(stmt).mappings().all()
             return [dict(row) for row in rows]
 
@@ -368,19 +377,36 @@ class DeployedRepository:
             rows = conn.execute(
                 select(schema.events)
                 .where(schema.events.c.run_id == run_id)
-                .order_by(schema.events.c.created_at.desc())
+                .order_by(schema.events.c.created_at.desc(), schema.events.c.id.desc())
                 .limit(limit)
             ).mappings().all()
             return [dict(row) for row in rows]
 
-    def get_events_after(self, run_id: str, *, after: datetime | None = None, limit: int = 500) -> list[dict[str, Any]]:
-        """Ascending event page for incremental streaming; `>=` plus caller-side id dedupe handles ties."""
+    def get_events_after(
+        self,
+        run_id: str,
+        *,
+        after: datetime | None = None,
+        after_id: str | None = None,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        """Return an ascending event page after a deterministic event cursor."""
 
         with self.engine.connect() as conn:
             stmt = select(schema.events).where(schema.events.c.run_id == run_id)
             if after is not None:
-                stmt = stmt.where(schema.events.c.created_at >= after)
-            rows = conn.execute(stmt.order_by(schema.events.c.created_at.asc()).limit(limit)).mappings().all()
+                if after_id is None:
+                    stmt = stmt.where(schema.events.c.created_at >= after)
+                else:
+                    stmt = stmt.where(
+                        or_(
+                            schema.events.c.created_at > after,
+                            and_(schema.events.c.created_at == after, schema.events.c.id > after_id),
+                        )
+                    )
+            rows = conn.execute(
+                stmt.order_by(schema.events.c.created_at.asc(), schema.events.c.id.asc()).limit(limit)
+            ).mappings().all()
             return [dict(row) for row in rows]
 
     def get_event(self, run_id: str, event_id: str) -> dict[str, Any] | None:
@@ -440,16 +466,48 @@ class DeployedRepository:
                     results.append(dict(row))
             return results
 
-    def record_response(self, run_id: str, clarification_id: str, response: str) -> None:
-        with self.engine.begin() as conn:
-            conn.execute(
-                insert(schema.responses).values(
-                    run_id=run_id,
-                    clarification_id=clarification_id,
-                    response=redact_freeform_text(response),
-                    consumed=False,
+    def record_response(
+        self,
+        run_id: str,
+        clarification_id: str,
+        response: str,
+        *,
+        agent: str | None = None,
+    ) -> bool:
+        """Record the first clarification response and optionally its event atomically."""
+
+        try:
+            with self.engine.begin() as conn:
+                conn.execute(
+                    insert(schema.responses).values(
+                        run_id=run_id,
+                        clarification_id=clarification_id,
+                        response=redact_freeform_text(response),
+                        consumed=False,
+                    )
                 )
-            )
+                if agent is not None:
+                    _ = self.append_event_in_transaction(
+                        conn,
+                        run_id,
+                        agent,
+                        "clarification_response",
+                        {"clarification_id": clarification_id},
+                    )
+        except IntegrityError:
+            with self.engine.connect() as conn:
+                existing = conn.execute(
+                    select(schema.responses.c.id).where(
+                        and_(
+                            schema.responses.c.run_id == run_id,
+                            schema.responses.c.clarification_id == clarification_id,
+                        )
+                    )
+                ).first()
+            if existing is not None:
+                return False
+            raise
+        return True
 
     def get_response(self, run_id: str, clarification_id: str) -> dict[str, Any] | None:
         with self.engine.connect() as conn:

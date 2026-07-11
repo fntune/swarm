@@ -75,8 +75,9 @@ async def respond_to_clarification(run_id: str, manager_name: str, clarification
     """Respond to a worker clarification or blocker."""
 
     repo = _repository()
-    repo.record_response(run_id, clarification_id, response)
-    repo.append_event(run_id, manager_name, "clarification_response", {"clarification_id": clarification_id})
+    recorded = repo.record_response(run_id, clarification_id, response, agent=manager_name)
+    if not recorded:
+        return f"Clarification already answered: {clarification_id[:8]}"
     logger.info("Manager %s responded to clarification %s", manager_name, clarification_id[:8])
     return f"Response sent to clarification {clarification_id[:8]}"
 

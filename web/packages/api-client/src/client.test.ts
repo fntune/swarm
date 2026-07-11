@@ -33,6 +33,28 @@ describe("createSpawndClient", () => {
     expect(new Headers(call.init.headers).get("authorization")).toBe("Bearer tok");
   });
 
+  it("repeats status filters for server-side run filtering", async () => {
+    const { impl, calls } = fetchStub(() => json([]));
+    const client = createSpawndClient({ baseUrl: "http://api:8765", fetch: impl });
+
+    await client.runs.list({ limit: 100, status: ["failed", "cost_exceeded"] });
+
+    const [call] = calls;
+    if (!call) throw new Error("expected a fetch call");
+    expect(call.url).toBe("http://api:8765/runs?limit=100&status=failed&status=cost_exceeded");
+  });
+
+  it("encodes identifiers as URL path segments", async () => {
+    const { impl, calls } = fetchStub(() => json({ run: {}, agents: [] }));
+    const client = createSpawndClient({ baseUrl: "http://api:8765", fetch: impl });
+
+    await client.runs.get("release ?#/id");
+
+    const [call] = calls;
+    if (!call) throw new Error("expected a fetch call");
+    expect(call.url).toBe("http://api:8765/runs/release%20%3F%23%2Fid");
+  });
+
   it("posts JSON bodies with content type", async () => {
     const { impl, calls } = fetchStub(() => json({ run_id: "run-1" }));
     const client = createSpawndClient({ baseUrl: "http://api:8765/", token: "tok", fetch: impl });
@@ -97,6 +119,17 @@ describe("createSpawndClient", () => {
 
     expect(response.status).toBe(200);
     expect(await response.text()).toBe("log line");
+  });
+
+  it("uses the uncapped artifact download endpoint", async () => {
+    const { impl, calls } = fetchStub(() => new Response("large log", { status: 200 }));
+    const client = createSpawndClient({ baseUrl: "http://api:8765", fetch: impl });
+
+    await client.runs.artifactDownload("run-1", "artifact-1");
+
+    const [call] = calls;
+    if (!call) throw new Error("expected a fetch call");
+    expect(call.url).toBe("http://api:8765/runs/run-1/artifacts/artifact-1/download");
   });
 
   it("builds the SSE stream path with replay", () => {

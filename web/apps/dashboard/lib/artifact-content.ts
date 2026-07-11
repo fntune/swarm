@@ -10,7 +10,9 @@ export async function fetchArtifactContent(
   runId: string,
   artifactId: string,
 ): Promise<ArtifactContent> {
-  const response = await fetch(`/api/spawnd/runs/${runId}/artifacts/${artifactId}/content`);
+  const response = await fetch(
+    `/api/spawnd/runs/${encodeURIComponent(runId)}/artifacts/${encodeURIComponent(artifactId)}/content`,
+  );
   if (!response.ok) {
     throw new Error(
       response.status === 413

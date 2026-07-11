@@ -144,6 +144,7 @@ responses = Table(
     Column('response', Text, nullable=False),
     Column('consumed', Boolean, nullable=False, server_default='false'),
     Column('created_at', DateTime(timezone=True), nullable=False, server_default=func.now()),
+    UniqueConstraint("run_id", "clarification_id", name="uq_responses_run_clarification"),
 )
 
 trace_spans = Table(

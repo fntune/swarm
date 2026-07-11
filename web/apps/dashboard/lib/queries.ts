@@ -1,4 +1,4 @@
-import { createSpawndClient, type SpawndClient } from "@spawnd/api-client";
+import { createSpawndClient, type RunStatus, type SpawndClient } from "@spawnd/api-client";
 import { queryOptions } from "@tanstack/react-query";
 
 let cached: SpawndClient | null = null;
@@ -19,10 +19,10 @@ export const workersQuery = () =>
     queryFn: () => browserClient().workers.get(),
   });
 
-export const runsQuery = (limit = 100) =>
+export const runsQuery = (limit = 100, status?: RunStatus[]) =>
   queryOptions({
-    queryKey: ["runs", limit],
-    queryFn: () => browserClient().runs.list({ limit }),
+    queryKey: ["runs", limit, status ?? []],
+    queryFn: () => browserClient().runs.list({ limit, status }),
   });
 
 export const runQuery = (runId: string) =>

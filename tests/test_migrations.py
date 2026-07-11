@@ -39,3 +39,13 @@ def test_alembic_head_matches_state_metadata(tmp_path, monkeypatch):
         actual_indexes = {index['name'] for index in inspector.get_indexes(table.name)}
         expected_indexes = {index.name for index in table.indexes if index.name}
         assert expected_indexes <= actual_indexes
+
+        actual_unique_constraints = {
+            constraint['name'] for constraint in inspector.get_unique_constraints(table.name)
+        }
+        expected_unique_constraints = {
+            constraint.name
+            for constraint in table.constraints
+            if isinstance(constraint, sa.UniqueConstraint) and constraint.name
+        }
+        assert expected_unique_constraints <= actual_unique_constraints

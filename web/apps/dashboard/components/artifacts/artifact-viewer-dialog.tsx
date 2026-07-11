@@ -61,7 +61,7 @@ export function ArtifactViewerDialog({
 }) {
   const tooLarge = (artifact?.size_bytes ?? 0) > MAX_INLINE_BYTES;
   const downloadHref = artifact
-    ? `/api/spawnd/runs/${artifact.run_id}/artifacts/${artifact.id}/content`
+    ? `/api/spawnd/runs/${encodeURIComponent(artifact.run_id)}/artifacts/${encodeURIComponent(artifact.id)}/download`
     : "#";
 
   return (

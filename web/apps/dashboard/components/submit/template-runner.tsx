@@ -17,7 +17,8 @@ import * as React from "react";
 import { toast } from "sonner";
 
 import { browserClient, templatesQuery } from "@/lib/queries";
-import { ParamForm, templateParameters } from "./param-form";
+import { initialParameterValues, templateParameters } from "@/lib/template-parameters";
+import { ParamForm } from "./param-form";
 
 export function TemplateRunner({ initialTemplates }: { initialTemplates: RunTemplate[] }) {
   const router = useRouter();
@@ -57,7 +58,8 @@ export function TemplateRunner({ initialTemplates }: { initialTemplates: RunTemp
         value={templateId}
         onValueChange={(value) => {
           setTemplateId(value);
-          setValues({});
+          const template = rows.find((row) => row.id === value);
+          setValues(initialParameterValues(template ? templateParameters(template) : []));
         }}
       >
         <SelectTrigger className="font-mono text-xs">

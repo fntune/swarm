@@ -50,6 +50,10 @@ export function runIsActive(status: string): boolean {
   return ACTIVE_RUN_STATUSES.has(status);
 }
 
+export function runIsCancellable(status: string): boolean {
+  return runIsActive(status) || status === "paused";
+}
+
 export function pollInterval(statuses: string[]): number {
   return statuses.some((status) => runIsActive(status)) ? 5_000 : 30_000;
 }

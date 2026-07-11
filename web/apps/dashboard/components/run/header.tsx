@@ -10,7 +10,7 @@ import { Loader2Icon, OctagonXIcon, RotateCcwIcon } from "lucide-react";
 import * as React from "react";
 import { toast } from "sonner";
 
-import { pollInterval, repoLabel, runIsActive } from "@/lib/format";
+import { pollInterval, repoLabel, runIsCancellable } from "@/lib/format";
 import { browserClient, runQuery } from "@/lib/queries";
 import { LiveDuration } from "./live-duration";
 
@@ -55,7 +55,7 @@ export function RunHeader({ runId, initialDetail }: { runId: string; initialDeta
   });
 
   const run = detail.data?.run ?? initialDetail.run;
-  const active = runIsActive(run.status);
+  const cancellable = runIsCancellable(run.status);
   const resumable = run.status === "paused" || run.status === "failed";
 
   return (
@@ -92,7 +92,7 @@ export function RunHeader({ runId, initialDetail }: { runId: string; initialDeta
             Resume
           </Button>
         ) : null}
-        {active ? (
+        {cancellable ? (
           <Button
             variant={confirmingCancel ? "destructive" : "outline"}
             size="sm"
